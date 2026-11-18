@@ -1,0 +1,14010 @@
+#!/usr/bin/env python3
+"""sosview: lay a sosreport out section by section, every block with the command that produced it.
+
+No verdicts or severities, apart from a short list of fixed-limit checks at the top. Fixed sections in a fixed order; each block shows what it is, the
+equivalent shell command, and the output. Plain text by default (pipe to less), the same document
+as a page, and `sosview-lite serve` adds search over every log, the task export and a file reference.
+
+Python 3.6+ standard library only. No network. Read-only, except for a command you type in `$ run`.
+"""
+from __future__ import print_function
+
+import argparse
+import binascii
+import io
+import datetime
+import functools
+import html
+import json
+import os
+import re
+import shutil
+import sys
+import tarfile
+import tempfile
+
+VERSION = "2.62.1"
+PROG = "sosview-lite"    # the name the tool is installed under and uses for itself in hints; the bare build is sosview-lite
+LITE = True        # the bare build sets this: Report, Search and Tasks only, neon style, no knowledge base
+
+
+# ---- plumbing: extraction, tables, timestamps ----
+
+MAX_READ = 2 * 1024 * 1024    # config files and command output: 2 MB per read
+LOG_READ = 48 * 1024 * 1024   # logs: the last 48 MB; when a file is bigger, the block says how much was read
+MAX_EXTRACT = int(os.environ.get("SOSVIEW_MAX_EXTRACT_GB", "40")) * 1024 ** 3   # refuse to unpack more than this
+EXTRACT_NOTES = []            # members skipped while extracting, shown on the page
+EXTRACT_PARTIAL = []          # one line when the archive was damaged or cut short and only part of it was read
+
+
+def _stream_errors():
+    """What a damaged or cut-short archive raises while it is read (tar, gzip, xz, bzip2)."""
+    errs = [tarfile.TarError, EOFError, OSError]
+    for mod, name in (("lzma", "LZMAError"), ("zlib", "error")):
+        try:
+            errs.append(getattr(__import__(mod), name))
+        except (ImportError, AttributeError):
+            pass
+    return tuple(errs)
+
+
+def safe_extract(tar_path, dest):
+    """Extract a tarball (or a zip wrapping one) refusing absolute paths, '..' and special files."""
+    import zipfile
+    if zipfile.is_zipfile(tar_path):
+        inner = os.path.join(dest, "_zip")
+        os.makedirs(inner, exist_ok=True)
+        with zipfile.ZipFile(tar_path) as zf:
+            tars = [n for n in zf.namelist() if re.search(r"\.(tar(\.(xz|gz|bz2))?|tgz)$", n, re.I) and ".." not in n]
+            if not tars:
+                raise tarfile.TarError("zip file does not contain a sosreport tarball")
+            zf.extract(tars[0], inner)
+        tar_path = os.path.join(inner, tars[0])
+    import posixpath
+    import errno
+    links = []
+    total = 0
+    del EXTRACT_NOTES[:]
+    del EXTRACT_PARTIAL[:]
+    bad = _stream_errors()
+    damage, nfiles = None, 0
+    try:
+        tf = tarfile.open(tar_path, "r:*")
+    except bad as e:
+        if isinstance(e, tarfile.ReadError) and "could not be opened" in str(e):      # no format tarfile knows fits
+            raise RuntimeError("not a tar archive (tried plain, gzip, bzip2 and xz), or damaged from its first bytes")
+        raise RuntimeError("the archive is damaged and nothing could be read from it (%s)" % (str(e).strip() or type(e).__name__))
+    with tf:
+        members = iter(tf)
+        while True:
+            try:
+                m = next(members)
+            except StopIteration:
+                break
+            except bad as e:                    # damaged or cut short: keep what was read up to here
+                damage = e
+                break
+            name = m.name
+            if name.startswith("/") or ".." in name.split("/"):
+                continue
+            if m.issym() or m.islnk():
+                links.append((name, m.issym(), m.linkname))
+                continue
+            if not (m.isfile() or m.isdir()):
+                continue  # devices, fifos
+            total += m.size if m.isfile() else 0
+            if total > MAX_EXTRACT:
+                raise RuntimeError("the archive unpacks to more than %d GB; stopped (set SOSVIEW_MAX_EXTRACT_GB to allow more)" % (MAX_EXTRACT // 1024 ** 3))
+            try:
+                if hasattr(tarfile, "data_filter"):      # Python 3.12+
+                    tf.extract(m, dest, set_attrs=False, filter="data")
+                else:
+                    tf.extract(m, dest, set_attrs=False)
+                if m.isfile():
+                    nfiles += 1
+                    try:                                  # keep the time each file was last changed on the host
+                        os.utime(os.path.join(dest, name), (m.mtime, m.mtime))
+                    except (OSError, OverflowError, ValueError):
+                        pass
+            except OSError as e:
+                if e.errno == errno.ENOSPC:
+                    raise RuntimeError("no space left in %s while unpacking (%s so far); point TMPDIR at a bigger filesystem" % (dest, human(total)))
+                if e.errno is None:             # gzip/bzip2 report a broken stream as a plain OSError: the rest cannot be read
+                    damage = e
+                    EXTRACT_NOTES.append("%s: cut short (%s)" % (name, e))
+                    break
+                EXTRACT_NOTES.append("%s: %s" % (name, e.strerror or e))
+            except (tarfile.TarError, ValueError) as e:
+                EXTRACT_NOTES.append("%s: %s" % (name, e))
+            except bad as e:                    # xz/zlib stream error or end of file inside a member
+                damage = e
+                EXTRACT_NOTES.append("%s: cut short (%s)" % (name, str(e).strip() or type(e).__name__))
+                break
+    if damage is not None:
+        why = str(damage).strip() or type(damage).__name__
+        if not nfiles:
+            raise RuntimeError("the archive is damaged and nothing could be read from it (%s)" % why)
+        EXTRACT_PARTIAL.append("the archive is damaged or cut short: %s read before the error (%s). What is shown comes from those files only."
+                               % ("%d file%s" % (nfiles, "" if nfiles == 1 else "s"), why))
+    # sos 4.x puts installed-rpms, hostname, uname, date ... at the top as symlinks into sos_commands/.
+    # Links whose target is a file inside the archive become plain copies of it; links pointing outside
+    # the archive, absolute links and links to directories are dropped, so nothing on disk is a symlink.
+    real_dest = os.path.realpath(dest)
+    pending = links
+    for _ in range(5):                      # a link may point at another link
+        left = []
+        for name, sym, target in pending:
+            if sym:
+                if target.startswith("/"):
+                    continue
+                target = posixpath.normpath(posixpath.join(posixpath.dirname(name), target))
+            else:
+                target = posixpath.normpath(target)
+            if target == ".." or target.startswith("../") or target.startswith("/"):
+                continue
+            src = os.path.realpath(os.path.join(dest, target))
+            dst = os.path.join(dest, name)
+            if not src.startswith(real_dest + os.sep):
+                continue
+            if not os.path.isfile(src):
+                left.append((name, False, target))      # retry once its own target exists
+                continue
+            if os.path.lexists(dst):
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(src, dst)
+            try:                                    # the copy carries the time of the file it stands for
+                st = os.stat(src)
+                os.utime(dst, (st.st_mtime, st.st_mtime))
+            except OSError:
+                pass
+        if len(left) == len(pending):
+            break
+        pending = left
+    return dest
+
+
+def find_sos_root(start):
+    """Walk down a few levels looking for the sosreport top directory."""
+    markers = ("sos_commands", "version.txt", "sos_reports", "installed-rpms")
+    candidates = [start]
+    for _ in range(4):
+        nxt = []
+        for d in candidates:
+            try:
+                entries = os.listdir(d)
+            except OSError:
+                continue
+            if any(m in entries for m in markers):
+                return d
+            for e in entries:
+                p = os.path.join(d, e)
+                if os.path.isdir(p) and not os.path.islink(p):
+                    nxt.append(p)
+        candidates = nxt
+        if not candidates:
+            break
+    return None
+
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")       # terminal colour and cursor codes that programs write into their logs
+
+
+def clean(s, width=220):
+    s = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", ANSI.sub("", s)).rstrip()
+    return s if len(s) <= width else s[:width] + " …"
+
+
+PG_ERROR = re.compile(r"PG::|psql: error|ERROR:\s|could not connect to server|unexpected zero page|invalid page in block|IndexCorrupted|DataCorrupted|Timed out reading data", re.I)
+
+
+# The task tables in the order the database holds their columns ('select *'), oldest columns first. sos keeps only the
+# end of a table past its size limit, and that end has no header line: the columns are then named from these.
+TABLE_COLS = {
+    "foreman_tasks_tasks": ["id", "type", "label", "started_at", "ended_at", "state", "result", "external_id", "parent_task_id",
+                            "start_at", "start_before", "action", "user_id", "state_updated_at"],
+    "dynflow_steps": ["execution_plan_uuid", "id", "action_id", "data", "state", "started_at", "ended_at", "real_time", "execution_time",
+                      "progress_done", "progress_weight", "class", "error", "action_class", "children", "queue"],
+    "dynflow_actions": ["execution_plan_uuid", "id", "data", "caller_execution_plan_id", "caller_action_id", "class", "input", "output",
+                        "plan_step_id", "run_step_id", "finalize_step_id"],
+    "dynflow_execution_plans": ["uuid", "data", "state", "result", "started_at", "ended_at", "real_time", "execution_time", "label", "class",
+                                "run_flow", "finalize_flow", "execution_history", "root_plan_step_id", "step_ids"],
+}
+_IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_ROW_CSV = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12},", re.M)
+_ROW_PIPE = re.compile(r"^\s*\|?\s*[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\s*\|")
+_T_STATE = frozenset(("stopped", "paused", "running", "planned", "planning", "scheduled", "pending", "stopping"))
+_T_RESULT = frozenset(("success", "error", "warning", "pending", "cancelled"))
+_S_STATE = frozenset(("pending", "running", "success", "suspended", "skipping", "skipped", "error", "cancelled", "reverted"))
+
+
+def table_name(rel):
+    """'dynflow_steps' for sos_commands/foreman/dynflow_steps and for sos_strings/foreman/dynflow_steps.tailed."""
+    base = os.path.basename(rel or "")
+    return base[:-7] if base.endswith(".tailed") else base
+
+
+def is_header(cells):
+    """A psql header line: every cell is a column name."""
+    cells = [c.strip().strip('"') for c in cells]
+    return len(cells) >= 2 and all(_IDENT.match(c) for c in cells)
+
+
+def known_header(name, sample):
+    """The column names of a task table that has no header line, from the order the database holds them, when the
+    rows read fit that order (states where states go, ids where ids go) in at least 6 of 10 of them; else None."""
+    cols = TABLE_COLS.get(name)
+    rows = [[c.strip() for c in r] for r in sample if len(r) >= 6]
+    if not cols or not rows:
+        return None
+    ok = lambda test: sum(1 for r in rows if test(r)) * 10 >= len(rows) * 6
+    cols = list(cols)
+    if name == "foreman_tasks_tasks":
+        if not ok(lambda r: len(r) > 7 and r[5] in _T_STATE and r[6] in _T_RESULT):
+            return None
+        if ok(lambda r: len(r) > 8 and not _UUID.match(r[7]) and _UUID.match(r[8])):     # before 2018 a progress column sat here
+            cols.insert(7, "progress")
+    elif name == "dynflow_steps":
+        if not ok(lambda r: r[1].isdigit() and r[4] in _S_STATE):
+            return None
+    elif name == "dynflow_actions":
+        if not ok(lambda r: r[1].isdigit() and "::" in r[5]):
+            return None
+    elif name == "dynflow_execution_plans":
+        if not ok(lambda r: r[2] in _T_STATE and r[3] in _T_RESULT):
+            return None
+    width = max(len(r) for r in rows)
+    return cols[:width] + ["col%d" % (i + 1) for i in range(len(cols), width)]
+
+
+def parse_table(text, keep=None, name=None, info=None):
+    """sos writes psql output either as CSV (sos 4.x) or as a pipe table. Returns (rows, kind):
+    rows = list of dicts keyed by header name plus '_line' (raw line) and '_ln' (line number);
+    kind = 'csv' | 'pipe' | 'error' (first non-empty line is an error message) | 'empty' | 'headless' (a task table
+    with no header line whose columns could not be recognised). name is the table's name (table_name()): a task table
+    without its header line gets its columns from known_header(), and info['inferred'] is set."""
+    import csv
+    import io
+    info = info if info is not None else {}
+    lines = text.splitlines()
+    first = next((l for l in lines if l.strip()), "")
+    if not first:
+        return [], "empty"
+    if PG_ERROR.search(first) and "," not in first[:40] and "|" not in first[:40]:
+        return [{"_line": first, "_ln": 1}], "error"
+    if "|" in first and first.count("|") >= 2:
+        edge = [first.strip().startswith("|")]        # psql --border=2 draws outer pipes; the default does not
+
+        def cells(line):
+            if edge[0]:
+                line = line.strip()
+                line = line[1:] if line.startswith("|") else line
+                line = line[:-1] if line.endswith("|") else line
+            return line.split("|")
+        hdr = [c.strip() for c in cells(first)]
+        body, start = lines[1:], 2
+        if name in TABLE_COLS and not is_header(hdr):
+            k = next((i for i, l in enumerate(lines) if _ROW_PIPE.match(l)), None)
+            if k is not None:
+                edge[0] = lines[k].strip().startswith("|")
+            hdr = known_header(name, [cells(l) for l in lines[k:k + 400] if _ROW_PIPE.match(l)][:60]) if k is not None else None
+            if hdr is None:
+                info["headless"] = True
+                return [], "headless"
+            info["inferred"] = True
+            body, start = lines[k:], k + 1
+        rows = []
+        cont = False
+        for i, l in enumerate(body, start=start):
+            if l.count("|") < 2 or re.match(r"^[-+| ]+$", l):
+                cont = False
+                continue
+            raw = cells(l)
+            cols = [c.strip() for c in raw]
+            if cont and rows:      # psql wraps a multi-line cell: the previous line's cell ends in '+', this line continues it
+                prev = rows[-1]
+                for h, c in zip(hdr, cols):
+                    if c:
+                        prev[h] = (prev.get(h) or "").rstrip("+").rstrip() + "\n" + c.rstrip("+").rstrip()
+                prev["_line"] += "\n" + l
+                cont = any(c.rstrip().endswith("+") for c in raw)
+                continue
+            if len(cols) < len(hdr) - 1:
+                continue
+            cont = any(c.rstrip().endswith("+") for c in raw)
+            d = dict(zip(hdr, [c.rstrip("+").rstrip() if cont else c for c in cols]))
+            d["_line"], d["_ln"] = l, i
+            rows.append(d)
+        return rows, "pipe"
+    if "," in first:
+        try:
+            csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))   # Dynflow error cells can be far larger than csv's 128 KB default
+        except (OverflowError, ValueError):
+            pass
+        rdr = csv.reader(io.StringIO(text))
+        base = 0
+        try:
+            hdr = [c.strip() for c in next(rdr)]
+        except StopIteration:
+            return [], "empty"
+        except csv.Error:
+            if name not in TABLE_COLS:
+                return [{"_line": first, "_ln": 1}], "error"
+            hdr = []
+        if name in TABLE_COLS and not is_header(hdr):      # the end of a cut table: it starts inside a record
+            m = _ROW_CSV.search(text)
+            hdr = None
+            if m:
+                sample = []
+                try:
+                    for rec in csv.reader(io.StringIO(text[m.start():m.start() + 4 * 1024 * 1024])):
+                        sample.append(rec)
+                        if len(sample) >= 60:
+                            break
+                except csv.Error:
+                    pass
+                hdr = known_header(name, sample[:-1] if len(sample) > 1 else sample)
+            if hdr is None:
+                info["headless"] = True
+                return [], "headless"
+            info["inferred"] = True
+            base = text.count("\n", 0, m.start())
+            rdr = csv.reader(io.StringIO(text[m.start():]))
+        rows = []
+        kidx = [(j, h) for j, h in enumerate(hdr) if keep and h in keep]
+        end = rdr.line_num if not base and not info.get("inferred") else 0
+        while True:
+            try:
+                rec = next(rdr)
+            except StopIteration:
+                break
+            except csv.Error:      # a record cut in half at a read limit
+                break
+            start, end = end + 1, rdr.line_num      # a quoted cell can span many lines: the record starts after the previous one
+            if len(rec) < 2:
+                continue
+            if keep:
+                d = dict((h, rec[j].strip()) for j, h in kidx if j < len(rec))
+            else:
+                d = dict(zip(hdr, [c.strip() for c in rec]))
+            d["_ln"] = start + base
+            rows.append(d)
+        return rows, "csv"
+    return [{"_line": first, "_ln": 1}], "error"
+
+
+MONTHS = {m: i + 1 for i, m in enumerate(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])}
+
+
+_ISO_START = re.compile(r"(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d))?")
+_ISO_NEAR = re.compile(r"^.{0,12}?\b(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d))?")
+_ISO_ANY = re.compile(r"\b(\d{4})-(\d\d)-(\d\d)[T ](\d\d):(\d\d)(?::(\d\d))?\b")
+_DATE1 = re.compile(r"(?:\w{3} )?(\w{3})\s+(\d{1,2})\s+(\d\d):(\d\d):(\d\d)(?:\s+\S+)?\s+(\d{4})\b")
+_SYSLOG = re.compile(r"(\w{3})\s+(\d{1,2})\s+(\d\d):(\d\d):(\d\d)")
+_HTTPD_ERR = re.compile(r"^\[\w{3} (\w{3}) (\d{1,2}) (\d\d):(\d\d):(\d\d)(?:\.\d+)? (\d{4})\]")
+_HTTPD_ACC = re.compile(r"\[(\d{1,2})/(\w{3})/(\d{4}):(\d\d):(\d\d):(\d\d) [+-]\d{4}\]")
+
+
+_SYSLOG_LINE = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) ([ \d]\d) (\d\d):(\d\d):(\d\d) ", re.M)
+_JOURNAL_SPAN = re.compile(r"^-- (?:Logs begin|Journal begins) at \w+ (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)[^,]*, ends? at \w+ (\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", re.M)
+
+
+def syslog_years(text, ref):
+    """For a log whose lines carry no year (syslog, journal): (first time, last time, offset where the last 12 months
+    begin), or None when the text is not in that format. The years are worked out from the end: the last line is read
+    against the collection time, and every step from December back to January, going up the file, is one year earlier.
+    A line older than 12 months cannot be told from the same date a year later by its text alone, so readers that take
+    one line at a time work on the part after the offset."""
+    if not ref or not _SYSLOG_LINE.search(text[:4096] if len(text) > 4096 else text):
+        return None
+    first = last = None
+    wraps, prev = [], None
+    for m in _SYSLOG_LINE.finditer(text):
+        mo = MONTHS[m.group(1)]
+        if first is None:
+            first = m
+        elif prev >= 11 and mo <= 2:
+            wraps.append(m.start())
+        prev, last = mo, m
+    if first is None:
+        return None
+
+    def when(m, year):
+        try:
+            return datetime.datetime(year, MONTHS[m.group(1)], int(m.group(2)), int(m.group(3)), int(m.group(4)), int(m.group(5)))
+        except ValueError:                       # Feb 29 read against the wrong year
+            return datetime.datetime(year, MONTHS[m.group(1)], 28, int(m.group(3)), int(m.group(4)), int(m.group(5)))
+    b = when(last, ref.year)
+    if b > ref + datetime.timedelta(days=1):
+        b = when(last, ref.year - 1)
+    a = when(first, b.year - len(wraps))
+    if a > b:                                    # not in time order after all: leave it alone
+        return a, b, 0
+    thr = ref - datetime.timedelta(days=363)
+    if a >= thr:
+        return a, b, 0
+    bounds = [0] + wraps + [len(text)]
+    k = len(wraps) - (b.year - thr.year)         # the run of lines that holds the day 12 months back
+    if k < 0:
+        return a, b, 0
+    cut = bounds[k + 1]
+    for m in _SYSLOG_LINE.finditer(text, bounds[k], bounds[k + 1]):
+        if (MONTHS[m.group(1)], int(m.group(2))) >= (thr.month, thr.day):
+            cut = m.start()
+            break
+    return a, b, cut
+
+
+def parse_when(s, ref=None):
+    """Best-effort timestamp parser for the formats that show up in a sosreport. Returns datetime or None.
+    The line's own prefix wins: a journal line 'Nov  2 10:00:01 host app[1]: 2026-11-02T08:00:01Z ...' is 10:00 local,
+    not the 08:00 UTC the application printed inside it."""
+    s = s.strip()
+    if s.startswith("-- "):                     # journal markers: -- Reboot --, -- Logs begin at … --
+        return None
+    try:
+        m = _ISO_START.match(s)
+        if m:
+            y, mo, d, hh, mm, ss = m.groups()
+            return datetime.datetime(int(y), int(mo), int(d), int(hh), int(mm), int(ss or 0))
+        m = _DATE1.match(s)                     # date(1): Mon Nov  2 14:22:01 UTC 2026
+        if m and m.group(1) in MONTHS:
+            mo, d, hh, mm, ss, y = m.groups()
+            return datetime.datetime(int(y), MONTHS[mo], int(d), int(hh), int(mm), int(ss))
+        m = _SYSLOG.match(s)                    # syslog / journal, no year
+        if m and m.group(1) in MONTHS:
+            if ref is None:
+                return None
+            mo, d, hh, mm, ss = m.groups()
+            y = ref.year
+            t = datetime.datetime(y, MONTHS[mo], int(d), int(hh), int(mm), int(ss))
+            if t > ref + datetime.timedelta(days=1):
+                t = t.replace(year=y - 1)
+            return t
+        m = _HTTPD_ERR.match(s)                 # [Mon Nov 02 14:22:01.123 2026]
+        if m and m.group(1) in MONTHS:
+            mo, d, hh, mm, ss, y = m.groups()
+            return datetime.datetime(int(y), MONTHS[mo], int(d), int(hh), int(mm), int(ss))
+        m = _HTTPD_ACC.search(s[:120])          # [02/Nov/2026:14:01:30 +0000]
+        if m and m.group(2) in MONTHS:
+            d, mo, y, hh, mm, ss = m.groups()
+            return datetime.datetime(int(y), MONTHS[mo], int(d), int(hh), int(mm), int(ss))
+        m = _ISO_NEAR.search(s) or _ISO_ANY.search(s)
+        if m:
+            y, mo, d, hh, mm, ss = m.groups()
+            return datetime.datetime(int(y), int(mo), int(d), int(hh), int(mm), int(ss or 0))
+    except ValueError:
+        return None
+    return None
+
+
+NOISE_GLOBS = ["sos_reports/*", "sos_logs/*", "sos_strings/*", "*.json", "*.html", "*/ls_*", "*/ls_-*", "ls_*", "sos_commands/kernel/modinfo*",
+               "sos_commands/kernel/sysctl*", "sos_commands/process/*", "sos_commands/rpm/*", "installed-rpms", "sos_commands/systemd/systemd-analyze*",
+               "sos_commands/tpm2/*", "sos_commands/insights/*", "proc/*", "sys/*", "usr/*", "sos_commands/*/*_--help",
+               "sos_commands/dnf/dnf_updateinfo*", "sos_commands/yum/yum_updateinfo*", "sos_commands/dnf/dnf_list*", "sos_commands/yum/yum_list*",
+               "sos_commands/dnf/dnf_module*", "sos_commands/networking/ethtool*", "sos_commands/hardware/*", "sos_commands/pci/*",
+               "sos_commands/usb/*", "sos_commands/block/*", "sos_commands/scsi/*", "sos_commands/devicemapper/*", "sos_commands/lvm2/*",
+               "sos_commands/md/*", "sos_commands/multipath/*", "sos_commands/boot/*", "sos_commands/date/*", "sos_commands/host/*",
+               "sos_commands/login/*", "sos_commands/pam/*", "sos_commands/python/*", "sos_commands/ruby/*", "var/lib/pulp/*"]
+
+
+NORMALIZE = [
+    (re.compile(r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}[.,]?\d*(?:[+-]\d{2}:?\d{2}|Z)?\s*"), ""),     # ISO timestamps
+    (re.compile(r"^[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\S+\s*"), ""),                        # syslog "Nov  1 02:14:07 host "
+    (re.compile(r"^\[?\w{3} \w{3} \d{1,2} \d{2}:\d{2}:\d{2}(?:\.\d+)? \d{4}\]?\s*"), ""),                # httpd error_log
+    (re.compile(r"\[([IWEDF])\|([^|\]]*)\|[^\]]*\]"), r"[\1|\2|ID]"),                                     # rails request ids
+    (re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I), "UUID"),
+    (re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b"), "IP"),
+    (re.compile(r"\b0x[0-9a-f]+\b", re.I), "0xN"),
+    (re.compile(r"\b[0-9a-f]{12,}\b", re.I), "HEX"),
+    (re.compile(r"\[\d+\]|\bpid[= ]\d+", re.I), "[PID]"),
+    (re.compile(r"\d+"), "#"),
+    (re.compile(r"\s+"), " "),
+]
+
+
+ROTATED = re.compile(r"(-\d{8}|\.\d+|\.(gz|xz|bz2|old))$")
+
+
+def esc(s):
+    return html.escape(str(s), quote=True)
+
+
+# 'sosreport-…' with or without something in front of it ('<label>_sosreport-…'), as files often get renamed
+SOS_NAME = re.compile(r"^(?:.*[_.\- ])?sosreport-.*\.(tar\.xz|tar\.gz|tgz|tar\.bz2|tar|tar\.zip|zip|tar\.xz\.txt|tar\.gz\.txt)$", re.I)
+SOS_DIR = re.compile(r"^(?:.*[_.\- ])?sosreport-", re.I)
+
+
+def find_recent_sosreports(dirs, limit=1):
+    """Newest sosreport tarballs/dirs in the given directories."""
+    found = []
+    for d in dirs:
+        d = os.path.expanduser(d)
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(d, n)
+            if SOS_NAME.match(n) or (SOS_DIR.match(n) and os.path.isdir(p)):
+                try:
+                    found.append((os.path.getmtime(p), p))
+                except OSError:
+                    pass
+    found.sort(reverse=True)
+    return [p for _, p in found[:limit]]
+
+
+def _tmp_base():
+    """Where extracted copies go: $TMPDIR if set, else /var/tmp (disk) rather than /tmp (often RAM-backed tmpfs)."""
+    if os.environ.get("TMPDIR"):
+        return None
+    for d in ("/var/tmp", "/tmp"):
+        if os.path.isdir(d) and os.access(d, os.W_OK):
+            return d
+    return None
+
+
+def _dir_size(path):
+    n = 0
+    for dp, _, fns in os.walk(path):
+        for fn in fns:
+            try:
+                n += os.path.getsize(os.path.join(dp, fn))
+            except OSError:
+                pass
+    return n
+
+
+def list_tree(root, limit=400000):
+    """[(rel, full, size)] for every regular file under root, sorted. Walked once per serve.
+    An extracted sosreport keeps sos's symlinks (var/log/messages -> ../../sos_strings/logs/var.log.messages.tailed,
+    installed-rpms -> sos_commands/rpm/...): a link to a regular file inside the report counts as that file."""
+    out = []
+    real_root = os.path.realpath(root)
+    stack = [(root, "")]
+    while stack:
+        dp, rp = stack.pop()
+        files, dirs = [], []
+        try:
+            with os.scandir(dp) as it:
+                for e in it:
+                    try:
+                        (dirs if e.is_dir() else files).append(e)
+                    except OSError:
+                        files.append(e)
+        except OSError:
+            continue
+        files.sort(key=lambda e: e.name)
+        for e in files:
+            try:
+                if e.is_symlink():
+                    target = os.path.realpath(e.path)
+                    if not (target.startswith(real_root + os.sep) and os.path.isfile(target)):
+                        continue
+                size = e.stat().st_size
+            except OSError:
+                continue
+            out.append((rp + e.name, e.path, size))
+            if len(out) >= limit:
+                return out
+        # the directories of this one come next, in name order, each before its later siblings (the order os.walk gives)
+        dirs.sort(key=lambda e: e.name, reverse=True)
+        for e in dirs:
+            try:
+                if e.is_symlink():
+                    continue
+            except OSError:
+                continue
+            stack.append((e.path, rp + e.name + "/"))
+    return out
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return ("%d %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+# ---- v1 core: tree access, blocks, formatting -----------------------------------------
+
+def fmt_n(n):
+    return "{:,}".format(n)
+
+
+class Tree(object):
+    """Read-only access to an extracted sosreport. Every read goes through candidate lists so the
+    same block works on sos 3.x and 4.x names."""
+
+    CACHE_CHARS = 320 * 1024 * 1024
+
+    def __init__(self, root):
+        self.root = os.path.realpath(root)
+        self._list = None
+        self._manifest_trunc = None
+        self._sos_tailed = None
+        self._cache = {}          # (rel, tail, limit) -> text, so six sections reading the journal decode it once
+        self._cache_order = []
+        self._tables = {}
+        self.table_info = {}       # rel -> {'inferred': True} (no header line: columns named by their known order) or {'headless': True}
+        self._globs = {}          # pattern -> the listed files that fit it
+        self._byname = None       # (rel, position in the list), sorted by rel
+        self.read_max = {}        # rel -> (most bytes read in one go, file size, tail?)
+        self.binary = set()       # files that hold binary data rather than text
+        self._nl = {}             # rel -> newlines in the whole file (absolute line numbers after a tail read)
+        self.ref = None           # collection time, set once the report is identified: year-less logs are read against it
+        self.year_cuts = {}       # rel -> first day kept, for a year-less log that goes back more than 12 months
+
+    def files(self):
+        if self._list is None:
+            self._list = list_tree(self.root)
+        return self._list
+
+    def exists(self, rel):
+        return os.path.exists(os.path.join(self.root, rel))
+
+    def _matches(self, c):
+        if any(ch in c for ch in "*?["):
+            return self.glob(c)
+        return [c] if os.path.isfile(os.path.join(self.root, c)) else []
+
+    def first(self, cands, largest=False):
+        """The file a block reads. An empty candidate never shadows a later one that has data; within a glob, and
+        across all candidates when largest=True, the biggest file wins (journalctl_--no-pager vs ..._--since_-3days)."""
+        if isinstance(cands, str):
+            cands = [cands]
+        first_empty = None
+        best = None
+        for c in cands:
+            hits = self._matches(c)
+            sized = [(self.size(h), h) for h in hits]
+            nonempty = [x for x in sized if x[0] > 0]
+            if not nonempty:
+                if hits and first_empty is None:
+                    first_empty = hits[0]
+                continue
+            top_ = max(nonempty, key=lambda x: x[0])
+            if not largest:
+                return top_[1]
+            if best is None or top_[0] > best[0]:
+                best = top_
+        return best[1] if best else first_empty
+
+    def glob(self, pattern):
+        """The listed files that fit the pattern, in the order of the list. Only the files under the pattern's fixed
+        leading directory are tried, and the answer for a pattern is kept."""
+        hit = self._globs.get(pattern)
+        if hit is not None:
+            return list(hit)
+        import bisect
+        import fnmatch
+        rx = re.compile(fnmatch.translate(pattern))
+        if self._byname is None:
+            self._byname = sorted((f[0], i) for i, f in enumerate(self.files()))
+        wild = min([pattern.index(ch) for ch in "*?[" if ch in pattern] or [len(pattern)])
+        prefix = pattern[:wild]
+        files = self.files()
+        if prefix:
+            lo = bisect.bisect_left(self._byname, (prefix, -1))
+            idx = []
+            for k in range(lo, len(self._byname)):
+                name, i = self._byname[k]
+                if not name.startswith(prefix):
+                    break
+                idx.append(i)
+            idx.sort()
+            out = [files[i][0] for i in idx if rx.match(files[i][0])]
+        else:
+            out = [r for r, _, _ in files if rx.match(r)]
+        self._globs[pattern] = out
+        return list(out)
+
+    def size(self, rel):
+        try:
+            return os.path.getsize(os.path.join(self.root, rel))
+        except OSError:
+            return 0
+
+    def read(self, cands, tail=False, limit=MAX_READ, largest=False):
+        if isinstance(cands, str):
+            cands = [cands]
+        rel = self.first(cands, largest=largest)
+        if rel is None:
+            return None, None
+        key = (rel, tail, limit)
+        if key in self._cache:
+            return self._cache[key], rel
+        if tail:      # the last 48 MB of a file whose last 64 MB are already decoded
+            for (r0, t0, l0), txt in self._cache.items():
+                if r0 == rel and t0 and l0 > limit:
+                    if len(txt) <= limit:
+                        return txt, rel
+                    cut = txt[-limit:]
+                    return cut[cut.find("\n") + 1:], rel
+        full = os.path.join(self.root, rel)
+        try:
+            size = os.path.getsize(full)
+            with open(full, "rb") as fh:
+                if tail and size > limit:
+                    fh.seek(size - limit)
+                    data = fh.read()
+                    data = data[data.find(b"\n") + 1:]
+                else:
+                    data = fh.read(limit)
+        except OSError:
+            return None, None
+        got = len(data)
+        prev = self.read_max.get(rel)
+        if prev is None or got > prev[0]:
+            self.read_max[rel] = (got, size, tail)
+        if b"\0" in data[:4096] and data[:4096].count(b"\0") > 64:
+            text = ""
+            self.binary.add(rel)
+        else:
+            text = data.decode("utf-8", "replace")
+        if tail and self.ref and text:      # a year-less log over 12 months long: keep the last 12, where a date names one day
+            ys = syslog_years(text, self.ref)
+            if ys and ys[2]:
+                text = text[ys[2]:]
+                self.year_cuts[rel] = (self.ref - datetime.timedelta(days=363)).strftime("%Y-%m-%d")
+        if len(text) > 64 * 1024:
+            self._cache[key] = text
+            self._cache_order.append((key, len(text)))
+            while sum(n for _, n in self._cache_order) > self.CACHE_CHARS and len(self._cache_order) > 1:
+                k0, _ = self._cache_order.pop(0)
+                self._cache.pop(k0, None)
+        return text, rel
+
+    def table(self, cands, limit=64 * 1024 * 1024, tail=False, keep=None):
+        """parse_table() of the first candidate, parsed once. With tail=True a table bigger than limit is read from its end
+        (sos orders dynflow_steps oldest first, so the newest rows are at the end): the header line is kept and the
+        first whole record after the cut is found again."""
+        rel = self.first(cands)
+        if rel is None:
+            return None, None, None, 0
+        key = (rel, tail, limit)
+        if key in self._tables:
+            return self._tables[key]
+        size = self.size(rel)
+        offset = 0
+        if tail and size > limit:
+            full = os.path.join(self.root, rel)
+            with open(full, "rb") as fh:
+                head = fh.readline()
+                fh.seek(size - limit)
+                body = fh.read()
+            hdr = head.decode("utf-8", "replace")
+            text = body.decode("utf-8", "replace")
+            first_col = hdr.split(",")[0].strip().strip('"')
+            lines = text.split("\n")
+            if "," not in hdr.split("\n")[0] or sum(1 for l in lines[1:200] if l.count("|") >= 2) > 100:    # a psql pipe table
+                rx = re.compile(r"^\s*\|?\s*(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d+)\s*\|")
+            else:
+                rx = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}," if "uuid" in first_col or first_col in ("id",) or not is_header(hdr.split(",")) else r"^\d+,")
+            k = next((i for i, l in enumerate(lines[1:], 1) if rx.match(l)), len(lines))
+            # line numbers in the file: count the newlines before the part that was read
+            with open(full, "rb") as fh:
+                n_before, left = 0, size - limit
+                while left > 0:
+                    chunk = fh.read(min(left, 8 * 1024 * 1024))
+                    if not chunk:
+                        break
+                    n_before += chunk.count(b"\n")
+                    left -= len(chunk)
+            offset = n_before + k - 1
+            text = hdr.rstrip("\n") + "\n" + "\n".join(lines[k:])
+            prev = self.read_max.get(rel)
+            if prev is None or limit > prev[0]:
+                self.read_max[rel] = (limit, size, True)
+        else:
+            text, rel = self.read([rel], limit=limit)
+        info = {}
+        rows, kind = parse_table(text or "", keep=keep, name=table_name(rel), info=info)
+        if info:
+            self.table_info[rel] = info
+        if offset:
+            for r in rows:
+                if r.get("_ln", 0) > 1:
+                    r["_ln"] += offset
+        res = (rows, kind, rel, size)
+        self._tables[key] = res
+        return res
+
+    def newlines(self, rel):
+        """Newlines in the whole file, counted once."""
+        if rel not in self._nl:
+            n = 0
+            try:
+                with open(os.path.join(self.root, rel), "rb") as fh:
+                    for chunk in iter(lambda: fh.read(8 * 1024 * 1024), b""):
+                        n += chunk.count(b"\n")
+            except OSError:
+                pass
+            self._nl[rel] = n
+        return self._nl[rel]
+
+    def line_base(self, rel, text, tail=True):
+        """How many lines of the file come before `text`: 0 for a read from the start, else the file's newlines
+        minus the text's (a tail read is the end of the file)."""
+        if not tail:
+            return 0
+        return max(0, self.newlines(rel) - text.count("\n"))
+
+    def numbered(self, rel, text, tail=True):
+        """(line number in the file, line) for every line of text; the numbers are what the viewer and grep -n show."""
+        base = self.line_base(rel, text, tail)
+        return [(base + i + 1, l.rstrip("\r")) for i, l in enumerate(text.split("\n"))]
+
+    def locate(self, rel, raw, part=False):
+        """The line number of the newest whole line in rel that is `raw` (leading bullets and spaces on the file's line
+        are allowed). None when it is not in the last LOG_READ of the file."""
+        if not raw or len(raw.strip()) < (2 if part else 4) or rel.endswith("/") or "*" in rel:
+            return None
+        text, r = self.read([rel], tail=True, limit=LOG_READ)
+        if text is None or r != rel:
+            return None
+        end = len(text)
+        for _ in range(4):
+            pos = text.rfind(raw, 0, end)
+            if pos < 0:
+                return None
+            ls = text.rfind("\n", 0, pos) + 1
+            le = text.find("\n", pos)
+            le = len(text) if le < 0 else le
+            if part or (not re.search(r"\w", text[ls:pos]) and not text[pos + len(raw):le].strip()):
+                return self.line_base(rel, text) + text.count("\n", 0, pos) + 1
+            end = pos + len(raw) - 1
+        return None
+
+    def forget(self):
+        """Drop the read and table caches once the page is built; serve mode reads files again on demand."""
+        self._cache, self._cache_order, self._tables = {}, [], {}
+        self._nl = {}
+
+    def listdir(self, rel):
+        try:
+            return sorted(os.listdir(os.path.join(self.root, rel)))
+        except OSError:
+            return []
+
+    def _tailed_set(self):
+        """Files sos itself cut at its size limit. sos keeps the cut copy as sos_strings/<plugin>/<name>.tailed and points
+        the file's usual path at it (var/log/messages -> ../../sos_strings/logs/var.log.messages.tailed)."""
+        if self._sos_tailed is None:
+            names = set()
+            for d in self.listdir("sos_strings"):
+                for f in self.listdir("sos_strings/" + d):
+                    if f.endswith(".tailed"):
+                        base = f[:-len(".tailed")]
+                        names.add("sos_commands/%s/%s" % (d, base))   # sos_strings/foreman/dynflow_steps.tailed
+                        names.add(base)                               # sos_strings/logs/var.log.messages.tailed
+            self._sos_tailed = names
+        return self._sos_tailed
+
+    def tailed(self, rel):
+        """A fact about the file, when we can tell: sos cut it at its size limit."""
+        if not rel:
+            return ""
+        full = os.path.join(self.root, rel)
+        try:
+            if os.path.islink(full) and os.readlink(full).endswith(".tailed"):
+                return "sos kept only the end of this file (it links to %s)" % os.readlink(full).lstrip("./")
+        except OSError:
+            pass
+        flat = rel.replace("/", ".")
+        ts = self._tailed_set()
+        if rel in ts or flat in ts:
+            return "sos kept only the end of this file (a .tailed copy is in sos_strings/)"
+        if self._manifest_trunc is None:
+            self._manifest_trunc = set()
+            text, _ = self.read(["sos_reports/manifest.json"], limit=32 * 1024 * 1024)
+            if text:
+                try:
+                    data = json.loads(text)
+                except ValueError:
+                    data = None
+
+                def walk(o):
+                    if isinstance(o, dict):
+                        name = o.get("filepath") or o.get("file") or o.get("path") or o.get("name")
+                        if (o.get("truncated") or o.get("tailed")) and isinstance(name, str):
+                            self._manifest_trunc.add(name.lstrip("/"))
+                        for v in o.values():
+                            walk(v)
+                    elif isinstance(o, list):
+                        for v in o:
+                            walk(v)
+                walk(data)
+        if rel in self._manifest_trunc:
+            return "sos kept only part of this file (marked truncated in sos_reports/manifest.json)"
+        size = self.size(rel)
+        for limit_mb in (25, 100, 500):
+            if abs(size - limit_mb * 1024 * 1024) < 256 * 1024:
+                return "%d MB, which is a sos size limit: older lines were probably not collected" % limit_mb
+        return ""
+
+    def cut(self, rel):
+        """What sosview itself read of the file, when that was not all of it."""
+        got = self.read_max.get(rel)
+        years = ("no year on its lines: those before %s (over 12 months old) are left out" % self.year_cuts[rel]) if rel in self.year_cuts else ""
+        if not got or got[0] >= got[1]:
+            return years
+        return "sosview read the %s %s of this %s file" % ("last" if got[2] else "first", human(got[0]), human(got[1])) + (("; " + years) if years else "")
+
+
+_GREP = re.compile(r"(?<![\w-])grep(?= )(?! -a\b)")
+
+
+def ere(s):
+    """s as a literal in a grep -E pattern: only what grep treats as special is escaped (re.escape also escapes '-',
+    which newer GNU grep warns about)."""
+    return re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", s)
+
+
+LINE_MAX = 16000      # a line longer than this is cut, and ends with …
+BLOCK_TIMES = None    # [time of the last block, [(title, seconds)]] while a section is built
+_now = __import__("time").time
+
+
+def block(title, cmd=None, lines=None, src=None, approx=False, note=None, learn=None,
+          missing=None, error=None, empty=None, refs=None):
+    """One unit of the report: what it is, the equivalent command, the output.
+    state: ok | nc (file not collected) | error (file holds an error message instead of data) | empty"""
+    # a log with a NUL byte or broken UTF-8 makes grep print "binary file matches" in place of the lines: -a reads it as text
+    cmd = _GREP.sub("grep -a", cmd) if cmd else cmd
+    if cmd and not approx:
+        # an exact command: sort orders by the bytes, as the page does, whatever the locale it runs in
+        cmd = re.sub(r"(^|\|\s*)(?<!LC_ALL=C )sort\b", r"\1LC_ALL=C sort", cmd)
+        if lines is not None and len(lines) == ALL_LINES and not re.search(r"\b(head|tail)\b", cmd):
+            # the block was cut at its first ALL_LINES lines; the command says so (a block that shows more, a whole
+            # file, was not cut and its command stays as it is)
+            cmd = ("(%s)" % cmd if ";" in cmd or "&&" in cmd else cmd) + " | head -%d" % ALL_LINES
+    if BLOCK_TIMES is not None:              # how long each block took to build, for the startup summary
+        now = _now()
+        BLOCK_TIMES[1].append((title, now - BLOCK_TIMES[0]))
+        BLOCK_TIMES[0] = now
+    b = {"title": title, "cmd": cmd or "", "approx": approx, "lines": [clean(l, LINE_MAX) for l in (lines or [])],
+         "src": [s for s in (src or []) if s], "note": note or "", "learn": learn or "", "state": "ok",
+         "refs": list(refs or [])}      # per output line: None or [file:line where it was found (newest), message to search for or ""]
+    if missing:
+        b["state"] = "nc"
+        if isinstance(missing, (list, tuple)):
+            names = [m for m in missing if m]
+            b["note"] = ("(not collected) %s is not in this sosreport" % names[0]) if len(names) == 1 else \
+                "(not collected) none of these is in this sosreport: %s" % ", ".join(names[:6])
+        else:
+            b["note"] = "(not collected) %s is not in this sosreport" % missing
+    elif error:
+        b["state"] = "error"
+        b["lines"] = [clean(x, LINE_MAX) for x in error.split("\n")]
+        b["note"] = "the file holds this message instead of data"
+    elif not b["lines"]:
+        b["state"] = "empty"
+        b["note"] = b["note"] or (empty or "(no lines)")
+    return b
+
+
+def counted(pairs, width=7):
+    return ["%*s  %s" % (width, fmt_n(n), k) for k, n in pairs]
+
+
+def top(counter, n=20):
+    return sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))[:n]
+
+
+def bars(day_counts, width=28):
+    """'2026-10-23   171  ███████' with eighth-block resolution, newest day first. Pure arithmetic, no thresholds."""
+    if not day_counts:
+        return []
+    mx = max(day_counts.values()) or 1
+    eighths = " ▏▎▍▌▋▊▉█"
+    out = []
+    for day in sorted(day_counts, reverse=True):
+        n = day_counts[day]
+        units = n * width * 8 // mx
+        bar = "█" * (units // 8) + (eighths[units % 8] if units % 8 else "")
+        if n and not bar:
+            bar = "▏"
+        out.append("%s  %7s  %s" % (day, fmt_n(n), bar))
+    return out
+
+
+def ref_time(ctx):
+    """The 'now' that year-less syslog lines are read against: the collection time, else the date in the report's name."""
+    return parse_when(ctx.get("collected", "")) or parse_when(ctx.get("ref", "")) or datetime.datetime.now()
+
+
+def when_span(a, b, fmt="%b %d %H:%M"):
+    """'Oct 24 10:02 – Oct 25 01:03'; the year is written on both ends when they are in different years."""
+    if a == b:
+        return a.strftime(fmt)
+    if a.year != b.year:
+        fmt = "%Y " + fmt
+    return a.strftime(fmt) + " – " + b.strftime(fmt)
+
+
+def span_of(lines, ctx):
+    """first … last time among the lines. Logs are written in time order, so for long lists only the first and last
+    few hundred lines are parsed."""
+    ref = ref_time(ctx)
+    pick = lines if len(lines) <= 4000 else list(lines[:300]) + list(lines[-300:])
+    ts = [t for t in (parse_when(l, ref) for l in pick) if t is not None]
+    if not ts:
+        return ""
+    a, b = min(ts), max(ts)
+    if a == b:
+        return "at %s" % a.strftime("%Y-%m-%d %H:%M")
+    return "first %s · last %s" % (a.strftime("%Y-%m-%d %H:%M"), b.strftime("%Y-%m-%d %H:%M"))
+
+
+_GEN_PATH = re.compile(r"(/(?:[\w.@+-]+/){2,})([\w.@+%-]+)")
+_KEEP_NAME = re.compile(r"\.(ya?ml|conf|cfg|pem|crt|key|log|rb|py|json|xml|repo|service|sh|erb|properties|ini)$|^[A-Za-z_-]+$")
+
+
+@functools.lru_cache(maxsize=1 << 16)
+def generalize_paths(s):
+    """'/var/lib/pulp/media/artifact/ab/cd9' -> '/var/lib/pulp/media/artifact/ab/…' so per-file messages group together.
+    Names that identify the message (settings.yml, ssl_cert.pem, a word with no digits) are kept."""
+    return _GEN_PATH.sub(lambda m: m.group(0) if _KEEP_NAME.search(m.group(2)) else m.group(1) + "…", s)
+
+
+_SQ1 = re.compile(r"(?=[0-9a-fA-F])(?:"                  # every placeholder starts with a hex digit: lets the scan skip ahead
+                  r"(?P<time>(?<![\w:])(?:\d{4}-\d\d-\d\d[T ])?\d{1,2}:\d\d:\d\d(?:[.,]\d+)?(?:\s?(?:Z|UTC|[+-]\d\d:?\d\d)\b)?(?![\w:]))"   # a time inside the message
+                  r"|(?P<date>\b\d{4}-\d\d-\d\d\b)"
+                  r"|(?P<uuid>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+                  r"|(?P<ip>(?<![\w.-])(?:\d{1,3}\.){3}\d{1,3}(?![\w-]|\.\d))"           # one CDN error from 200 addresses is one message;
+                  r"|(?P<hex>\b[0-9a-fA-F]{16,}\b)"                                          # katello-4.14.0.1 in a gem path is a version, not an address
+                  r"|(?P<num>\b\d{5,}\b))")
+# IPv6 only when it is one: all eight groups, or '::' compression. Clock times (14:22:01), MAC addresses and
+# Ruby names (Katello::Errors) are not addresses.
+_SQ_IP6 = re.compile(r"(?<![\w:.])(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}"
+                     r"|(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{0,4}::(?:[0-9a-fA-F]{1,4}:){0,6}[0-9a-fA-F]{0,4})(?![\w:])")
+_SQ_RETRY = re.compile(r"\b(no\.|#|attempt|retry|try)\s*\d+\b", re.I)            # "retry no. 1" ... "no. 10" as one
+_SQ_WS = re.compile(r"\s+")
+_SQ_REP = {"time": "TIME", "date": "DATE", "uuid": "UUID", "ip": "IP", "hex": "HEX", "num": "N"}
+
+
+@functools.lru_cache(maxsize=1 << 16)
+def squash(s):
+    """Light normaliser for error texts: hide times, ids, addresses and long numbers, keep hostnames and ports."""
+    s = _SQ1.sub(lambda m: _SQ_REP[m.lastgroup], s)
+    if "::" in s or s.count(":") >= 7:
+        s = _SQ_IP6.sub("IP", s)
+    s = _SQ_RETRY.sub(r"\1 N", s)
+    return _SQ_WS.sub(" ", s).strip()[:160]
+
+
+def fold(b, approx=None):
+    """Mark a block as closed by default: one line with its count on the page and in the text report, opened on a click.
+    approx=True also marks its command as one that gives the same information in another shape."""
+    b["fold"] = True
+    if approx is not None:
+        b["approx"] = approx
+    return b
+
+
+def cat(t, title, cands, learn=None, nocomments=False, keep=None, limit=MAX_READ):
+    text, rel = t.read(cands, limit=limit)
+    if text is None:
+        return block(title, "cat %s" % cands[0], missing=cands, learn=learn)
+    lines = text.splitlines()
+    cmd = "cat %s" % rel
+    if nocomments:
+        lines = [l for l in lines if l.strip() and not re.match(r"^\s*[#;]", l)]
+        cmd = "grep -vE '^\\s*(#|;|$)' %s" % rel
+    if keep:
+        rx = re.compile(keep, re.I)
+        lines = [l for l in lines if rx.search(l)]
+        cmd = "grep -iE '%s' %s" % (keep, rel)
+    if PG_ERROR.search(lines[0] if lines else "") and len(lines) <= 3 and "Status" not in text:
+        return block(title, cmd, src=[rel], learn=learn, error="\n".join(lines))
+    return block(title, cmd, lines, [rel], learn=learn, empty="(empty file)")
+
+
+def grep(t, ctx, title, cands, pattern, learn=None, tail=True, last=None, flags=re.I, count=False, largest=False):
+    text, rel = t.read(cands, tail=tail, limit=LOG_READ, largest=largest)
+    shown_pat = pattern.replace("'", "'\\''")
+    if text is None:
+        return block(title, "grep -E '%s' %s" % (shown_pat, cands[0]), missing=cands, learn=learn)
+    rx = re.compile(pattern, flags)
+    hits = [l for l in text.splitlines() if rx.search(l)]
+    opt = "-iE" if flags & re.I else "-E"
+    if count:
+        return block(title, "grep -c %s '%s' %s" % (opt, shown_pat, rel), [fmt_n(len(hits))], [rel], learn=learn, note=span_of(hits, ctx))
+    cmd = "grep %s '%s' %s" % (opt, shown_pat, rel) + (" | tail -%d" % last if last else "") + " | tac"
+    lines = (hits[-last:] if last else hits)[::-1]          # newest first
+    note = " · ".join(x for x in ((plural(len(hits), "matching line")) if hits else "", span_of(hits, ctx)) if x)
+    return block(title, cmd, lines, [rel], learn=learn, note=note, empty="(no matching lines)")
+
+
+def plural(n, word, words=None):
+    return "%s %s" % (fmt_n(n), word if n == 1 else (words or word + "s"))
+
+
+def na_section(reason):
+    return [block("not applicable", None, [], note=reason)]
+
+
+# ---- the bare build: Report, Search and Tasks only ---------------------------------------------------------------
+# This part stands in for the knowledge base, the Learn cards and the plain-language tool, which the bare build leaves out.
+
+
+# ---- v2 Learn: playbooks, known error strings, certificates, diagrams --------------------
+
+
+# ---- where a known string shows up in a sosreport --------------------------------------
+
+# (pattern over the string's "where", files to check, case-insensitive?)
+
+
+def sig_applies(s, role):
+    return s["use"] and (s.get("role", "any") == "any" or role in ("satellite", "capsule"))
+
+
+_MON3 = frozenset(m.encode() for m in ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"))
+
+
+# ---- certificates ----------------------------------------------------------------------
+
+CERT_FILES = [
+    ("etc/pki/katello/certs/katello-apache.crt", "web server certificate (443)"),
+    ("etc/pki/katello/certs/katello-server-ca.crt", "server CA: clients trust it for 443"),
+    ("etc/pki/katello/certs/katello-default-ca.crt", "default CA: signs client and Capsule certs"),
+    ("etc/foreman/proxy_ca.pem", "Satellite checks Capsules (9090) with this"),
+    ("etc/foreman/client_cert.pem", "Satellite's client cert to Capsules"),
+    ("etc/foreman-proxy/ssl_cert.pem", "smart proxy server cert (9090)"),
+    ("etc/foreman-proxy/ssl_ca.pem", "smart proxy checks Satellite's client cert"),
+    ("etc/foreman-proxy/foreman_ssl_cert.pem", "smart proxy's client cert to Satellite"),
+    ("etc/foreman-proxy/foreman_ssl_ca.pem", "smart proxy checks Satellite (443) with this"),
+    ("etc/candlepin/certs/candlepin-ca.crt", "Candlepin CA"),
+    ("etc/rhsm/ca/katello-server-ca.pem", "subscription-manager trusts the Satellite"),
+    ("etc/rhsm/ca/redhat-uep.pem", "subscription-manager trusts the vendor CDN with this"),
+    ("etc/pki/consumer/cert.pem", "this host's identity (after registration)"),
+]
+PEM_RX = re.compile(r"-----BEGIN (TRUSTED )?CERTIFICATE-----.+?-----END (?:TRUSTED )?CERTIFICATE-----", re.S)
+PKCS7_RX = re.compile(r"-----BEGIN PKCS7-----")
+
+
+def decode_pem(pem):
+    """Subject, issuer, dates and SAN of one PEM certificate, using the ssl module that ships with Python."""
+    import ssl
+    dec = getattr(getattr(ssl, "_ssl", None), "_test_decode_cert", None)
+    if dec is None:
+        return None
+    fd, path = tempfile.mkstemp(suffix=".pem", dir=_tmp_base())
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(pem + "\n")
+        return dec(path)
+    except Exception:
+        return None
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+SIG_OIDS = {"1.2.840.113549.1.1.4": "md5WithRSAEncryption", "1.2.840.113549.1.1.5": "sha1WithRSAEncryption",
+            "1.2.840.113549.1.1.10": "rsassaPss", "1.2.840.113549.1.1.11": "sha256WithRSAEncryption",
+            "1.2.840.113549.1.1.12": "sha384WithRSAEncryption", "1.2.840.113549.1.1.13": "sha512WithRSAEncryption",
+            "1.2.840.113549.1.1.14": "sha224WithRSAEncryption", "1.2.840.10040.4.3": "dsaWithSHA1",
+            "1.2.840.10045.4.1": "ecdsa-with-SHA1", "1.2.840.10045.4.3.2": "ecdsa-with-SHA256",
+            "1.2.840.10045.4.3.3": "ecdsa-with-SHA384", "1.2.840.10045.4.3.4": "ecdsa-with-SHA512",
+            "1.3.101.112": "ED25519", "1.3.101.113": "ED448"}
+
+
+def _der_tlv(b, i):
+    """One DER element at offset i: (tag, start of its content, end of its content). Raises on a short or odd buffer."""
+    tag, n = b[i], b[i + 1]
+    i += 2
+    if n & 0x80:
+        k = n & 0x7F
+        if not 1 <= k <= 4:
+            raise ValueError("length")
+        n = int.from_bytes(b[i:i + k], "big")
+        i += k
+    if i + n > len(b):
+        raise ValueError("short")
+    return tag, i, i + n
+
+
+def sig_alg(pem):
+    """The signature algorithm of one PEM certificate, by name when it is a common one, else its OID. None when unreadable.
+    Read straight from the certificate: Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm { OID, ... }, signature }."""
+    import base64
+    try:
+        body = "".join(l for l in pem.splitlines() if l and not l.startswith("-----"))
+        b = base64.b64decode(body)
+        tag, i, end = _der_tlv(b, 0)                   # Certificate
+        if tag != 0x30:
+            return None
+        _, _, i = _der_tlv(b, i)                       # tbsCertificate, skipped
+        tag, i, _ = _der_tlv(b, i)                     # signatureAlgorithm
+        if tag != 0x30:
+            return None
+        tag, i, j = _der_tlv(b, i)                     # its OID
+        if tag != 0x06 or j <= i:
+            return None
+        arcs, v = [b[i] // 40 if b[i] < 80 else 2, b[i] % 40 if b[i] < 80 else b[i] - 80], 0
+        for c in b[i + 1:j]:
+            v = (v << 7) | (c & 0x7F)
+            if not c & 0x80:
+                arcs.append(v)
+                v = 0
+        oid = ".".join(str(a) for a in arcs)
+        return SIG_OIDS.get(oid, oid)
+    except Exception:
+        return None
+
+
+def cert_mark(pem):
+    """(fingerprint, is a CA) of one PEM certificate. The fingerprint is the SHA-256 of the certificate itself, so two files
+    hold the same certificate exactly when their fingerprints are equal. CA: basicConstraints says CA:TRUE."""
+    import base64, hashlib
+    try:
+        der = base64.b64decode("".join(l for l in pem.splitlines() if l and not l.startswith("-----")))
+    except Exception:
+        return None, False
+    if not der:
+        return None, False
+    ca = False
+    i = der.find(b"\x06\x03\x55\x1d\x13")              # the basicConstraints extension
+    if i >= 0:
+        try:
+            j = i + 5
+            if der[j] == 0x01:                           # critical flag
+                j += 3
+            if der[j] == 0x04:                           # the value, wrapped: OCTET STRING { SEQUENCE { BOOLEAN ca } }
+                _, j, _ = _der_tlv(der, j)
+                tag, j, end = _der_tlv(der, j)
+                ca = tag == 0x30 and end - j >= 3 and der[j:j + 3] == b"\x01\x01\xff"
+        except Exception:
+            ca = False
+    return hashlib.sha256(der).hexdigest(), ca
+
+
+def dn_str(dn):
+    parts = []
+    for rdn in dn or ():
+        for k, v in rdn:
+            parts.append("%s=%s" % ({"commonName": "CN", "organizationName": "O", "organizationalUnitName": "OU", "countryName": "C",
+                                     "stateOrProvinceName": "ST", "localityName": "L", "emailAddress": "email"}.get(k, k), v))
+    return ", ".join(parts)
+
+
+def dn_cn(dn):
+    for rdn in dn or ():
+        for k, v in rdn:
+            if k == "commonName":
+                return v
+    return dn_str(dn) or "?"
+
+
+def cert_when(s):
+    """'Nov  2 14:22:01 2027 GMT' -> datetime; month names read without the locale, so a non-English LANG changes nothing."""
+    m = re.match(r"\s*(\w{3})\s+(\d{1,2})\s+(\d\d):(\d\d):(\d\d)\s+(\d{4})", s or "")
+    if not m or m.group(1) not in MONTHS:
+        return None
+    mo, d, hh, mm, ss, y = m.groups()
+    try:
+        return datetime.datetime(int(y), MONTHS[mo], int(d), int(hh), int(mm), int(ss))
+    except ValueError:
+        return None
+
+
+def read_certs(t, rel):
+    text, _ = t.read([rel], limit=8 * 1024 * 1024)
+    if text is None:
+        return None
+    out = []
+    for m in PEM_RX.finditer(text):
+        pem = m.group(0)
+        if m.group(1):          # OpenSSL 'TRUSTED CERTIFICATE': the certificate followed by trust settings
+            pem = pem.replace("BEGIN TRUSTED CERTIFICATE", "BEGIN CERTIFICATE").replace("END TRUSTED CERTIFICATE", "END CERTIFICATE")
+        d = decode_pem(pem) or {"error": "could not decode"}
+        d["_line"] = text.count("\n", 0, m.start()) + 1
+        d["_sig"] = sig_alg(pem)
+        d["_fp"], d["_ca"] = cert_mark(pem)
+        out.append(d)
+    if not out and PKCS7_RX.search(text):
+        out.append({"error": "PKCS#7 bundle: sosview cannot decode it; openssl pkcs7 -print_certs -in %s lists the certificates" % rel})
+    return out
+
+
+def cert_line(c, ref):
+    if "error" in c:
+        return "(%s)" % (c["error"] if c["error"] != "could not decode" else "could not decode this certificate")
+    na = cert_when(c.get("notAfter"))
+    rel = ""
+    if na and ref:
+        days = (na - ref).days
+        rel = " (%d days after collection)" % days if days >= 0 else " (%d days before collection)" % -days
+    san = ", ".join(v for k, v in c.get("subjectAltName", ()) if k in ("DNS", "IP Address"))
+    return "subject %s · issuer %s · until %s%s%s" % (dn_cn(c.get("subject")), dn_cn(c.get("issuer")),
+                                                      na.strftime("%Y-%m-%d") if na else c.get("notAfter", "?"), rel, (" · SAN " + san) if san else "")
+
+
+def cert_inventory(t, ctx):
+    ref = parse_when(ctx.get("collected", ""))
+    if ref and ctx.get("utc_offset"):          # certificate times are UTC, the collection time is the host's clock
+        ref = ref - datetime.timedelta(minutes=ctx["utc_offset"])
+    inv = []
+    for rel, label in CERT_FILES:
+        certs = read_certs(t, rel)
+        if certs is not None:
+            inv.append((rel, label, certs))
+    for rel in sorted(t.glob("etc/pki/entitlement/*.pem")):
+        if "-key" not in rel:
+            certs = read_certs(t, rel)
+            if certs:
+                inv.append((rel, "entitlement / content access", certs))
+    return inv, ref
+
+
+def chain_by_name(leaf, bundle):
+    """Follow issuer names from `leaf` through the subjects in `bundle` (names only, no signature check)."""
+    subjects = dict((dn_str(c.get("subject")), c) for c in bundle if "error" not in c)
+    path, cur, seen = [], leaf, set()
+    while True:
+        iss = dn_str(cur.get("issuer"))
+        if iss == dn_str(cur.get("subject")):
+            return path, "reaches a self-signed CA"
+        nxt = subjects.get(iss)
+        if nxt is None:
+            return path, "issuer %s is not among the subjects in the trust file" % dn_cn(cur.get("issuer"))
+        path.append(dn_cn(nxt.get("subject")))
+        if iss in seen:
+            return path, "loops"
+        seen.add(iss)
+        cur = nxt
+
+
+SAT_443_NOTE = ("sos does not collect etc/pki/katello, so the Satellite's built-in smart proxy certificate is used; the installer issues it "
+                "from the same server-certificate settings as the 443 certificate, so its issuer is normally the same")
+
+
+def trust_direction(title, server_t, server_rels, client_t, client_rel, server_name, client_name):
+    """One direction of Satellite <-> Capsule trust, as facts. server_rels: candidate files for the presented
+    certificate, first one present wins; [(rel, note_if_used)]."""
+    server_rel, used_note = server_rels[0][0], ""
+    for rel, note in server_rels:
+        if read_certs(server_t, rel) is not None:
+            server_rel, used_note = rel, note
+            break
+    sc = read_certs(server_t, server_rel)
+    tc = read_certs(client_t, client_rel)
+    cmd = "openssl verify -CAfile %s/%s %s/%s" % (client_name, client_rel, server_name, server_rel)
+    if sc is None:
+        return block(title, cmd, missing=" or ".join("%s/%s" % (server_name, r) for r, _ in server_rels), learn="cert-trust"), None
+    if tc is None:
+        return block(title, cmd, missing="%s/%s" % (client_name, client_rel), learn="cert-trust"), None
+    if not sc or "error" in sc[0]:
+        return block(title, cmd, [], note="no readable certificate in %s" % server_rel, learn="cert-trust"), None
+    leaf = sc[0]
+    path, end = chain_by_name(leaf, tc)
+    found = end == "reaches a self-signed CA"
+    lines = (["(%s)" % used_note] if used_note else []) + ["presents   %s: subject %s, issuer %s" % (server_rel, dn_cn(leaf.get("subject")), dn_cn(leaf.get("issuer"))),
+             "trust file %s: %d certificate(s): %s" % (client_rel, len(tc), ", ".join(dn_cn(c.get("subject")) for c in tc if "error" not in c)),
+             "issuer chain by name: %s%s" % ((" → ".join([dn_cn(leaf.get("subject"))] + path) + " · ") if path else "", end)]
+    b = block(title, cmd, lines, [server_rel], approx=True, learn="cert-trust",
+              note="names only; openssl verify also checks signatures")
+    return b, {"found": found, "issuer": dn_cn(leaf.get("issuer")), "trust": [dn_cn(c.get("subject")) for c in tc if "error" not in c],
+               "end": end}
+
+
+def capsule_points_at(ct):
+    """[(file, host)] for where a Capsule report says its Satellite is."""
+    found = []
+    tx, rel = ct.read(["etc/foreman-proxy/settings.yml"])
+    if tx:
+        m = re.search(r"^\s*:foreman_url:\s*['\"]?https?://([^/:'\"\s]+)", tx, re.M)
+        if m:
+            found.append((rel + "  :foreman_url:", m.group(1)))
+    tx, rel = ct.read(["etc/rhsm/rhsm.conf"])
+    if tx:
+        m = re.search(r"^\s*hostname\s*=\s*(\S+)", tx, re.M)
+        if m:
+            found.append((rel + "  hostname", m.group(1)))
+    return found
+
+
+def pair_names_block(st, sctx, ct, cctx):
+    names = capsule_points_at(ct)
+    sat = sctx["hostname"]
+    lines = ["%-50s %s" % (f, h) for f, h in names] + ["%-50s %s" % ("paired Satellite report: hostname", sat)]
+    differ = [h for _, h in names if h.lower() != sat.lower() and h.split(".")[0].lower() != sat.split(".")[0].lower()]
+    note = ("the Capsule names %s; the paired Satellite report is %s, so these may be reports of unrelated hosts"
+            % (", ".join(sorted(set(differ))), sat)) if differ else ("names match" if names else "")
+    return block("which Satellite the Capsule names", "grep -E ':foreman_url:' etc/foreman-proxy/settings.yml; grep -E '^hostname' etc/rhsm/rhsm.conf",
+                 lines, [], approx=True, learn="cert-trust", note=note, empty="(the Capsule report has neither settings.yml nor rhsm.conf)")
+
+
+CERT_GROUPS = [
+    ("Satellite web server and its CAs (443)", ("etc/pki/katello/", "etc/candlepin/")),
+    ("Satellite ↔ Capsule: smart proxy certificates (9090)", ("etc/foreman/", "etc/foreman-proxy/")),
+    ("subscription-manager: what this host trusts and its own certificates", ("etc/rhsm/", "etc/pki/consumer/", "etc/pki/entitlement/")),
+]
+
+
+BUNDLE_MIN = 3     # a file with this many certificates is a CA bundle: one row for the file
+
+
+def _cert_rows(group, ref, seen=None):
+    """One row per distinct certificate (by fingerprint), with the files that hold it. The vendor's root bundle is one row
+    for the file, with its earliest expiry. `seen` (fingerprint -> first file) carries over between blocks, so a certificate already
+    listed above is said to be the same one. Columns line up within the group."""
+    seen = {} if seen is None else seen
+    rows, by_fp = [], {}
+    for rel, label, certs in group:
+        certs = certs or []
+        good = [c for c in certs if "error" not in c]
+        if not certs:
+            rows.append({"text": "(no certificate in this file)", "files": [(rel, label, 1)]})
+            continue
+        if rel == VENDOR_ROOT and len(good) >= BUNDLE_MIN:      # the same bundle on every host: one row for the file
+            whens = sorted(w for w in (cert_when(c.get("notAfter")) for c in good) if w)
+            rows.append({"na": whens[0] if whens else None, "subj": "%d certificates" % len(good), "iss": "earliest expiry shown", "files": [(rel, label, 1)], "bundle": True})
+            continue
+        for c in certs:
+            if "error" in c:
+                rows.append({"text": cert_line(c, ref), "files": [(rel, label, c.get("_line") or 1)]})
+                continue
+            fp = c.get("_fp") or id(c)
+            if fp in by_fp:
+                if rel not in [f[0] for f in by_fp[fp]["files"]]:
+                    by_fp[fp]["files"].append((rel, label, c.get("_line") or 1))
+                continue
+            subj, iss = dn_cn(c.get("subject")), dn_cn(c.get("issuer"))
+            san = [v for kk, v in c.get("subjectAltName", ()) if kk in ("DNS", "IP Address")]
+            by_fp[fp] = {"na": cert_when(c.get("notAfter")), "raw": c.get("notAfter"), "subj": subj[:48] + (" (CA)" if c.get("_ca") and not re.search(r"\bCA\b|Authority", subj) else ""),
+                         "iss": "itself" if dn_str(c.get("subject")) == dn_str(c.get("issuer")) else iss[:48],
+                         "san": "" if not san or san == [subj] else "SAN " + ", ".join(san), "files": [(rel, label, c.get("_line") or 1)], "fp": fp}
+            rows.append(by_fp[fp])
+
+    def cells(r):
+        days = (r["na"] - ref).days if r.get("na") and ref else None
+        return [r["na"].strftime("%Y-%m-%d") if r.get("na") else (r.get("raw") or "?")[:11], "" if days is None else str(days), r["subj"], r["iss"]]
+    table = [cells(r) for r in rows if "text" not in r]
+    w = [max([len(h)] + [len(c[i]) for c in table]) for i, h in enumerate(("EXPIRES", "DAYS", "SUBJECT", "ISSUER"))]
+    lines, refs = [("%-*s  %*s  %-*s    %-*s  %s" % (w[0], "EXPIRES", w[1], "DAYS", w[2], "SUBJECT", w[3], "ISSUER", "IN")).rstrip()], [None]
+    for r in rows:
+        fs = r["files"]
+        where = "%s · %s" % (fs[0][0], fs[0][1]) if len(fs) == 1 else "%d files: %s" % (len(fs), " · ".join(f[0] for f in fs))
+        if r.get("fp") in seen and seen[r["fp"]] not in [f[0] for f in fs]:
+            where += " · the same certificate as in %s" % seen[r["fp"]]
+        if r.get("fp"):
+            seen.setdefault(r["fp"], fs[0][0])
+        if "text" in r:
+            lines.append("%s  %s" % (r["text"], where))
+        else:
+            c = cells(r)
+            lines.append(("%-*s  %*s  %-*s  ← %-*s  %s%s" % (w[0], c[0], w[1], c[1], w[2], c[2], w[3], c[3], where, (" · " + r["san"]) if r.get("san") else "")).rstrip())
+        refs.append({"rel": fs[0][0], "line": fs[0][2], "q": "", "tip": "\n".join("%s: %s" % (f[0], f[1]) for f in fs) if len(fs) > 1 else ""})
+    return lines, refs
+
+
+SERVER_CERT_FILES = ("etc/pki/katello/certs/katello-apache.crt", "etc/foreman-proxy/ssl_cert.pem")
+CHAIN_PREFIXES = ("etc/pki/katello/", "etc/foreman/", "etc/foreman-proxy/")
+_UNSET = ("", "~", "null", "false", '""', "''")
+
+
+def cert_origin(t, ctx):
+    """'custom' or 'default' server certificates on a Satellite, from the installer answers: a server_cert that is set means custom."""
+    if ctx.get("role") != "satellite":
+        return None
+    text, rel = t.read(ANSWERS)
+    if text is None or not re.search(r"^certs:", text, re.M):
+        return None
+    m = re.search(r"^certs:[ \t]*\n((?:[ \t]+.*\n?|[ \t]*\n)*)", text, re.M)
+    v = re.search(r"^[ \t]+server_cert:[ \t]*(.*?)[ \t]*$", m.group(1) if m else "", re.M)
+    val = (v.group(1) if v else "").strip()
+    if val.strip("\"'") and val not in _UNSET:
+        return "server certificates: custom (the installer answers set server_cert: %s)" % val.strip("\"'")
+    return "server certificates: default, from the installer's own CA (no server_cert in the installer answers)"
+
+
+def _name_fits(host, names):
+    h = (host or "").lower().rstrip(".")
+    for n in names:
+        n = n.lower().rstrip(".")
+        if n == h or (n.startswith("*.") and "." in h and h.split(".", 1)[1] == n[2:]) or ("." not in h and n.startswith(h + ".")):
+            return True
+    return False
+
+
+def cert_facts(t, ctx, inv, ref):
+    """The lines of 'certificates at a glance': counts, custom or default, validity on the collection date, and one line
+    for each of two disagreements when the report holds them: a server certificate that is not for this host's name, and
+    an issuer that is not among the certificates in the report."""
+    distinct = {}
+    for rel, _, certs in inv:
+        for c in certs:
+            if "error" not in c:
+                distinct.setdefault(c.get("_fp") or id(c), (rel, c))
+    total = sum(len(c) for _, _, c in inv)
+    out = ["%d certificate%s in %d file%s · %d distinct" % (total, "" if total == 1 else "s", len(inv), "" if len(inv) == 1 else "s", len(distinct))]
+    origin = cert_origin(t, ctx)
+    if origin:
+        out.append(origin)
+    dated = [(rel, c, cert_when(c.get("notBefore")), cert_when(c.get("notAfter"))) for rel, c in distinct.values()]
+    dated = [d for d in dated if d[3]]
+    if dated and ref:
+        late = sorted((d for d in dated if d[3] < ref), key=lambda d: d[3])
+        early = sorted((d for d in dated if d[2] and d[2] > ref), key=lambda d: d[2])
+        if not late and not early:
+            f = min(dated, key=lambda d: d[3])
+            dd = (f[3] - ref).days
+            out.append("valid at collection: all %d · earliest expiry: %s, %d day%s after collection, %s in %s"
+                       % (len(dated), f[3].strftime("%Y-%m-%d"), dd, "" if dd == 1 else "s", dn_cn(f[1].get("subject")), f[0]))
+        else:
+            parts = ["valid at collection: %d of %d" % (len(dated) - len(late) - len(early), len(dated))]
+            said = []                                  # [reason, files]; files with the same reason share one mention
+            for d in late:
+                said.append(("expired %d day%s before collection" % ((ref - d[3]).days, "" if (ref - d[3]).days == 1 else "s"), d[0]))
+            for d in early:
+                said.append(("not valid until %s" % d[2].strftime("%Y-%m-%d"), d[0]))
+            groups = []
+            for why, rel in said:
+                g = next((x for x in groups if x[0] == why), None)
+                if g is None:
+                    groups.append((why, [rel]))
+                elif rel not in g[1]:
+                    g[1].append(rel)
+            for why, rels in groups[:4]:
+                parts.append("%s: %s%s" % (why, ", ".join(rels[:3]), " and %d more" % (len(rels) - 3) if len(rels) > 3 else ""))
+            if len(groups) > 4:
+                parts.append("and %d more" % (len(groups) - 4))
+            out.append(" · ".join(parts))
+    elif dated:
+        f = min(dated, key=lambda d: d[3])
+        out.append("earliest expiry: %s, %s in %s (the collection date is unknown, so validity is not compared)" % (f[3].strftime("%Y-%m-%d"), dn_cn(f[1].get("subject")), f[0]))
+    host = ctx.get("hostname") or ""
+    by_rel = dict((rel, certs) for rel, _, certs in inv)
+    if host and host != "unknown":
+        for rel in SERVER_CERT_FILES:
+            cs = [c for c in by_rel.get(rel) or [] if "error" not in c]
+            if cs:
+                names = [dn_cn(cs[0].get("subject"))] + [v for k, v in cs[0].get("subjectAltName", ()) if k == "DNS"]
+                names = [n for i, n in enumerate(names) if n and n not in names[:i]]
+                if not _name_fits(host, names):
+                    out.append("name: %s is for %s · this host is %s" % (rel, ", ".join(names[:4]), host))
+    subjects = set(dn_str(c.get("subject")) for _, c in distinct.values())
+    told = set()
+    for rel, _, certs in inv:
+        if not rel.startswith(CHAIN_PREFIXES):
+            continue
+        for c in certs:
+            if "error" in c:
+                continue
+            iss = dn_str(c.get("issuer"))
+            if iss != dn_str(c.get("subject")) and iss not in subjects and (c.get("_fp"), iss) not in told:
+                told.add((c.get("_fp"), iss))
+                out.append("chain: the issuer of %s (%s) is not among the certificates in this report" % (rel, dn_cn(c.get("issuer"))))
+    return out
+
+
+VENDOR_ROOT = "etc/rhsm/ca/redhat-uep.pem"      # the vendor's own root; its algorithm is the same on every host
+
+
+def sig_lines(inv):
+    """One line: each signature algorithm and how many certificates carry it. Under it, the files of every algorithm
+    but the most common one (three files at most each), so the odd ones out can be found."""
+    by = {}
+    for rel, _, certs in inv:
+        for c in certs:
+            if c.get("_sig"):
+                by.setdefault(c["_sig"], []).append(rel)
+    if not by:
+        return []
+    if len(set(c["_sig"] for rel, _, certs in inv if rel != VENDOR_ROOT for c in certs if c.get("_sig"))) < 2:
+        return []                                   # one algorithm throughout: nothing to tell apart
+    order = sorted(by, key=lambda a: (-len(by[a]), a))
+    out = ["signed with: " + " · ".join("%s %d" % (a, len(by[a])) for a in order)]
+    for a in order[1:]:
+        files = sorted(set(by[a]))
+        out.append("   %s: %s%s" % (a, ", ".join(files[:3]), " and %d more" % (len(files) - 3) if len(files) > 3 else ""))
+    return out
+
+
+def s03_certs(t, ctx):
+    inv, ref = cert_inventory(t, ctx)
+    out = []
+    if not inv:
+        out.append(block("certificate files", "ls etc/pki/katello/certs etc/foreman-proxy etc/rhsm/ca etc/pki/consumer 2>/dev/null", [], learn="cert-trust",
+                         empty="(none of the Satellite, Capsule or subscription-manager certificate files are in this sosreport)"))
+    else:
+        seen_fp = {}
+        for title, prefixes in CERT_GROUPS:
+            if not title.startswith("Satellite ↔ Capsule"):
+                continue                     # every certificate's dates are under Potential issues, in the certificate check
+            grp = [x for x in inv if x[0].startswith(prefixes)]
+            if not grp:
+                continue
+            lines, refs = _cert_rows(grp, ref, seen_fp)
+            cmd = "for f in %s; do echo \"== $f\"; openssl crl2pkcs7 -nocrl -certfile $f | openssl pkcs7 -print_certs -noout; done%s" % (" ".join(r for r, _, _ in grp[:4]),
+                  ("   # and %d more files" % (len(grp) - 4)) if len(grp) > 4 else "")
+            out.append(block(title, cmd, lines, [r for r, _, _ in grp], approx=True, learn="cert-trust", refs=refs,
+                             note="one row per certificate · DAYS: collection date to expiry · ← issuer"))
+        if not out:
+            out.append(block("certificate files", "ls %s 2>/dev/null" % " ".join(r for r, _, _ in inv), [r for r, _, _ in inv], [r for r, _, _ in inv], approx=True,
+                             learn="cert-trust", note="their dates and whether each was valid at collection are under Potential issues"))
+    pair = ctx.get("pair")
+    if pair:
+        roles = {ctx["role"]: (t, ctx), pair["ctx"]["role"]: (pair["t"], pair["ctx"])}
+        if "satellite" in roles and "capsule" in roles:
+            (st, sctx), (ct, cctx) = roles["satellite"], roles["capsule"]
+            sname, cname = os.path.basename(st.root), os.path.basename(ct.root)
+            out.append(pair_names_block(st, sctx, ct, cctx))
+            b1, r1 = trust_direction("Capsule → Satellite (443): %s checks %s" % (cctx["hostname"], sctx["hostname"]),
+                                     st, [("etc/pki/katello/certs/katello-apache.crt", ""), ("etc/foreman-proxy/ssl_cert.pem", SAT_443_NOTE)],
+                                     ct, "etc/foreman-proxy/foreman_ssl_ca.pem", sname, cname)
+            b2, r2 = trust_direction("Satellite → Capsule (9090): %s checks %s" % (sctx["hostname"], cctx["hostname"]),
+                                     ct, [("etc/foreman-proxy/ssl_cert.pem", "")], st, "etc/foreman/proxy_ca.pem", cname, sname)
+            for bb, srv in ((b1, st), (b2, ct)):
+                if srv is not t and bb.get("src"):
+                    bb["src"] = ["@pair/" + x for x in bb["src"]]
+            out.extend([b1, b2])
+            ctx["trust"] = {"cap_to_sat": r1, "sat_to_cap": r2, "sat": sctx["hostname"], "cap": cctx["hostname"]}
+        else:
+            out.append(block("paired report", None, [], note="pairing compares one Satellite with one Capsule; these are %s and %s"
+                             % (ctx["role"], pair["ctx"]["role"])))
+    return out
+
+
+# ---- facts used by the diagrams ---------------------------------------------------------
+
+
+# ---- SVG diagrams (static, filled with this report's values) ----------------------------
+
+
+# ---- the Satellite map on the Learn home page -----------------------------------------------
+# Each box: where it sits (column, row on a 6 x 3 grid), the systemd units that are it, the logs whose known strings
+# count for it (only strings of its own playbooks), and its playbooks. "outside" boxes are never on this host.
+
+
+def unit_states(t):
+    """Units and their ACTIVE state from systemctl list-units, as sos collected it: {unit: state}."""
+    for cands in (["sos_commands/systemd/systemctl_list-units_--all", "sos_commands/systemd/systemctl_list-units_--all_--no-pager"],
+                  ["sos_commands/systemd/systemctl_list-units"]):
+        text, rel = t.read(cands)
+        if text:
+            out = {}
+            for l in text.splitlines():
+                m = re.match(r"^\W*([\w@.:-]+\.(?:service|socket|timer))\s+(\S+)\s+(\S+)\s+(\S+)", l)
+                if m:
+                    out[m.group(1)] = m.group(3)
+            return out, rel
+    return None, None
+
+
+# ---- the 20 sections, fixed order -----------------------------------------------------
+
+# the system log: whichever of messages and the journal dump holds most. sos names the journal after its options
+# (journalctl_--no-pager, ..._--boot, ..._--since_-3days), so a glob, biggest file wins.
+LOGS = ["var/log/messages", "sos_commands/logs/journalctl_--no-pager*"]
+JOURNAL = ["sos_commands/logs/journalctl_--no-pager*", "var/log/messages"]
+PS = ["ps", "sos_commands/process/ps_auxwww", "sos_commands/process/ps_auxwwwm", "sos_commands/process/ps_aux"]
+DF = ["df", "sos_commands/filesys/df_-al_-x_autofs", "sos_commands/filesys/df_-al", "sos_commands/filesys/df_-h"]
+UNITS = ["sos_commands/systemd/systemctl_list-units", "sos_commands/systemd/systemctl_list-units_--all", "sos_commands/systemd/systemctl_list-units_--all_--no-pager"]
+INSTALLER = ["var/log/foreman-installer/satellite.log", "var/log/foreman-installer/capsule.log",
+             "var/log/foreman-installer/katello.log", "var/log/foreman-installer/foreman-installer.log"]
+TASKS = ["sos_commands/foreman/foreman_tasks_tasks"]
+STEPS = ["sos_commands/foreman/dynflow_steps", "sos_commands/foreman/dynflow_steps_--limit_50000"]
+STEP_COLS = {"execution_plan_uuid", "id", "state", "started_at", "error", "action_class", "class"}   # the data column (JSON) is not read
+PROD = ["var/log/foreman/production.log"]
+ACCESS = ["var/log/httpd/foreman-ssl_access_ssl.log", "var/log/httpd/rhsm-pulpcore-https-443_access_ssl.log", "var/log/httpd/pulpcore-https-443_access_ssl.log"]
+HTTPD_ERR = ["var/log/httpd/error_log", "var/log/httpd/foreman-ssl_error_ssl.log", "var/log/httpd/rhsm-pulpcore-https-443_error_ssl.log"]
+PROXY_LOG = ["var/log/foreman-proxy/proxy.log"]
+PG_LOGS = ["var/lib/pgsql/data/log/*.log", "var/lib/pgsql/data/pg_log/*.log", "var/opt/rh/rh-postgresql12/lib/pgsql/data/log/*.log"]
+PG_CONF = ["var/lib/pgsql/data/postgresql.conf", "var/opt/rh/rh-postgresql12/lib/pgsql/data/postgresql.conf"]
+ANSWERS = ["etc/foreman-installer/scenarios.d/satellite-answers.yaml", "etc/foreman-installer/scenarios.d/capsule-answers.yaml"]
+SCENARIO = ["etc/foreman-installer/scenarios.d/satellite.yaml", "etc/foreman-installer/scenarios.d/capsule.yaml"]
+
+
+ALL_LINES = 500      # a block that lists every matching line stops here and says how many more there are
+
+
+def upto(lines, n=None):
+    """(the first n lines, a note saying how many more there are or '')."""
+    n = n or ALL_LINES
+    return lines[:n], ("%s more not shown" % fmt_n(len(lines) - n)) if len(lines) > n else ""
+
+
+COPIES_TOTAL = 256 * 1024 * 1024      # decompressed bytes read of one log's rotated copies, newest first
+COPIES_FILES = 40
+
+
+def read_copies(t, pattern, current=None):
+    """A log together with its rotated copies: [(file, text)], the current file first and then the copies, newest
+    first (by the file's time). A plain file gives its end, a compressed copy its start, each up to LOG_READ; reading
+    stops at COPIES_TOTAL. Second value: the files that were not read."""
+    files = [f for f in t.glob(pattern) if not ARCHIVE.search(f)]
+    if current and current in files:
+        files.remove(current)
+
+    def mtime(r):
+        try:
+            return os.path.getmtime(os.path.join(t.root, r))
+        except OSError:
+            return 0
+    files = ([current] if current and t.exists(current) else []) + sorted(files, key=lambda r: (mtime(r), r), reverse=True)
+    got, left, total = [], [], 0
+    for r in files:
+        if total >= COPIES_TOTAL or len(got) >= COPIES_FILES:
+            left.append(r)
+            continue
+        if COMPRESSED.search(r):
+            try:
+                with open_log(os.path.join(t.root, r)) as fh:
+                    data = fh.read(LOG_READ)
+                text = data.decode("utf-8", "replace")
+            except Exception:           # a damaged copy: the others are still read
+                left.append(r)
+                continue
+        else:
+            text, _ = t.read([r], tail=True, limit=LOG_READ)
+            if text is None:
+                continue
+        total += len(text)
+        got.append((r, text))
+    return got, left
+
+
+def copies_note(got, left):
+    return join_notes("read %s" % plural(len(got), "file") if len(got) > 1 else "", ("%s not read" % plural(len(left), "older copy", "older copies")) if left else "")
+
+
+def grep_context(lines, pred, before=0, after=0):
+    """The lines grep -B/-A would print: each match with its context, '--' between groups that do not touch."""
+    keep = set()
+    for i, l in enumerate(lines):
+        if pred(l):
+            keep.update(range(max(0, i - before), min(len(lines), i + after + 1)))
+    out, prev = [], None
+    for i in sorted(keep):
+        if prev is not None and i > prev + 1:
+            out.append("--")
+        out.append(lines[i])
+        prev = i
+    return out
+
+
+def ls_names(t, rel):
+    """`ls REL` run in the report directory: the names only. `ls -l` there would show the owner of the extracted copy
+    (whoever extracted it) and, for folders, the time of extraction: facts of this computer, not of the host."""
+    import subprocess
+    ls = shutil.which("ls")
+    if ls:
+        try:
+            p = subprocess.run([ls, rel], cwd=t.root, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, timeout=20)
+            if p.returncode == 0:
+                return p.stdout.decode("utf-8", "replace").splitlines()
+        except Exception:
+            pass
+    return None
+
+
+NAMES_ONLY = "names only: owners and dates in an extracted copy are those of the computer it was extracted on"
+
+
+def ps_sorted(rows_text, col, n):
+    """`sort -nr -kCOL ps | head -n N`: the number the column starts with, then the whole line, both descending."""
+    def key(l):
+        f = l.split()
+        m = re.match(r"-?\d+(?:\.\d+)?", f[col - 1]) if len(f) >= col else None
+        return (float(m.group(0)) if m else 0.0, l)
+    return sorted([l for l in rows_text.splitlines() if l.strip()], key=key, reverse=True)[:n]
+
+
+def top_nr(counter, n):
+    """The first n of `sort | uniq -c | sort -nr`: the largest count first, equal counts in reverse text order."""
+    return sorted(counter.items(), key=lambda kv: (kv[1], kv[0]), reverse=True)[:n]
+
+
+_LINE_TIME = re.compile(r"^(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d)\S*\s+(.*)$")
+
+
+_LINE_PID = re.compile(r"(\b[\w.@-]+):\d+(?=:\w)|(?<=\w)\[\d+\](?=:)")      # 'dnf:11482:MainThread', 'sshd[991]:' : the process id differs on every run
+
+
+def collapse_repeats(lines, look=3):
+    """Log lines, newest first, with the repeats of a message on one line. Returns runs [newest time, oldest time, count,
+    text of the newest line after its time, the newest line]. A line joins one of the last `look` runs when its text is
+    the same with ids set aside, so two or three messages that take turns still fold."""
+    runs, keys = [], []
+    for l in lines:
+        m = _LINE_TIME.match(l)
+        when, msg = (("%s %s" % (m.group(1), m.group(2))), m.group(3).rstrip()) if m else ("", l.rstrip())
+        k = _LINE_PID.sub(r"\1", _ERR_NUM_ID.sub(r"\1…", _ERR_IDS.sub("…", msg)))
+        for back in range(1, min(look, len(runs)) + 1):
+            if keys[-back] == k:
+                runs[-back][1], runs[-back][2] = when, runs[-back][2] + 1
+                break
+        else:
+            runs.append([when, when, 1, msg, l])
+            keys.append(k)
+    return runs
+
+
+_HEX_ADDR = re.compile(r"\b0x[0-9a-fA-F]{6,}\b")
+_FULL_TIME = re.compile(r"(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d(?::\d\d)?)")
+_LOG_LEVEL = re.compile(r"\b(?:ERROR|FATAL|PANIC|WARNING|LOG|DETAIL|STATEMENT|HINT|CONTEXT):")
+
+
+def fold_file_lines(pairs, look=3):
+    """(file, line) pairs from one or more logs, newest first by the time on each line, with the repeats of a message on
+    one line. A line joins one of the last `look` runs when its text from the level word on is the same once ids and
+    numbers are set aside, so two or three messages that take turns still fold, also across files. Returns runs
+    [newest time, oldest time, count, file of the newest line, text, newest line]."""
+    rows = []
+    for i, (rel, l) in enumerate(pairs):
+        m = _FULL_TIME.search(l[:80])
+        rows.append(("%s %s" % m.groups() if m else "", i, rel, l, m))
+    rows.sort(key=lambda x: (x[0], x[1]), reverse=True)          # newest first; within one time, the later line first
+    runs, keys, memo = [], [], {}
+    for when, _, rel, l, m in rows:
+        lv = _LOG_LEVEL.search(l)
+        raw = l[lv.start():] if lv else l[m.end():] if m else l
+        got = memo.get(raw)
+        if got is None:                    # the same message comes back thousands of times: make its text and key once
+            text = squash(raw)
+            got = memo[raw] = (text, re.sub(r"\d{3,}", "#", _ERR_NUM_ID.sub(r"\1…", _ERR_IDS.sub("…", _HEX_ADDR.sub("0x…", text)))))
+        text, k = got
+        for back in range(1, min(look, len(runs)) + 1):
+            if keys[-back] == k:
+                runs[-back][1], runs[-back][2] = when[:16], runs[-back][2] + 1
+                break
+        else:
+            runs.append([when[:16], when[:16], 1, rel, text, l])
+            keys.append(k)
+    return runs
+
+
+def folded_lines_block(t, ctx, title, pairs, grep_cmd, src, many, learn, note, empty):
+    """A block of log lines newest first. When a message repeats, each run of it is one line: its newest time, how many,
+    since when, the file and the text. When nothing repeats, the lines as the logs wrote them."""
+    runs = fold_file_lines(pairs)
+    if len(runs) == len(pairs):
+        lines = [((rel + ":") if many else "") + l for rel, l in [(r[3], r[5]) for r in runs]]
+        return block(title + " (newest first)", grep_cmd + " | sort -r" if many else grep_cmd + " | tac", lines[:ALL_LINES], src, learn=learn,
+                     approx=many, note=join_notes(note, upto(lines)[1]), empty=empty)
+    lines = ["%-16s %6s  %-22s %s%s" % (a or "(no time)", "×%s" % fmt_n(n), ("since %s" % b) if n > 1 and b != a else "", (rel.rsplit("/", 1)[-1] + "  ") if many else "", txt)
+             for a, b, n, rel, txt, _ in runs]
+    return block(title + " (newest first, repeats of a line on one line)",
+                 grep_cmd + " | sort -r | sed -E 's/^([0-9-]+ [0-9:]{5})\\S* .*((ERROR|FATAL|PANIC|DETAIL|LOG):.*)/\\1 \\2/' | uniq -c -f2",
+                 lines[:ALL_LINES], src, learn=learn, approx=True,
+                 note=join_notes("%s on %s" % (plural(len(pairs), "line"), plural(len(runs), "line")), note, upto(runs)[1]), empty=empty,
+                 refs=[{"rel": rel, "raw": raw, "q": ""} for _, _, _, rel, _, raw in runs[:ALL_LINES]])
+
+
+def repeat_lines(runs):
+    return ["%-16s %6s  %-22s %s" % (a, "×%s" % fmt_n(n), ("since %s" % b) if n > 1 else "", msg) for a, b, n, msg, _ in runs]
+
+
+def join_notes(*parts):
+    return " · ".join(p for p in parts if p)
+
+
+def head_table(t, title, cands, n=20, learn=None, keep=None):
+    """The first n rows of a table sos dumped from the database (psql aligned or csv), header kept."""
+    text, rel = t.read(cands, limit=4 * 1024 * 1024)
+    if text is None:
+        return block(title, "grep -vE '^[[:space:]]*$|^\\([0-9]+ rows?\\)$' %s | head -%d" % (cands[0], n + 2), missing=cands, learn=learn)
+    lines = [l for l in text.splitlines() if l.strip() and not re.match(r"^\(\d+ rows?\)$", l.strip())]
+    if keep:
+        lines = lines[:2] + [l for l in lines[2:] if re.search(keep, l, re.I)]
+    more = max(0, len(lines) - (n + 2))
+    # blank lines and psql's "(N rows)" footer are not rows: the command leaves them out as the block does
+    return block(title, "grep -vE '^[[:space:]]*$|^\\([0-9]+ rows?\\)$' %s | head -%d" % (rel, n + 2), lines[:n + 2], [rel], learn=learn, note=("%s more rows in the file" % fmt_n(more)) if more else "",
+                 approx=bool(keep), empty="(empty: the query returned nothing)")
+
+
+TAINT_BITS = ("proprietary module loaded", "module force-loaded", "kernel running on out-of-specification hardware", "module force-unloaded",
+              "machine check exception", "bad page", "taint requested by userspace", "kernel oops or BUG", "ACPI table overridden", "kernel warning",
+              "staging driver loaded", "firmware bug workaround", "out-of-tree module loaded", "unsigned module loaded", "soft lockup",
+              "live patched", "auxiliary taint", "built with struct randomisation")
+
+
+def taint_flags(value):
+    """What the set bits of proc/sys/kernel/tainted stand for. Bits past the common list are vendor-specific and named by number."""
+    try:
+        n = int(str(value).strip())
+    except ValueError:
+        return []
+    return [TAINT_BITS[i] if i < len(TAINT_BITS) else "bit %d" % i for i in range(64) if n >> i & 1]
+
+
+def _rpm_key(v):
+    """Sort key close to rpm's own order: runs of digits compare as numbers, runs of letters as text, digits above letters."""
+    return [(1, int(x), "") if x.isdigit() else (0, 0, x) for x in re.findall(r"\d+|[A-Za-z]+", v)]
+
+
+def newest_kernel(t, running):
+    """The newest installed kernel package, when it is not the running one. None when it is, or when either is unknown."""
+    text, _ = t.read(["installed-rpms"], limit=16 * 1024 * 1024)
+    m = re.search(r"\b(\d+\.\d+\.\d+-\S+)", running or "")
+    if text is None or not m:
+        return None
+    run = m.group(1)
+    arch = run.rsplit(".", 1)[-1]
+    have = set(re.findall(r"^kernel(?:-core)?-(\d\S*)", text, re.M))
+    have = {k for k in have if k.rsplit(".", 1)[-1] == arch}
+    if run not in have:
+        return None
+    top = max(have, key=_rpm_key)
+    return top if top != run else None
+
+
+def s01_system(t, ctx):
+    out = []
+    parts, srcs, hrefs, first = [], [], [], {}
+    for cands in (["hostname", "sos_commands/host/hostname"], ["etc/hostname"], ["etc/redhat-release", "etc/os-release"], ["uname", "sos_commands/kernel/uname_-a"],
+                  ["proc/cmdline"], ["sos_commands/crypto/update-crypto-policies_--show"],
+                  ["uptime", "sos_commands/host/uptime", "sos_commands/general/uptime"], ["date", "sos_commands/date/date"], ["version.txt"]):
+        text, rel = t.read(cands)
+        if text is not None and text.strip():
+            first[cands[0]] = (text.strip().splitlines() or [""])[0].strip()
+            parts.append("%-22s %s" % (rel, first[cands[0]]))
+            srcs.append(rel)
+            hrefs.append({"rel": rel, "line": 1 + (len(text) - len(text.lstrip("\n"))), "q": ""})
+    notes = []                                          # said only when there is something to say
+    taint = ((t.read(["proc/sys/kernel/tainted"])[0] or "").strip().splitlines() or ["0"])[0].strip()
+    flags = taint_flags(taint)
+    if flags:
+        notes.append("proc/sys/kernel/tainted is %s: %s" % (taint, ", ".join(flags)))
+    if ((t.read(["proc/sys/crypto/fips_enabled"])[0] or "").strip().splitlines() or ["0"])[0].strip() == "1":
+        notes.append("FIPS mode is on (proc/sys/crypto/fips_enabled is 1)")
+    newer = newest_kernel(t, first.get("uname"))
+    if newer:
+        notes.append("a newer kernel is installed than the one running: %s" % newer)
+    out.append(block("host, OS, kernel, uptime, collection time", "awk 'NF && !s[FILENAME]++ {sub(/^[ \\t]+/, \"\"); printf \"%-22s %s\\n\", FILENAME, $0}' " + " ".join(srcs), parts, srcs, learn="system-basics", refs=hrefs,
+                     note=" · ".join(notes) or None,
+                     approx=any("\ufffd" in x for x in parts)))     # bytes that are not text are shown cleaned, so not exactly as printed
+    text, rel = t.read(["dmidecode", "sos_commands/hardware/dmidecode"])
+    if text is None:
+        out.append(block("hardware vendor and model (virtual or bare metal)", "grep -A3 'System Information' dmidecode", missing="dmidecode"))
+    else:
+        m = re.search(r"System Information\n((?:\t.*\n){1,4})", text)
+        lines = [l.strip() for l in text.splitlines() if re.search(r"Vendor|Manufacture", l)][:3]
+        lines += [l.strip() for l in (m.group(1).splitlines() if m else []) if re.match(r"\s*(Product Name|Version|Family)", l)]
+        out.append(block("hardware vendor and model (virtual or bare metal)", "grep -E 'Vendor|Manufacture' %s | head -3; grep -A4 'System Information' %s | grep -oE '(Product Name|Version|Family).*'" % (rel, rel),
+                         lines, [rel], approx=True, empty="(no vendor or manufacturer line)"))
+    text, rel = t.read(["proc/cpuinfo"])
+    if text is None:
+        out.append(block("CPUs", "grep -c ^processor proc/cpuinfo", missing="proc/cpuinfo"))
+    else:
+        n = len(re.findall(r"^processor\s*:", text, re.M))
+        models = {}
+        for mm in re.findall(r"^model name\s*:\s*(.+)$", text, re.M):
+            models[mm.strip()] = models.get(mm.strip(), 0) + 1
+        out.append(block("CPUs", "grep -c ^processor %s; grep 'model name' %s | sort | uniq -c" % (rel, rel),
+                         ["%d processors" % n] + counted(top(models, 4)), [rel], approx=True))
+    out.append(recent_changes(t, ctx))
+    out.extend(config_changes(t, ctx))
+    out.append(sos_log_block(t))
+    out.append(dmesg_block(t, ctx))
+    if ctx.get("extract_notes") or ctx.get("partial"):
+        notes = ctx.get("extract_notes") or []
+        out.append(block("what could not be read from the archive", "tar tf REPORT.tar.xz > /dev/null", ([ctx["partial"]] if ctx.get("partial") else []) + notes[:40], [],
+                         approx=True, note=plural(len(notes), "member") if notes else ""))
+    return out
+
+
+STACK_PKGS = ("satellite|foreman|katello|pulpcore|python3?[0-9]*-pulp|candlepin|puppet|rubygem-(katello|foreman)|ansible|leapp|insights|"
+              "subscription-manager|postgresql|redis|tomcat|httpd-[0-9]")
+
+
+SOS_LOG_RX = r" (WARNING|ERROR|CRITICAL): |timed out|runcated|size limit"
+
+
+def sos_log_block(t):
+    """What sos itself reported while it collected: commands it skipped, timeouts, size limits and errors."""
+    title = "what sos skipped or could not finish while collecting"
+    text, rel = t.read(["sos_logs/sos.log"], limit=32 * 1024 * 1024)
+    cmd = "grep -E '%s' %s | cut -d' ' -f3- | tail -25 | tac" % (SOS_LOG_RX, rel or "sos_logs/sos.log")
+    if text is None:
+        return block(title, cmd, missing=["sos_logs/sos.log"])
+    hits = [(n, l) for n, l in enumerate(text.splitlines(), 1) if re.search(SOS_LOG_RX, l)]
+    ran = re.search(r"executing '([^'\n]*)'", text[:4000])
+    note = " · ".join(x for x in (plural(len(hits), "line") if hits else "", ("sos ran as: " + ran.group(1)) if ran else "") if x)
+    return block(title, cmd, [" ".join(l.split(" ")[2:]) for _, l in hits[-25:][::-1]], [rel], note=note, empty="(sos reported nothing skipped, cut or timed out)",
+                 refs=[{"rel": rel, "line": n, "q": ""} for n, _ in hits[-25:][::-1]])
+
+
+DMESG_RX = r"error|fail|warn|BUG:|Call Trace|segfault|Out of memory|soft lockup|blocked for more than|I/O error|corrupt|timed out"
+_PCI_ADDR = re.compile(r"\b[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]\b")
+
+
+def dmesg_block(t, ctx):
+    """Kernel ring buffer lines that name an error, a failure or a warning, counted by text (device addresses as one)."""
+    title = "kernel messages (dmesg): lines that say error, fail or warn, by text (newest first)"
+    text, rel = t.read(["sos_commands/kernel/dmesg_-T", "sos_commands/kernel/dmesg", "dmesg", "var/log/dmesg"], tail=True, limit=16 * 1024 * 1024)
+    if text is None:
+        return block(title, "grep -iE '%s' sos_commands/kernel/dmesg" % DMESG_RX, missing=["sos_commands/kernel/dmesg_-T", "sos_commands/kernel/dmesg"])
+    rx = re.compile(DMESG_RX, re.I)
+    agg, ex, n, last, stamp = {}, {}, 0, {}, {}
+    for pos, l in enumerate(text.splitlines()):
+        if rx.search(l):
+            n += 1
+            k = re.sub(r"0x[0-9a-fA-F]+", "0xN", _PCI_ADDR.sub("ADDR", squash(re.sub(r"^\[[^\]]*\]\s*", "", l))))
+            agg[k] = agg.get(k, 0) + 1
+            ex[k], last[k] = l, pos
+            m = re.match(r"^\[\s*([^\]]*?)\s*\]", l)
+            stamp[k] = m.group(1) if m else ""
+    order = sorted(agg, key=lambda k: -last[k])[:15]        # the text seen last comes first; the kernel's own time of that line leads the row
+    w = max([len(stamp[k]) for k in order] or [0])
+    pairs = [(k, agg[k]) for k in order]
+    return block(title, "grep -iE '%s' %s | sed -E 's/[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\\.[0-9a-f]/ADDR/g' | tac | awk '{t=$0; sub(/^\\[[^]]*\\] */,\"\",t); if(!(t in n))o[++c]=t; n[t]++} END {for(i=1;i<=c&&i<=15;i++) print n[o[i]], o[i]}'" % (DMESG_RX, rel),
+                 ["%-*s %6s  %s" % (w, stamp[k], fmt_n(agg[k]), k) for k in order], [rel], approx=True,
+                 note=("%s in %s distinct texts · the time is the kernel's own, of the text's newest line" % (plural(n, "line"), fmt_n(len(agg)))) if n else "",
+                 empty="(no such lines)", refs=raw_refs(rel, pairs, ex, q=lambda k: ""))
+
+
+FW_KEEP = r"\(active\)|interfaces|sources|services|ports|rich rules"
+
+
+def firewall_block(t):
+    """firewalld: running or not, and what its active zones let in."""
+    title = "firewall (firewalld): state and what the active zones allow"
+    st, srel = t.read(["sos_commands/firewalld/firewall-cmd_--state"])
+    zt, zrel = t.read(["sos_commands/firewalld/firewall-cmd_--list-all-zones"])
+    if st is None and zt is None:
+        return block(title, "cat sos_commands/firewalld/firewall-cmd_--state", missing=["sos_commands/firewalld/firewall-cmd_--state", "sos_commands/firewalld/firewall-cmd_--list-all-zones"])
+    lines, cmds = [], []
+    if st is not None:
+        lines += [l for l in st.splitlines() if l.strip()]
+        cmds.append("cat %s" % srel)
+    if zt is not None:
+        on = False
+        for l in zt.splitlines():
+            if "(active)" in l:
+                on = True
+            elif not l.strip():
+                on = False
+            if on and re.search(FW_KEEP, l) and not re.search(r":\s*$", l):
+                lines.append(l)
+        cmds.append("awk '/\\(active\\)/{p=1} /^[[:space:]]*$/{p=0} p' %s | grep -E '%s' | grep -vE ':\\s*$'" % (zrel, FW_KEEP))
+    return block(title, "; ".join(cmds), lines, [x for x in (srel, zrel) if x], empty="(nothing recorded)")
+
+
+def selinux_blocks(t, ctx):
+    """SELinux mode, and the denials the audit log holds, counted by process, permission and target class."""
+    out = []
+    pat = r"SELinux status|Current mode|Mode from config|Loaded policy"
+    text, rel = t.read(["sos_commands/selinux/sestatus", "sos_commands/selinux/sestatus_-b", "sos_commands/selinux/sestatus_-v"])
+    if text is None and t.exists("etc/selinux/config"):
+        out.append(cat(t, "SELinux mode (configured: /etc/selinux/config)", ["etc/selinux/config"]))
+    elif text is None:
+        out.append(block("SELinux mode", "grep -E '%s' sos_commands/selinux/sestatus" % pat, missing=["sos_commands/selinux/sestatus"]))
+    else:
+        out.append(block("SELinux mode", "grep -E '%s' %s" % (pat, rel), [l for l in text.splitlines() if re.search(pat, l)], [rel], empty="(no mode lines)"))
+    if text is not None and t.exists("etc/selinux/config"):
+        out.append(cat(t, "/etc/selinux/config", ["etc/selinux/config"]))
+    rp, rprel = t.read(["installed-rpms"], limit=16 * 1024 * 1024)
+    lt_, lrel_ = t.read(LOGS, tail=True, limit=LOG_READ)
+    if rp is not None or lt_ is not None:
+        pk = [l for l in (rp or "").splitlines() if "setroubleshoot" in l]
+        se = sorted(set(m.group(0) for m in re.finditer(r"sealert.*", lt_ or "")))
+        out.append(fold(block("setroubleshoot packages and sealert lines in the system log",
+                              "grep -s setroubleshoot %s; grep -s -o 'sealert.*' %s | sort -u" % (rprel or "installed-rpms", lrel_ or LOGS[0]),
+                              pk + se[:ALL_LINES], [x for x in (rprel, lrel_) if x], approx=True,
+                              note=upto(se)[1], empty="(setroubleshoot is not installed, and no sealert line is in the log)")))
+    acands = audit_logs(t)
+    text, rel = t.read(acands, tail=True, limit=LOG_READ)
+    title = "SELinux denials (AVC) in audit.log, by process, permission and target class"
+    cmd = ("grep 'avc:  denied' %s | sed -E 's/.*denied +\\{ ([^}]*) \\}.*comm=\"([^\"]*)\".*tclass=([a-z_0-9]+).*/\\2 { \\1 } \\3/' | sort | uniq -c | sort -rn | head -15"
+           % (rel or "var/log/audit/audit.log"))
+    if text is None:
+        out.append(block(title, cmd, missing=acands))
+        return out
+    agg, ex, n, first, last = {}, {}, 0, None, None
+    for l in text.splitlines():
+        if "avc:" not in l or "denied" not in l:
+            continue
+        m = re.search(r"denied\s+\{ ([^}]*) \}.*?comm=\"([^\"]*)\"(?:.*?tclass=(\w+))?", l)
+        if not m:
+            continue
+        n += 1
+        k = ("%s { %s } %s" % (m.group(2), m.group(1), m.group(3) or "")).rstrip()
+        agg[k] = agg.get(k, 0) + 1
+        ex[k] = l
+        ts = re.search(r"audit\((\d+)\.", l)
+        if ts:
+            w = datetime.datetime(1970, 1, 1) + datetime.timedelta(seconds=int(ts.group(1)))
+            first, last = (w if first is None or w < first else first), (w if last is None or w > last else last)
+    note = ("%s · first %s · last %s UTC" % (plural(n, "denial"), first.strftime("%Y-%m-%d %H:%M"), last.strftime("%Y-%m-%d %H:%M"))) if n and first else ""
+    out.append(block(title, cmd, counted(top(agg, 15)), [rel], approx=True, note=note, empty="(no AVC denials in audit.log)",
+                     refs=raw_refs(rel, top(agg, 15), ex, q=lambda k: "")))
+    den = sorted(set(m.group(0) for m in re.finditer(r"denied.*", text)))
+    out.append(fold(block("denied in audit.log: each distinct line", "grep -o 'denied.*' %s | sort -u" % rel, den[:ALL_LINES], [rel],
+                          note=join_notes(plural(len(den), "distinct line") if den else "", upto(den)[1]), empty="(no line with 'denied')")))
+    return out
+
+
+def s02_network(t, ctx):
+    out = [cat(t, "/etc/hosts", ["etc/hosts"], learn="etc-hosts"),
+           cat(t, "/etc/resolv.conf", ["etc/resolv.conf"])]
+    text, rel = t.read(["ip_addr", "sos_commands/networking/ip_-o_addr", "sos_commands/networking/ip_-d_address", "sos_commands/networking/ip_address"])
+    if text is None:
+        out.append(block("IP addresses", "cat ip_addr", missing="ip_addr"))
+    else:
+        al, amore = upto(text.splitlines())
+        out.append(block("IP addresses", "cat %s" % rel, al, [rel], note=amore, empty="(empty file)"))
+    out.append(cat(t, "routes", ["ip_route", "sos_commands/networking/ip_route", "sos_commands/networking/ip_route_show_table_all"]))
+    lines, srcs, prefs = [], [], []
+    for cands, pat in ((["etc/rhsm/rhsm.conf"], r"proxy"), (["etc/dnf/dnf.conf", "etc/yum.conf"], r"^\s*proxy"),
+                       (["etc/environment"], r"_proxy"), (ANSWERS, r"^  proxy_(url|port|username|password)"), (["etc/sysconfig/virt-who"], r"(?i)proxy")):
+        text, rel = t.read(cands)
+        if text is None:
+            continue
+        for l in text.splitlines():
+            if re.search(pat, l) and not (l.startswith("#") and "virt-who" not in rel):
+                lines.append("%-48s %s" % (rel, l.strip()))
+                srcs.append(rel)
+                prefs.append({"rel": rel, "raw": l.strip(), "q": ""})
+    out.append(block("proxy settings found in config files", "grep -sF proxy etc/rhsm/rhsm.conf | grep -v ^#; grep -sE '^  proxy_(url|port|username|password)' etc/foreman-installer/scenarios.d/*-answers.yaml; grep -sFi proxy etc/sysconfig/virt-who; grep -sE '^\\s*proxy' etc/dnf/dnf.conf etc/yum.conf; grep -s _proxy etc/environment",
+                     lines, sorted(set(srcs)), approx=True, empty="(no proxy settings in the files collected)", refs=prefs))
+    out.append(net_failures(t, ctx))
+    facts = net_facts(t, ctx)
+    if facts:
+        out.append(facts)
+    if ctx.get("role") != "rhel":
+        out.append(rex_failures(t, ctx))
+    out.append(firewall_block(t))          # the clock is under Potential issues, in the clock check
+    return out
+
+
+def s03_packages(t, ctx):
+    out = []
+    text, rel = t.read(["installed-rpms"], limit=16 * 1024 * 1024)
+    if text is None:
+        out.append(block("installed packages", "wc -l installed-rpms", missing="installed-rpms"))
+    else:
+        names = [l.split()[0] for l in text.splitlines() if l.strip()]
+        stack = [n for n in names if re.match("(%s)" % STACK_PKGS, n)]
+        sat = [l for l in text.splitlines() if "satellite" in l]
+        if ctx.get("role") != "rhel" or sat:
+            out.append(block("installed packages which contain satellite", "grep satellite %s" % rel, sat[:ALL_LINES], [rel], note=upto(sat)[1],
+                             empty="(no package name contains satellite)"))
+        out.append(block("installed packages: count, and the Satellite / subscription / platform stack",
+                         "wc -l < %s; grep -oE '^(%s)\\S*' %s" % (rel, STACK_PKGS, rel),
+                         ["%s packages installed" % fmt_n(len(names))] + stack, [rel], approx=True))
+    text, rel = t.read(["sos_commands/rpm/package-data"], limit=16 * 1024 * 1024)
+    if text is None:
+        out.append(block("packages from other vendors", "cut -f1,4 sos_commands/rpm/package-data | grep -v 'Red Hat'", missing="sos_commands/rpm/package-data"))
+    else:
+        rows, vendors = [], {}
+        for l in text.splitlines():
+            c = l.split("\t")
+            cut = "\t".join(c[i] for i in (0, 3) if i < len(c))
+            if "Red Hat" in cut or "katello-ca-consumer-" in cut:
+                continue
+            v = c[3].strip() if len(c) > 3 else ""
+            vendors[v or "(none)"] = vendors.get(v or "(none)", 0) + 1
+            rows.append(cut)
+        rows.sort(key=lambda r: (r.split(None, 1)[1] if len(r.split(None, 1)) > 1 else "", r))      # sort -k2
+        lines = rows[:ALL_LINES]
+        out.append(block("packages from other vendors", "cut -f1,4 %s | grep -v -e 'Red Hat' -e katello-ca-consumer- | sort -k2" % rel, lines, [rel], note=join_notes(plural(len(vendors), "vendor") if rows else "", upto(rows)[1]),
+                         approx=True, empty="(every package is from the OS vendor)"))
+    text, rel = t.read(["sos_commands/dnf/dnf_history", "sos_commands/dnf/dnf_history_list", "sos_commands/yum/yum_history", "sos_commands/dnf/dnf_-C_history",
+                        "sos_commands/dnf/dnf*history*"])
+    if text is None:
+        out.append(block("package transactions (dnf / yum history)", "cat sos_commands/dnf/dnf_history", missing="sos_commands/dnf/dnf_history", learn="dnf-history"))
+    else:
+        hl, hmore = upto(text.splitlines())
+        out.append(block("package transactions (dnf / yum history)", "cat %s" % rel, hl, [rel], learn="dnf-history", note=hmore))
+    return out
+
+
+REPOLIST = ["sos_commands/dnf/dnf_-C_repolist", "sos_commands/dnf/dnf_-C_repolist_--verbose", "sos_commands/dnf/dnf_repo_info",
+            "sos_commands/yum/yum_-C_repolist", "sos_commands/yum/yum_-C_repolist_--verbose", "sos_commands/yum/yum_repolist"]
+
+
+def repolist(t):
+    """The repo ids in the repolist sos ran (dnf 4 table, dnf 5 'repo info', yum table, or --verbose 'Repo-id :' lines).
+    Returns (ids, file, first error line) or None when no repolist was collected. ids is [] when the output lists no repos."""
+    for cand in REPOLIST:
+        text, rel = t.read([cand], limit=4 * 1024 * 1024)
+        if text is None:
+            continue
+        ids, table, err = [], False, None
+        for l in text.splitlines():
+            m = re.match(r"^\s*Repo[- ]?id\s*:\s*(\S+)", l, re.I)
+            if m:
+                ids.append(m.group(1))
+                continue
+            if re.match(r"^\s*repo id\s", l, re.I):
+                table = True
+                continue
+            if re.match(r"^\s*repolist:", l, re.I):
+                table = False
+                continue
+            if table and l.strip():
+                ids.append(re.sub(r"/.*$", "", l.split()[0].lstrip("!*")))
+            elif err is None and re.search(r"\b(error|unable|cannot|failed)\b", l, re.I):
+                err = l.strip()
+        return [i for n, i in enumerate(ids) if i not in ids[:n]], rel, err
+    return None
+
+
+def _rhsm_conf(text):
+    """rhsm.conf as {section: {key: value}}, with %(name)s references filled in from the same section."""
+    conf, sec = {}, None
+    for l in text.splitlines():
+        m = re.match(r"^\s*\[([^\]]+)\]", l)
+        if m:
+            sec = conf.setdefault(m.group(1).strip().lower(), {})
+            continue
+        m = re.match(r"^\s*([A-Za-z_]+)\s*[=:]\s*(.*?)\s*$", l)
+        if m and sec is not None:
+            sec[m.group(1).lower()] = m.group(2)
+    for sec in conf.values():
+        for k, v in list(sec.items()):
+            sec[k] = re.sub(r"%\((\w+)\)s", lambda r: sec.get(r.group(1).lower(), r.group(0)), v)
+    return conf
+
+
+def content_source(t, enabled, rl):
+    """One place for where this host registers, where its content comes from, its release pin and its repo count.
+    Every value names the file it came from; a value that is not set shows subscription-manager's built-in default."""
+    sm = "sos_commands/subscription_manager/"
+    lines, src = [], []
+    text, rel = t.read(["etc/rhsm/rhsm.conf"])
+    if text is None:
+        lines.append("registers to    not collected (etc/rhsm/rhsm.conf is not in this sosreport)")
+    else:
+        src.append(rel)
+        c = _rhsm_conf(text)
+        s, r = c.get("server", {}), c.get("rhsm", {})
+
+        def val(d, k, dflt):
+            v = d.get(k, "")
+            return (v, "") if v else (dflt, " (not set; default)")
+        host, h_d = val(s, "hostname", "subscription.rhsm.redhat.com")
+        port, p_d = val(s, "port", "443")
+        prefix, x_d = val(s, "prefix", "/subscription")
+        unset = [k for k, d in (("hostname", h_d), ("port", p_d), ("prefix", x_d)) if d]
+        lines.append("registers to    %s:%s%s%s" % (host, port, prefix, (" (%s not set; default)" % ", ".join(unset)) if unset else ""))
+        base, b_d = val(r, "baseurl", "https://cdn.redhat.com")
+        lines.append("content from    %s%s" % (base, b_d))
+        ca, c_d = val(r, "repo_ca_cert", "/etc/rhsm/ca/redhat-uep.pem")
+        lines.append("repo CA         %s%s" % (ca, c_d))
+        ph = s.get("proxy_hostname", "")
+        lines.append("proxy           %s" % ("%s:%s" % (ph, s.get("proxy_port", "") or "(no port set)") if ph else "(none set in rhsm.conf)"))
+    it, irel = None, None           # identity: its own block, as collected
+    st, srel = t.read([sm + "subscription-manager_status"])
+    if st is None:
+        lines.append("content access  not collected (subscription-manager status)")
+    else:
+        src.append(srel)
+        mode = re.search(r"Content Access Mode is set to ([^.\n]+)", st)
+        overall = re.search(r"Overall Status:\s*(.+)", st)
+        parts = (["Overall Status: " + overall.group(1).strip()] if overall else []) + (["Content Access Mode: " + mode.group(1).strip()] if mode else [])
+        body = [l.strip() for l in st.splitlines() if l.strip() and not re.match(r"^[+\-\s]+$|^\s*System Status Details", l)]
+        first = next((l for l in body if re.search(r"[:：]\s*\S", l)), body[0] if body else "(empty)")
+        lines.append("content access  %s" % (" · ".join(parts) if parts else first[:160]))
+    rel_parts = []
+    rt, rrel = t.read([sm + "subscription-manager_release_--show", sm + "subscription-manager_release"])
+    if rt is None:
+        rel_parts.append("subscription-manager release: not collected")
+    else:
+        src.append(rrel)
+        rlines = [l.strip() for l in rt.splitlines() if l.strip()] or ["(empty)"]
+        shown = rlines[-1] if rlines[0].startswith("Traceback") else rlines[0]
+        rel_parts.append("subscription-manager release: %s" % re.sub(r"^Release:\s*", "", shown)[:80])
+    for d in ("etc/dnf/vars", "etc/yum/vars"):
+        if not t.listdir(d) and not t.listdir(d.rsplit("/", 1)[0]):
+            continue
+        v, vrel = t.read([d + "/releasever"])
+        if v is not None:
+            src.append(vrel)
+            rel_parts.append("%s/releasever: %s" % (d, v.strip() or "(empty)"))
+        else:
+            rel_parts.append("%s/releasever: not present" % d)
+    lines.append("release         " + " · ".join(rel_parts))
+    if enabled is None:
+        rr = "redhat.repo: not collected"
+    else:
+        rr = "%d enabled in redhat.repo" % len(enabled)
+    if rl is None:
+        lines.append("repos           %s · repolist: not collected" % rr)
+    else:
+        src.append(rl[1])
+        name = rl[1].rsplit("/", 1)[-1].replace("_", " ")
+        if rl[0]:
+            lines.append("repos           %s · %d in %s (as sos ran it)" % (rr, len(rl[0]), name))
+        else:
+            lines.append("repos           %s · %s lists no repos%s" % (rr, name, ("; it says: " + rl[2][:140]) if rl[2] else ""))
+    if not src and enabled is None:
+        return block("where this host registers and gets content", "cat etc/rhsm/rhsm.conf", learn="sm-identity",
+                     missing=["etc/rhsm/rhsm.conf", sm + "subscription-manager_identity", sm + "subscription-manager_status", sm + "subscription-manager_release_--show", "etc/yum.repos.d/redhat.repo", REPOLIST[0]])
+    cmds = []                    # only the files that are in this sosreport, so the line runs as it stands
+    if rel:
+        cmds.append("grep -E '^ *(hostname|port|prefix|baseurl|repo_ca_cert|proxy_hostname|proxy_port) *=' %s" % rel)
+    if irel:
+        cmds.append("cat %s" % irel)
+    if srel:
+        cmds.append("grep -E 'Overall|Content Access' %s" % srel)
+    rest = [x for x in src if x not in (rel, irel, srel)]
+    if rest:
+        cmds.append("head -20 %s" % " ".join(rest))
+    cmd = "; ".join(cmds)
+    where = {"registers to": (rel, r"^\s*hostname\s*[=:]"), "content from": (rel, r"^\s*baseurl\s*[=:]"), "repo CA": (rel, r"^\s*repo_ca_cert\s*[=:]"),
+             "proxy": (rel, r"^\s*proxy_hostname\s*[=:]"), "identity": (irel, r"\S"), "content access": (srel, r"Content Access Mode|Overall Status"),
+             "release": (rrel, r"\S"), "repos": (rl[1] if rl else None, r"\S")}
+    refs = []
+    for l in lines:
+        f, rx = where.get(l[:15].strip(), (None, None))
+        txt = t.read([f])[0] if f else None
+        m = re.search(rx, txt or "", re.M) if txt else None
+        refs.append({"rel": f, "line": txt.count("\n", 0, m.start()) + 1, "q": ""} if m else None)
+    return block("where this host registers and gets content", cmd, lines, src, approx=True, learn="sm-identity", refs=refs)
+
+
+def s04_subscriptions(t, ctx):
+    sm = "sos_commands/subscription_manager/"
+    text, rel = t.read(["etc/yum.repos.d/redhat.repo"])
+    en, total = [], 0
+    for b in re.split(r"^\[", text or "", flags=re.M)[1:]:
+        total += 1
+        if re.search(r"^enabled\s*=\s*1", b, re.M):
+            en.append(b.split("]", 1)[0].strip())
+    rl = repolist(t)
+    out = [content_source(t, en if text is not None else None, rl),
+           cat(t, "subscription-manager identity", [sm + "subscription-manager_identity"], learn="sm-identity")]
+    tail_blocks = [cat(t, "subscription-manager list --installed", [sm + "subscription-manager_list_--installed"]),
+                   fold(cat(t, "subscription-manager list --consumed", [sm + "subscription-manager_list_--consumed"]))]
+    if text is None:
+        out.append(block("enabled repositories (redhat.repo)", "grep -B12 'enabled = 1' etc/yum.repos.d/redhat.repo | grep '^\\['", missing="etc/yum.repos.d/redhat.repo", learn="redhat-repo"))
+    else:
+        lines = (["%d of %d repos enabled" % (len(en), total)] + en) if en else []     # none enabled: the block is empty, its note says so
+        erefs = [None] + [{"rel": rel, "raw": "[%s]" % r, "q": ""} for r in en]
+        if rl and rl[0]:
+            only_rl = [r for r in rl[0] if r not in en]
+            only_rr = [r for r in en if r not in rl[0]]
+            if only_rl:
+                lines.append("in %s, not enabled in redhat.repo: %s" % (rl[1].rsplit("/", 1)[-1].replace("_", " "), ", ".join(only_rl[:12]) + (" …" if len(only_rl) > 12 else "")))
+            if only_rr:
+                lines.append("enabled in redhat.repo, not in %s: %s" % (rl[1].rsplit("/", 1)[-1].replace("_", " "), ", ".join(only_rr[:12]) + (" …" if len(only_rr) > 12 else "")))
+        out.append(block("enabled repositories (redhat.repo)", "awk '/^\\[/{r=$0} /^enabled *= *1/{print r}' %s%s" % (rel, ("; awk 'NR>1{print $1}' %s" % rl[1]) if rl and rl[0] else ""),
+                         lines, [rel] + ([rl[1]] if rl else []), approx=True, learn="redhat-repo", refs=erefs if lines else [],
+                         empty="(0 of %d repos enabled)" % total))
+    rv, rvrel = t.read(["sos_commands/dnf/dnf_-C_repolist_--verbose", "sos_commands/yum/yum_-C_repolist_--verbose", "sos_commands/dnf/dnf_-C_repolist",
+                        "sos_commands/yum/yum_-C_repolist", "sos_commands/dnf/dnf_repo_info", "sos_commands/yum/yum_repolist"], limit=4 * 1024 * 1024)
+    if rv is None:
+        out.append(block("repolist as collected", "cat sos_commands/dnf/dnf_-C_repolist_--verbose", missing="sos_commands/dnf/dnf_-C_repolist_--verbose"))
+    else:
+        rl_, rmore = upto(rv.splitlines())
+        out.append(block("repolist as collected", "cat %s" % rvrel, rl_, [rvrel], note=rmore, empty="(empty file)"))
+    rows, orefs = [], []
+    for n in t.listdir("etc/yum.repos.d"):
+        if not n.endswith(".repo") or n == "redhat.repo":
+            continue
+        tx, _ = t.read(["etc/yum.repos.d/" + n], limit=512 * 1024)
+        for b in re.split(r"^\[", tx or "", flags=re.M)[1:]:
+            rid = b.split("]", 1)[0]
+            en = re.search(r"^enabled\s*=\s*(\d)", b, re.M)
+            url = re.search(r"^(baseurl|mirrorlist|metalink)\s*=\s*(\S+)", b, re.M)
+            rows.append("%-26s %-32s enabled=%s  %s" % (n, rid[:32], en.group(1) if en else "1(default)", url.group(2) if url else ""))
+            orefs.append({"rel": "etc/yum.repos.d/" + n, "raw": "[%s]" % rid, "q": ""})
+    out.append(block("other repo files in /etc/yum.repos.d", "grep -sH -E '^\\[|^enabled|^baseurl' etc/yum.repos.d/*.repo | grep -v '/redhat.repo:'", rows,
+                     ["etc/yum.repos.d/"], approx=True, empty="(no other .repo files)", refs=orefs))
+    out.append(cat(t, "dnf/yum excludes and version locks", ["etc/dnf/dnf.conf", "etc/yum.conf"], keep=r"^\s*(exclude|excludepkgs|includepkgs|best|proxy)"))
+    rp, rprel = t.read(["installed-rpms"], limit=16 * 1024 * 1024)
+    ut, utrel = t.read(UNITS)
+    if rp is not None or ut is not None:
+        ka = [l for l in (rp or "").splitlines() if re.match(r"^(katello-agent|gofer)", l)] + [re.sub(r"^\W+", "", l) for l in (ut or "").splitlines() if "goferd" in l]
+        out.append(block("katello-agent and gofer packages, and the goferd unit", "grep -sE '^katello-agent|^gofer' %s; grep -s goferd %s" % (rprel or "installed-rpms", utrel or UNITS[0]),
+                         ka, [x for x in (rprel, utrel) if x], approx=True, empty="(not installed, and no goferd unit)"))
+    out += tail_blocks
+    prods = sorted(t.glob("etc/pki/product/*.pem") + t.glob("etc/pki/product-default/*.pem"))
+    out.append(block("product certificates (which RHEL products this host claims)", "ls etc/pki/product*/*.pem 2>/dev/null",
+                     [p for p in prods], prods[:1] and ["etc/pki/product"], learn="repos-404", empty="(no product certificates in this sosreport)"))
+    return out
+
+
+INSTALLER_SCAN = 96 * 1024 * 1024     # bytes read of each installer log while looking for its run line
+INSTALLER_FILES = 80
+
+
+def installer_runs(t, rel):
+    """Every run the installer logged, newest first: the installer starts a new log for each run and keeps the earlier
+    ones beside it under dated names, so the runs are spread over satellite.log and satellite.*.log(.gz)."""
+    stem = rel.rsplit("/", 1)[-1].split(".", 1)[0]
+    files = sorted(set(t.glob("var/log/foreman-installer/%s.*" % stem)))
+    more = max(0, len(files) - INSTALLER_FILES)
+    files = [rel] + sorted([f for f in files if f != rel], reverse=True)[:INSTALLER_FILES - 1]
+    rows, read = [], []
+    for r in files:
+        try:
+            with open_log(os.path.join(t.root, r)) as fh:
+                got = 0
+                for raw in fh:
+                    got += len(raw)
+                    if b"Running installer with args" in raw:
+                        rows.append((r, clean(raw.decode("utf-8", "replace"), LINE_MAX)))
+                    if got > INSTALLER_SCAN:
+                        break
+            read.append(r)
+        except Exception:               # a damaged compressed copy: the other logs are still read
+            continue
+
+    def when(row):
+        m = re.search(r"\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d", row[1])
+        return m.group(0).replace("T", " ") if m else ""
+    rows.sort(key=when, reverse=True)
+    name = lambda r: r.rsplit("/", 1)[-1]
+    wide = max([len(name(r)) for r, _ in rows] or [0])
+    packed = any(COMPRESSED.search(r) for r in read)
+    cmd = "%s 'Running installer with args' var/log/foreman-installer/%s.* | sort -t: -k2 -r" % ("zgrep -a" if packed else "grep -a", stem)
+    note = "%s in %s" % (plural(len(rows), "run"), plural(len(read), "log")) + ((" · %d older logs not read" % more) if more else "")
+    return block("all installer runs, from every installer log (newest first)", cmd, ["%-*s  %s" % (wide, name(r), l) for r, l in rows[:ALL_LINES]], read,
+                 approx=True, learn="installer-log", note=note, empty="(no 'Running installer with args' line in %s)" % plural(len(read), "installer log"),
+                 refs=[None if COMPRESSED.search(r) else {"rel": r, "raw": l, "q": ""} for r, l in rows[:ALL_LINES]])
+
+
+def s05_installer(t, ctx):
+    out = []
+    text, rel = t.read(INSTALLER, tail=True, limit=LOG_READ)
+    if text is None:
+        out.append(block("satellite-installer runs", "grep 'Running installer with args' var/log/foreman-installer/satellite.log",
+                         missing="var/log/foreman-installer/satellite.log", learn="installer-log"))
+        out.append(custom_hiera(t))
+        return out
+    last = [l for l in text.splitlines() if re.search(r"Running installer with args|signal was", l)]
+    out.append(block("last installer run: its arguments and exit signal", "grep -E 'Running installer with args|signal was' %s" % rel,
+                     last[-12:], [rel], learn="installer-log", empty="(no 'Running installer with args' or 'signal was' line)"))
+    out.append(installer_runs(t, rel))
+    out.append(custom_hiera(t))
+    errs = [l for l in text.splitlines() if re.match(r"^\[\s*ERROR", l)]
+    out.append(block("[ERROR] lines in the installer log", "grep -E '^\\[ *ERROR' %s | tac" % rel, errs[::-1][:ALL_LINES], [rel], learn="installer-log",
+                     note=join_notes(plural(len(errs), "[ERROR] line"), span_of(errs, ctx), upto(errs)[1]), empty="(0 [ERROR] lines)"))
+    ends = [l for l in text.splitlines() if re.search(r"Success!|Upgrade completed|Puppet has finished|exit status \d+|signal was", l)]
+    out.append(block("how the runs ended", "grep -E 'Success!|Upgrade completed|Puppet has finished|exit status [0-9]+|signal was' %s | tac" % rel, ends[::-1][:ALL_LINES], [rel],
+                     note=join_notes(plural(sum(1 for l in ends if "Upgrade completed" in l), "'Upgrade completed' line"), upto(ends)[1]),
+                     empty="(no completion lines)"))
+    out.append(block("last 20 lines of the installer log", "tail -20 %s" % rel, text.splitlines()[-20:], [rel]))
+    mt, mrel = t.read(["var/log/foreman-maintain/foreman-maintain.log"], tail=True, limit=LOG_READ)
+    if mt is None:
+        out.append(block("satellite-maintain / foreman-maintain errors", "grep -E '^E,|FAIL' var/log/foreman-maintain/foreman-maintain.log", missing="var/log/foreman-maintain/foreman-maintain.log"))
+    else:
+        e = [l for l in mt.splitlines() if re.match(r"^E,", l) or "[FAIL]" in l]
+        out.append(block("satellite-maintain / foreman-maintain errors", "grep -E '^E,|\\[FAIL\\]' %s | tail -15 | tac" % mrel, e[-15:][::-1], [mrel],
+                         note=span_of(e, ctx), empty="(no error lines)"))
+    return out
+
+
+def free_in_gb(text, rel):
+    """free output (KiB, or MiB from free -m) with the amounts in GB (one decimal); None when it is in other units."""
+    if rel.endswith(("_-g", "_-h", "_-b")) or re.search(r"\d[KMGT]i?\b", text):
+        return None
+    div = 1024.0 if rel.endswith("_-m") else 1048576.0
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) < 2:
+        return None
+    head = lines[0].split()
+    rows = []
+    for l in lines[1:]:
+        lab, _, rest = l.partition(":")
+        vals = rest.split()
+        if not vals or not all(v.isdigit() for v in vals):
+            return None
+        rows.append([lab.strip() + ":"] + ["{:,.1f}".format(int(v) / div) for v in vals])
+    w0 = max(len(r[0]) for r in rows + [["GB"]])
+    wn = max([len(h) for h in head] + [len(v) for r in rows for v in r[1:]])
+    return [" " * w0 + "".join(h.rjust(wn + 2) for h in head)] + [r[0].ljust(w0) + "".join(v.rjust(wn + 2) for v in r[1:]) for r in rows]
+
+
+def memory_block(t):
+    """free with its amounts in GiB; as collected when the file is in other units or is not a plain free table."""
+    cands = ["free", "sos_commands/memory/free_-m", "sos_commands/memory/free"]
+    text, rel = t.read(cands)
+    gb = free_in_gb(text, rel) if text is not None else None
+    if gb is None:
+        return cat(t, "memory (free), as collected", cands, learn="free")
+    unit = "MiB" if rel.endswith("_-m") else "KiB"
+    return block("memory (free), in GiB", "cat %s" % rel, gb, [rel], approx=True, learn="free",
+                 note="amounts converted from %s to GiB, one decimal; the file itself holds %s" % (unit, unit))
+
+
+def s06_disk(t, ctx):
+    out = []
+    text, rel = t.read(DF)
+    if text is None:
+        out.append(block("filesystems", "cat df", missing="df"))
+    else:
+        dl, dmore = upto(text.splitlines())
+        out.append(block("filesystems (df, as collected)", "cat %s" % rel, dl, [rel], learn="df", note=dmore, empty="(empty file)"))
+    text, rel = t.read(["sos_commands/filesys/df_-ali*", "sos_commands/filesys/df_-li*"])      # sos 4.x: df_-aliT_-x_autofs
+    if text is not None:
+        lines = [l for i, l in enumerate(text.splitlines()) if i == 0 or re.match(r"^/dev/", l)]
+        out.append(block("inodes", "awk 'NR==1 || /^\\/dev\\//' %s" % rel, lines, [rel]))
+    rows, srcs, nrefs = [], [], []
+    for cands in (["var/log/messages"], JOURNAL[:1], PROD, ["var/log/candlepin/candlepin.log"], INSTALLER, ["var/log/rhsm/rhsm.log"]):
+        tx, r = t.read(cands, tail=True, limit=LOG_READ)
+        if tx is None or r in srcs:
+            continue
+        hits = [l for l in tx.splitlines() if "No space left on device" in l]
+        srcs.append(r)
+        for h in hits[-ALL_LINES:]:
+            rows.append("%s:%s" % (r, h))
+            nrefs.append({"rel": r, "raw": h, "q": ""})
+    for n in sorted(t.listdir("")):
+        if n in srcs or not os.path.isfile(os.path.join(t.root, n)) or t.size(n) > 64 * 1024 * 1024:
+            continue
+        tx, r = t.read([n], limit=64 * 1024 * 1024)
+        hits = [l for l in (tx or "").splitlines() if "No space left on device" in l]
+        if hits:
+            srcs.append(r)
+            for h in hits[-ALL_LINES:]:
+                rows.append("%s:%s" % (r, h))
+                nrefs.append({"rel": r, "raw": h, "q": ""})
+    if not srcs:
+        out.append(block("'No space left on device' in the main logs", "grep -c 'No space left on device' var/log/messages",
+                         missing=["var/log/messages", JOURNAL[0], PROD[0], "var/log/rhsm/rhsm.log"]))
+    else:
+        out.append(block("'No space left on device' in the main logs and the files at the top of the report", "grep 'No space left on device' " + " ".join(srcs) + "; grep -d skip 'No space left on device' * 2>/dev/null", rows[:ALL_LINES], srcs, note=upto(rows)[1],
+                         approx=True, empty="(not found in %d logs, nor in the files at the top of the report)" % len(srcs), refs=nrefs[:ALL_LINES]))
+    dus = t.glob("sos_commands/*/du_*")
+    if dus:
+        lines = []
+        for r in dus[:12]:
+            tx, _ = t.read([r], limit=64 * 1024)
+            lines += ["%-60s %s" % (r, (tx or "").strip().splitlines()[-1] if (tx or "").strip() else "")]
+        out.append(block("directory sizes sos measured (du)", "tail -n1 sos_commands/*/du_*", lines, dus[:12], approx=True))
+    return out
+
+
+def _ps_rows(t):
+    text, rel = t.read(PS, limit=16 * 1024 * 1024)
+    if text is None:
+        return None, None, None
+    lines = text.splitlines()
+    hdr = lines[0].split() if lines else []
+    rows = []
+    for l in lines[1:]:
+        c = l.split(None, 10)
+        if len(c) >= 11 and re.match(r"^[\d.]+$", c[2] or "") and c[5].isdigit():
+            rows.append(c)
+    return rows, rel, hdr
+
+
+def s07_memory(t, ctx):
+    out = [memory_block(t)]
+    rows, rel, _ = _ps_rows(t)
+    if rows is None:
+        out.append(block("top processes by memory", "sort -nrk6 ps | head", missing="ps"))
+    else:
+        pstext, _ = t.read([rel])
+        out.append(block("top 5 processes by memory (RSS)", "sort -nrk6 %s | head -n5" % rel, ps_sorted(pstext, 6, 5), [rel]))
+        users = {}
+        for c in rows:
+            users[c[0]] = users.get(c[0], 0) + int(c[5])
+        out.append(block("memory by user (RSS, GB)", "awk 'NR>1{a[$1]+=$6} END{for(u in a) printf \"%%d %%8.2f GB  %%s\\n\", a[u], a[u]/1048576, u}' %s | sort -nr | sed 's/^[0-9]* //'" % rel,
+                         ["%8s GB  %s" % ("%.2f" % (v / 1048576.0), u) for u, v in sorted(sorted(users.items(), reverse=True), key=lambda x: -x[1])[:ALL_LINES]], [rel]))
+        bycpu = sorted(rows, key=lambda c: -float(c[2]))[:6]
+        out.append(block("top processes by CPU", "sort -nrk3 %s | head -6" % rel,
+                         ["%-12s %6s%%  %s" % (c[0], c[2], c[10][:110]) for c in bycpu], [rel], approx=True))
+        def _cpu_secs(v):                        # ps TIME: [days-][hours:]minutes:seconds
+            d, _, rest = v.rpartition("-")
+            n = 0
+            for p in rest.split(":"):
+                n = n * 60 + (int(p) if p.isdigit() else 0)
+            return n + (int(d) * 86400 if d.isdigit() else 0)
+        out.append(block("processes running for a while (top 5 by the TIME column)", "sort -nr -k10 %s | head -n5" % rel, ps_sorted(pstext, 10, 5), [rel]))
+        pg = {}
+        for c in rows:
+            m = re.match(r"postgres: (\w+) (\w+) \S+ (idle|active|idle in transaction)", c[10])
+            if m:
+                k = "%s@%s  %s" % (m.group(1), m.group(2), m.group(3))
+                pg[k] = pg.get(k, 0) + 1
+        idle = [l for l in pstext.splitlines() if l.startswith("postgres") and l.rstrip().endswith("idle")]
+        out.append(block("PostgreSQL idle connections: candlepin, foreman, all",
+                         "grep ^postgres {0} | grep 'idle$' | grep -c 'candlepin candlepin'; grep ^postgres {0} | grep 'idle$' | grep -c 'foreman foreman'; grep ^postgres {0} | grep -c 'idle$'".format(rel),
+                         ["%-10s %d" % ("candlepin", sum(1 for l in idle if "candlepin candlepin" in l)), "%-10s %d" % ("foreman", sum(1 for l in idle if "foreman foreman" in l)),
+                          "%-10s %d" % ("all", len(idle))], [rel], approx=True))
+        if pg:
+            out.append(block("PostgreSQL connections by user@database and state", "grep -oE 'postgres: \\w+ \\w+ \\S+ (idle|active)' %s | sort | uniq -c" % rel,
+                             counted(top(pg, 15)), [rel], approx=True))
+    out.append(grep(t, ctx, "out-of-memory kills", LOGS, r"Out of memory|oom-kill:|Killed process [0-9]+", last=ALL_LINES, flags=0))
+    return out
+
+
+# the units that matter here, by name without .service: the Satellite or Capsule services and the network on those hosts;
+# on other hosts, the services that tie the host to its Satellite and the network. Any unit that failed is shown as well.
+_UC = "[A-Za-z0-9_@.-]*"
+SAT_UNITS = ("foreman%s|pulpcore%s|(rh-)?postgresql%s|tomcat|httpd|redis|dynflow%s|puppetserver|candlepin|qdrouterd|qpidd|smart_proxy%s|goferd|virt-who|NetworkManager"
+             % (_UC, _UC, _UC, _UC, _UC))
+BASE_UNITS = "rhsmcertd|virt-who|rhcd|yggdrasil|goferd|NetworkManager"
+
+
+def key_units(ctx):
+    return SAT_UNITS if ctx["role"] != "rhel" else BASE_UNITS
+
+
+def _lead_sum(lines, col=0):
+    """Sum of the count each line of a counted block starts with ('  1,234  text'); col=1 for 'day  count  bar' lines."""
+    n = 0
+    for l in lines:
+        c = l.split()
+        if col == 0 and len(c) > 2 and (re.match(r"^\d{4}-\d\d-\d\d$", c[0]) and re.match(r"^\d\d:\d\d", c[1]) or c[:2] == ["(no", "time)"]):
+            c = c[2:]                          # 'time  count  text': the newest-first blocks put the time before the count
+        if len(c) > col and re.match(r"^[\d,]+$", c[col]):
+            n += int(c[col].replace(",", ""))
+    return n
+
+
+# Blocks that start closed: one line with the count, opened on a click. They are in the report for the cases that need
+# them and stay out of the way otherwise. A block listed here keeps its place and its command.
+CLOSED_BY_DEFAULT = (
+    "kernel messages (dmesg)", "other repo files in /etc/yum.repos.d", "firewall (firewalld)",
+    "inodes", "directory sizes sos measured", "top processes by CPU", "system log lines by program",
+    "rows in the audits and logs tables", "fact name prefixes by count",
+    "production.log error lines per day", "Foreman settings: proxy, download policy", "authentication sources (database)",
+    "Puma (Foreman web server) workers", "smart proxy (proxy.log) ERROR / WARNING lines per day", "5xx responses per hour",
+    "Pulp settings", "Pulp status as collected", "configured vs running", "/etc/crontab", "jobs in /etc/cron.d",
+)
+
+
+def close_by_default(secs):
+    for s in secs:
+        for b in s.get("blocks", []):
+            if b["title"].startswith(CLOSED_BY_DEFAULT):
+                b["fold"] = True
+    return secs
+
+
+SUM_RULES = [     # block title starts with -> one line of counts and times for the opening panel (never a judgement)
+    ("download and connection failures", lambda b: (lambda m: m and "download and connection failures: %s" % m.group(1))(re.match(r"([\d,]+ lines? in [\d,]+ groups?)", b["note"]))),
+    ("kernel messages", lambda b: "kernel messages that say error, fail or warn: %s" % b["note"]),
+    ("SELinux denials", lambda b: "SELinux: %s" % b["note"]),
+    ("'No space left on device'", lambda b: "'No space left on device': %s" % plural(len(b["lines"]), "line")),
+    ("out-of-memory kills", lambda b: "out-of-memory kills: %s" % b["note"]),
+    ("[ERROR] lines in the installer log", lambda b: "installer log: %s" % b["note"]),
+    ("tasks at a glance", lambda b: (lambda d: "tasks: %s ended in error or warning%s" % (fmt_n(d["bad"]), (", %s paused" % fmt_n(d["paused"])) if d["paused"] else "")
+                                     if d and (d["bad"] or d["paused"]) else None)(b.get("tasks"))),
+    ("PostgreSQL logs: ERROR / FATAL messages by text", lambda b: "PostgreSQL logs: %s with ERROR or FATAL in the texts shown" % plural(_lead_sum(b["lines"]), "line")),
+    ("production.log error lines per day", lambda b: "production.log: %s" % plural(_lead_sum(b["lines"], 1), "error line")),
+    ("smart proxy (proxy.log) ERROR / WARNING lines per day", lambda b: "proxy.log: %s" % plural(_lead_sum(b["lines"], 1), "error or warning line")),
+    ("failed Pulp tasks", lambda b: (lambda d: d and "Pulp: %s failed in the %s its table holds · newest %s" % (plural(d["failed"], "task"), "day" if d["days"] == 1 else "%d days" % d["days"] if d["days"] else "days", d["newest"]))(b.get("pulp"))),
+    ("pulpcore error messages by text", lambda b: "pulpcore: %s in the texts shown" % plural(_lead_sum(b["lines"]), "error line")),
+    ("5xx responses per hour", lambda b: "httpd: %s" % plural(_lead_sum(b["lines"]), "5xx response")),
+    ("error.log: ERROR lines by message", lambda b: "candlepin error.log: %s" % plural(_lead_sum(b["lines"]), "ERROR line")),
+    ("rhsm.log ERROR / WARNING", lambda b: "rhsm.log: %s in the texts shown" % plural(_lead_sum(b["lines"]), "ERROR or WARNING line")),
+    ("certificates at a glance", lambda b: next(("certificates valid at collection, " + l[len("valid at collection: "):] for l in b["lines"] if l.startswith("valid at collection: ")), None)),
+]
+
+
+def add_sums(secs):
+    """Give the blocks that hold something countable their line for the opening panel. Only blocks with output get one."""
+    close_by_default(secs)
+    for s in secs:
+        for b in s["blocks"]:
+            if b.get("state") != "ok" or not b.get("lines") or b.get("sum"):
+                continue
+            for prefix, fn in SUM_RULES:
+                if b["title"].startswith(prefix):
+                    try:
+                        text = fn(b)
+                    except Exception:
+                        text = None
+                    if text and not re.search(r": 0 \w", text):
+                        b["sum"] = text
+                    break
+    return secs
+
+
+def in_this_report(ctx, secs):
+    """[(text, target)] for the opening panel: target is a block id ('b09-1') or 'learn:seen'."""
+    out = []
+    if ctx.get("partial"):
+        out.append(("partial archive: " + ctx["partial"], "s01"))
+    for s in secs:
+        for i, b in enumerate(s["blocks"]):
+            if b.get("sum"):
+                out.append((b["sum"], "b%s-%d" % (s["num"], i)))
+    kn = (ctx.get("known") or {}).get("hits") or []
+    if kn:
+        ref = ref_time(ctx)
+        recent = set(h["i"] for h in kn if hit_frame(h, ref) == "d1")
+        out.append(("known error strings: %s found on %s%s" % (fmt_n(len(set(h["i"] for h in kn))), plural(sum(h["n"] for h in kn), "line"),
+                                                               (" · %d last seen in the 24 hours before collection" % len(recent)) if recent else ""), "learn:seen"))
+    return out
+
+
+STATUS_ALL = ["sos_commands/systemd/systemctl_status_--all", "sos_commands/systemd/systemctl_status"]
+_UNIT_HEAD = re.compile(r"^[^\w\s]{1,3} (\S+\.(?:service|socket|timer|mount|target|path|scope|slice|automount|swap))(?: - (.*))?$")
+
+
+def unit_status(t):
+    """systemctl status --all as {unit: {active, since, ago, ended, log, ln}}: the Active line split into state and time,
+    how the main process ended, and the unit's last log lines as systemd printed them under it."""
+    text, rel = t.read(STATUS_ALL, limit=32 * 1024 * 1024)
+    if text is None:
+        return None, None
+    units, cur = {}, None
+    # systemctl's own complaints land in the middle of a line ("active (runniUnit x.service could not be found.\nng)"): the
+    # two halves are joined again; line numbers still count the file's lines
+    for n, l in enumerate(re.sub(r"Unit \S+ could not be found\.\n", "\x00", text).splitlines(), 1):
+        n += l.count("\x00")
+        l = l.replace("\x00", "")
+        m = _UNIT_HEAD.match(l)
+        if m:
+            cur = units.setdefault(m.group(1), {"desc": m.group(2) or "", "active": "", "since": "", "ago": "", "ended": "", "log": [], "ln": n})
+            continue
+        if cur is None:
+            continue
+        s = l.strip()
+        if s.startswith("Active:") and not cur["active"]:
+            a = re.match(r"Active:\s*(.*?)(?:\s+since\s+(.*?))?(?:;\s*(.*))?$", s)
+            cur["active"], cur["since"], cur["ago"] = a.group(1), a.group(2) or "", a.group(3) or ""
+        elif re.match(r"(Main PID|Process):.*\((code=[^)]*)\)", s):
+            cur["ended"] = re.search(r"\((code=[^)]*)\)", s).group(1)
+        elif _SYSLOG_LINE.match(l) or re.match(r"^\d{4}-\d\d-\d\d[T ]\d\d:", l):
+            cur["log"].append(l)
+            cur.setdefault("logln", []).append(n)
+    return units, rel
+
+
+def since_when(t, ctx, failed, listed=([], None), covered=()):
+    """State and 'since' for the units that are neither active nor inactive, and for the units that matter here. A unit
+    that matters and is only in the list of units (not in systemctl status) is shown with the state the list gives."""
+    title = "units: failed or in between, and the units that matter here, with since when"
+    units, rel = unit_status(t)
+    if units is None:
+        return block(title, "grep -A3 -E '^\\S+ \\S+\\.service' %s" % STATUS_ALL[0], missing=STATUS_ALL[:1], learn="systemctl")
+    pat = re.compile(r"^(?:%s)\.service$" % key_units(ctx))
+    logrel = t.first(JOURNAL, largest=True)      # a unit's last lines open at the same line in the main log
+    odd = [u for u, d in units.items() if d["active"] and not re.match(r"(active|inactive)\b", d["active"])]
+    odd += [u for u in failed if u in units and u not in odd]
+    show, shrel = unit_show(t)
+
+    def counted_by_systemd(u, mem=False):
+        """' · restarted N times' (and the memory now) as systemctl show has them; '' when it has neither."""
+        d = show.get(u)
+        n, m = _show_int(d, "NRestarts"), _show_int(d, "MemoryCurrent")
+        return ((" · restarted %s" % plural(n, "time")) if n else "") + ((" · %s" % human(m)) if mem and m is not None else "")
+    lines, refs = [], []
+    for u in sorted(u for u in failed if u not in units):          # listed as failed, with no entry in systemctl status
+        lines.append("%-38s failed (in the list of failed units; systemctl status has no entry for it)" % u)
+        refs.append(None)
+    for u in sorted(odd):
+        d = units[u]
+        lines.append("%-38s %s%s%s" % (u, d["active"], (" since %s (%s)" % (d["since"], d["ago"])) if d["since"] else "", counted_by_systemd(u)))
+        refs.append({"rel": rel, "line": d["ln"], "q": ""})
+        if d["ended"]:
+            lines.append("    main process: %s" % d["ended"])
+            refs.append(None)
+        for l, ln in list(zip(d["log"], d.get("logln") or [None] * len(d["log"])))[-3:]:
+            lines.append("    " + l)
+            # the same line in the main log; else, where systemctl printed it (the log may be cut, rotated or shortened)
+            refs.append(dict({"rel": logrel, "raw": l, "q": ""}, **({"else": [rel, ln]} if ln else {})) if logrel else
+                        ({"rel": rel, "line": ln, "q": ""} if ln else None))
+    only_ok = []
+    for l in listed[0]:                          # units that matter and are in the list of units only
+        c = l.split()
+        if len(c) >= 4 and c[0] not in units and not (c[0] in failed and c[2] == "failed"):      # already named above, from the list of failed units
+            row = ("%-38s %s (%s)" % (c[0], c[2], c[3]), {"rel": listed[1], "raw": l, "part": True, "q": ""})
+            if c[2] in ("active", "inactive"):
+                if c[0] not in covered:
+                    only_ok.append(row)
+            else:
+                odd.append(c[0])
+                lines.append(row[0])
+                refs.append(row[1])
+    key = sorted(u for u in units if u not in odd and u not in covered and pat.match(u) and units[u]["active"]
+                 and (units[u]["since"] or not units[u]["active"].startswith("inactive")))      # never-started units are left out; the main services have their table
+    if odd and (key or only_ok):
+        lines.append("")
+        refs.append(None)
+    for u in key:
+        d = units[u]
+        lines.append("%-38s %s%s%s" % (u, d["active"], (" since %s (%s)" % (d["since"], d["ago"])) if d["since"] else "", counted_by_systemd(u, mem=True)))
+        refs.append({"rel": rel, "line": d["ln"], "q": ""})
+    for row in only_ok:
+        lines.append(row[0])
+        refs.append(row[1])
+    names = "|".join(ere(u) for u in (sorted(odd) + key)[:6])
+    cmd = "grep -A12 -E '^\\S+ (%s) ' %s | grep -E '^\\S+ \\S+ - |Active:|Main PID:'" % (names, rel) if names else "grep -c 'Active:' %s" % rel
+    b = block(title, cmd, lines, [rel] + ([listed[1]] if listed[1] else []) + ([shrel] if shrel else []), approx=True, learn="systemctl", refs=refs,
+              note=join_notes("as systemctl status printed it at collection%s" % (" · command shows the first 6 units" if len(odd) + len(key) > 6 else ""),
+                              "the main services that are running are in the table below" if covered else "",
+                              "restarts and memory as systemctl show counts them" if shrel else ""),
+              empty="(no unit is failed or in between%s)" % ("; the main services are in the table below" if covered else "; none of the units that matter here is in the file"))
+    return b
+
+
+def audit_logs(t):
+    """Where the audit log is: auditd.conf's log_file when it names another place (sos copies that file), else
+    var/log/audit/audit.log."""
+    cf, _ = t.read(["etc/audit/auditd.conf"], limit=64 * 1024)
+    m = re.search(r"(?m)^\s*log_file\s*=\s*/?(\S+)", cf or "")
+    own = m.group(1) if m else ""
+    return ([own] if own and own != "var/log/audit/audit.log" else []) + ["var/log/audit/audit.log"]
+
+
+def s08_services(t, ctx):
+    out = []
+    f = []
+    listed = ([], None)
+    # the units block names the failed units first; "failed units" is a block of its own only when that block cannot be built
+    merged = t.first(STATUS_ALL) is not None and unit_status(t)[0] is not None
+    text, rel = t.read(["sos_commands/systemd/systemctl_list-units_--failed", "sos_commands/systemd/systemctl_list-units_--state_failed"])
+    if text is None:
+        text2, rel2 = t.read(UNITS)
+        if text2 is None:
+            if not merged:
+                out.append(block("failed units", "cat sos_commands/systemd/systemctl_list-units_--failed", missing="sos_commands/systemd/systemctl_list-units_--failed", learn="systemctl"))
+        else:
+            f = [l for l in text2.splitlines() if re.search(r"\sfailed\s", l)]
+            if not merged:
+                out.append(block("failed units", "grep -E '\\sfailed\\s' %s" % rel2, f, [rel2], learn="systemctl", empty="(no failed units)"))
+    else:
+        f = [l for l in text.splitlines() if re.search(r"\.(service|socket|mount|timer|target)\b", l)]
+        if not merged:
+            out.append(block("failed units", "grep -E '\\.(service|socket|mount|timer|target)\\b' %s" % rel, f, [rel], learn="systemctl", empty="(no failed units)"))
+    n_before = len(out)
+    text, rel = t.read(UNITS)
+    if text is None:
+        out.append(block("state of the units that matter here", "grep -E '(^|\\s)(%s)\\.service\\s' sos_commands/systemd/systemctl_list-units" % key_units(ctx), missing="sos_commands/systemd/systemctl_list-units"))
+    else:
+        pat = key_units(ctx)
+        lines = [re.sub(r"^\W+", "", l) for l in text.splitlines() if re.search(r"(^|\s)(%s)\.service\s" % pat, l)]
+        listed = (lines, rel)
+        if t.first(STATUS_ALL) is None:         # no systemctl status: the list of units is all there is
+            out.append(block("state of the units that matter here", "grep -E '(^|\\s)(%s)\\.service\\s' %s | sed -E 's/^\\W+//'" % (pat, rel), lines, [rel], approx=True))
+    mrole = ctx["role"] if ctx["role"] in MAIN_SERVICES else ("satellite" if t.first(MAINT_STATUS) else None)    # satellite-maintain output on a host not seen as one
+    covered = set()
+    if mrole:
+        rows, srcs = main_services(t, ctx, mrole)
+        show, shrel = unit_show(t)
+        title = "main services: state, since when, how long up, restarts, memory and limits" if show else "main services: state, since when, and how long up"
+        if rows is None:
+            out.append(block(title, "grep -E '^\\s*[*●] |Active:' %s" % STATUS_ALL[0], missing=[STATUS_ALL[0], UNITS[0], MAINT_STATUS[0]], learn="systemctl"))
+        else:
+            st_like = [r for r in srcs if r in STATUS_ALL or r in MAINT_STATUS]       # the files laid out like systemctl status
+            mcmd = ("grep -E '^\\s*[*●] |Active:' %s" % " ".join(st_like)) if st_like else "grep -E '\\.service\\s' %s" % " ".join(r for r in srcs if r not in UNIT_FILES or len(srcs) == 1)
+            if show:
+                mcmd += "; grep -E '^(Id|NRestarts|MemoryCurrent|MemoryPeak|LimitNOFILE|LimitNOFILESoft)=' %s" % shrel
+            # a service that is running is in this table only; one that is not is also in the units block, with how it ended
+            covered = set(u for r in rows if not r[4] for u in r[6])
+            mrefs = [None] + [({"rel": shrel, "line": show[r[6][0]]["_ln"], "q": ""} if show and r[6] and r[6][0] in show else None) for r in rows]
+            out.append(block(title, mcmd, services_lines(rows, show), srcs + ([shrel] if shrel else []), approx=True, learn="systemctl", refs=mrefs,
+                             note=join_notes("%s for a %s · instances counted together · UP FOR is to the collection time" % (plural(len(rows), "service"), mrole),
+                                             "restarts since boot, memory and open-file limits as systemctl show has them%s" % (
+                                                 "" if any("MemoryPeak" in d for d in show.values()) else " (this systemd keeps no memory peak)") if show else ""),
+                             empty="(none of the main services is in these files)"))
+    if t.first(STATUS_ALL) is not None or t.first(UNITS) is None:
+        out.insert(n_before, since_when(t, ctx, [re.sub(r"^\W+", "", l).split()[0] for l in f if l.strip()], listed, covered))
+    out += selinux_blocks(t, ctx)
+    out.extend(unit_events(t, ctx))
+    out.append(syslog_programs(t, ctx))
+    out.append(fold(grep(t, ctx, "lines with ERROR in the system log (newest first)", LOGS, r"ERROR", last=ALL_LINES, flags=0), approx=True))      # long lines are cut here
+    return out
+
+
+def task_rows(t):
+    """(rows, kind, rel, hdr) from foreman_tasks_tasks; rows are dicts. sos orders the table oldest first, so a table over
+    the read limit is read from its end."""
+    rows, kind, rel, _ = t.table(TASKS, limit=48 * 1024 * 1024, tail=True)
+    if rows is None:
+        return None, "missing", None, []
+    hdr = []
+    if rows and kind in ("csv", "pipe"):        # a short row holds fewer cells: the header is every column any row has, in order
+        seen = set()
+        for r in rows:
+            if len(r) > len(seen):
+                for h in r:
+                    if h not in seen:
+                        seen.add(h)
+                        hdr.append(h)
+        hdr = [h for h in hdr if not h.startswith("_")]
+    return rows, kind, rel, hdr
+
+
+RHSM_LINE = re.compile(r"^\S+ \S+ \[(ERROR|WARNING)\] (?:([\w.-]+):\d+(?::\w+)? )?@(\S+?):\d+ - (.*)$")
+
+
+@functools.lru_cache(maxsize=1 << 16)
+def error_text(err, keep=False):
+    """One line from a Dynflow-style error: 'ExceptionClass: message', or a traceback's last line.
+    Squashed (ids, addresses and numbers hidden) so errors group; keep=True returns the task's own text."""
+    sq = (lambda x: re.sub(r"\s+", " ", x).strip()[:400]) if keep else squash
+    s0 = err.strip()
+    if s0.startswith("{"):          # 6.14+: {"backtrace":[...],"exception_class":"...","message":"..."}
+        try:
+            d = json.loads(s0)
+        except ValueError:
+            d = None
+        if isinstance(d, dict) and (d.get("message") or d.get("exception_class")):
+            m0, c0 = str(d.get("message") or "").strip(), str(d.get("exception_class") or "").strip()
+            line0 = m0.splitlines()[0] if m0 else ""
+            return sq(("%s: %s" % (c0, line0)) if c0 and c0 not in line0 else (line0 or c0))
+        mj = re.search(r'"message"\s*:\s*"((?:[^"\\]|\\.)*)"', s0)
+        cj = re.search(r'"exception_class"\s*:\s*"((?:[^"\\]|\\.)*)"', s0)
+        if mj or cj:
+            m0 = mj.group(1).replace('\\"', '"').replace("\\n", " ") if mj else ""
+            c0 = cj.group(1) if cj else ""
+            return sq(("%s: %s" % (c0, m0)) if c0 and c0 not in m0 else (m0 or c0))
+    cls = re.search(r"exception_class:\s*(\S+)", err)
+    blk = re.search(r"message:\s*[|>][-+]?\s*\n((?:[ \t]+.*\n?)+)", err)      # message: |-  followed by indented lines
+    msg = re.search(r"message:\s*[\"']?(.+?)[\"']?\s*(?:\n|$|backtrace:)", err)
+    if blk:
+        text1 = " ".join(x.strip() for x in blk.group(1).splitlines() if x.strip())
+    elif msg:
+        text1 = msg.group(1)
+    elif "Traceback" in err:   # a Python traceback: the exception is its last real line
+        tail = [x.strip() for x in err.splitlines() if x.strip() and not re.match(r"\s*(File [\"/]|Traceback|raise |\^)", x.strip())]
+        text1 = tail[-1] if tail else "Traceback (no exception line)"
+    else:
+        text1 = re.sub(r"\s+", " ", err)[:200]
+    if cls and cls.group(1) not in text1:
+        text1 = "%s: %s" % (cls.group(1), text1)
+    return sq(text1)
+
+
+def _plain_error(err):
+    """A step's error cell as text: encoded cells (msgpack, shown by psql as \\x…) are decoded to the JSON dynflow writes."""
+    if err.startswith("\\x"):
+        v, how = dyn_value(err)
+        if how == "msgpack":
+            return json.dumps(v, default=str)
+    return err
+
+
+def step_errors(t):
+    """(errors by execution_plan_uuid, list of (message, started_at, line), rel). dynflow stores the error as YAML text
+    with exception_class / message; fall back to the whole error cell."""
+    rows, kind, rel, _ = t.table(STEPS, limit=64 * 1024 * 1024, tail=True, keep=STEP_COLS)
+    if rows is None:
+        return None, None, None
+    by_plan, msgs = {}, []
+    t._raw_errors = {}
+    if kind not in ("csv", "pipe"):
+        return by_plan, msgs, rel
+    for r in rows:
+        err = _plain_error(r.get("error") or "")
+        if not err or err in ("\\N", "NULL") or (r.get("state") or "").lower() == "skipped":
+            continue
+        text1 = error_text(err)
+        plan = r.get("execution_plan_uuid") or ""
+        if plan and plan not in by_plan:
+            by_plan[plan] = text1
+            raw = error_text(err, keep=True)
+            if raw != text1:
+                t._raw_errors[plan] = raw
+        msgs.append((text1, r.get("started_at") or "", r["_ln"]))
+    return by_plan, msgs, rel
+
+
+def col_no(hdr, name):
+    return (hdr.index(name) + 1) if name in hdr else None
+
+
+def _lead_pipe(t, rel):
+    """True when the table's lines start with '|' (then awk's first field is empty and the columns start at 2)."""
+    try:
+        with open(os.path.join(t.root, rel), "rb") as fh:
+            return fh.read(64).lstrip().startswith(b"|")
+    except (OSError, IOError):
+        return False
+
+
+def s09_tasks(t, ctx):
+    out = []
+    rows, kind, rel, hdr = task_rows(t)
+    if rows is None:
+        return [block("tasks at a glance", "head -3 sos_commands/foreman/foreman_tasks_tasks", missing=TASKS[0], learn="foreman_tasks_tasks")]
+    if kind == "error":
+        return [block("tasks at a glance", "cat %s" % rel, src=[rel], learn="foreman_tasks_tasks",
+                      error="\n".join(((t.read([rel], limit=64 * 1024)[0] or rows[0]["_line"]).strip().splitlines() or [rows[0]["_line"]])[:20]))]
+    if kind == "empty":
+        return [block("tasks at a glance", "wc -l %s" % rel, [], [rel], learn="foreman_tasks_tasks", empty="(the file is empty: the database query returned nothing)")]
+    s, r_, lab, st = (col_no(hdr, "state"), col_no(hdr, "result"), col_no(hdr, "label"), col_no(hdr, "started_at"))
+    if kind == "headless" or not (s and r_ and lab and st):
+        return [block("tasks at a glance", "head -c 400 %s" % rel, [], [rel], approx=True, learn="foreman_tasks_tasks",
+                      empty="(the table has no header line%s, and its columns could not be recognised from its rows: no task can be read)"
+                            % (": sos kept only its end" if t.tailed(rel) else ""))]
+    csv = kind == "csv"
+    pre = "awk -F, " if csv else "awk -F' *[|] *' "
+    if not csv and _lead_pipe(t, rel):          # rows that start with '|' have an empty first field
+        s, r_, lab, st = (c + 1 if c else c for c in (s, r_, lab, st))
+    idc = 1 if csv or not _lead_pipe(t, rel) else 2
+    pairs = {}
+    for r in rows:
+        k = "%s,%s" % (r.get("state", ""), r.get("result", ""))
+        pairs[k] = pairs.get(k, 0) + 1
+    bad = [r for r in rows if (r.get("result") or "") in ("error", "warning")]
+    starts = sorted(x for x in ((r.get("started_at") or "")[:16] for r in rows) if re.match(r"\d{4}-\d\d-\d\d", x))
+    lines = ["tasks           %s%s" % (fmt_n(len(rows)), (" · started %s → %s (UTC)" % (starts[0], starts[-1])) if starts else "")]
+    refs = [None]
+    # 1. how they ended, and how many of the failures are from the day before collection
+    ref = ref_time(ctx)
+    if ref and ctx.get("utc_offset"):
+        ref = ref - datetime.timedelta(minutes=ctx["utc_offset"])      # the table's times are UTC
+    recent = None
+    if ref:
+        cut = (ref - datetime.timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")
+        recent = sum(1 for r in bad if (r.get("started_at") or "")[:19].replace("T", " ") >= cut)
+    days = sorted(set((r.get("started_at") or "")[:10] for r in bad if re.match(r"\d{4}-\d\d-\d\d", r.get("started_at") or "")))
+    lines.append("error/warning   %s%s%s" % (fmt_n(len(bad)), (" · %s started in the 24 hours before collection" % fmt_n(recent)) if recent is not None and bad else "",
+                                              (" · on %s, newest %s" % (plural(len(days), "day"), days[-1])) if days else ""))
+    refs.append(["taskday:" + days[-1], ""] if days else None)
+    # 2. what is not finished
+    paused = sorted((r for r in rows if r.get("state") == "paused"), key=lambda r: r.get("started_at") or "")
+    running = [r for r in rows if r.get("state") in ("running", "planning", "scheduled")]
+    lines.append("not finished    %s paused%s · %s running, planning or scheduled" % (
+        fmt_n(len(paused)), (" (oldest since %s)" % (paused[0].get("started_at") or "")[:16]) if paused and paused[0].get("started_at") else "", fmt_n(len(running))))
+    refs.append(["task:" + str(paused[-1].get("id", "")), ""] if paused else None)
+    # 3. which kinds of task fail
+    labels = {}
+    for r in bad:
+        labels[r.get("label", "")] = labels.get(r.get("label", ""), 0) + 1
+    tl = top(labels, 3)
+    if tl:
+        lines.append("failing most    %s%s" % (" · ".join("%s %s" % ((l or "(no label)").replace("Actions::", ""), fmt_n(n)) for l, n in tl),
+                                               (" · and %d more labels" % (len(labels) - 3)) if len(labels) > 3 else ""))
+        refs.append(["tasklabel:" + tl[0][0], ""])
+    # 4. what the errors say
+    by_plan, msgs, srel = step_errors(t)
+    if msgs:
+        agg = {}
+        for m, when, ln in msgs:
+            a = agg.setdefault(m, [0, ln])
+            a[0] += 1
+            a[1] = ln
+        m, a = sorted(agg.items(), key=lambda kv: -kv[1][0])[0]
+        task_errs = set(by_plan.get(r.get("external_id") or "", None) for r in rows) - {None}
+        lines.append("top error text  %s× %s%s" % (fmt_n(a[0]), m[:150], (" · %d more texts" % (len(agg) - 1)) if len(agg) > 1 else ""))
+        refs.append(["taskerr:" + m[:150], ""] if m in task_errs else {"rel": srel, "line": a[1], "q": ""})
+    elif msgs is None:
+        lines.append("top error text  not collected (%s)" % STEPS[0])
+        refs.append(None)
+    # 5. tasks that failed because a sub-task failed
+    pc = col_no(hdr, "parent_task_id")
+    if pc:
+        by_plan = by_plan or {}
+        lite = [{"id": r.get("id", ""), "parent": _nul(r.get("parent_task_id")), "result": r.get("result", ""), "label": (r.get("label") or "").replace("Actions::", ""),
+                 "error": by_plan.get(r.get("external_id") or "", ""), "eraw": getattr(t, "_raw_errors", {}).get(r.get("external_id") or "", "")} for r in rows]
+        sub_failures(lite, cap=3)
+        agg, parents = {}, 0
+        for p in lite:
+            if p.get("subfail"):
+                parents += 1
+            for e, k, ids in p.get("subfail") or []:
+                a = agg.setdefault(e, [0, ids[0]])
+                a[0] += k
+        if agg:
+            e, a = sorted(agg.items(), key=lambda kv: (kv[0].startswith("("), -kv[1][0]))[0]      # a text that says something comes first
+            lines.append("sub-tasks       %s failed because a sub-task failed · their sub-tasks say most: %s× %s" % (plural(parents, "task"), fmt_n(a[0]), e[:120]))
+            refs.append(["task:" + str(a[1]), ""])
+    out.append(block("tasks at a glance", "%s'NR>1 && NF>3{print $%s\",\"$%s}' %s | sort | uniq -c | sort -rn" % (pre, s, r_, rel),
+                     lines, [rel] + ([srel] if srel else []), approx=True, learn="foreman_tasks_tasks", refs=refs,
+                     note="%s rows (%s) · the Tasks tab lists, groups and opens them" % (fmt_n(len(rows)), "csv" if csv else "psql table")))
+    out[-1]["tasks"] = {"bad": len(bad), "paused": len(paused)}
+    raw_, _ = t.read([rel], limit=64 * 1024 * 1024)
+    raw_ = (raw_ or "").splitlines()
+    pz = paused[::-1]
+    pl = [l for l in raw_[1:] if "paused" in l][::-1]
+    out.append(block("paused tasks, the newest %d" % PAUSED_SHOWN, "grep paused %s | tac | head -n %d" % (rel, PAUSED_SHOWN), pl[:PAUSED_SHOWN], [rel],
+                     note=("%s · the Tasks tab lists and opens them all" % plural(len(pl), "paused task")) if len(pl) > PAUSED_SHOWN else "",
+                     empty="(no paused tasks)", refs=[["task:" + str(r.get("id", "")), ""] for r in pz][:PAUSED_SHOWN] if len(pz) == len(pl) else None))
+    return out
+
+
+PAUSED_SHOWN = 10
+
+
+def s10_hammer(t, ctx):
+    """hammer ping as one line per service: its status, and the response time or the message when it did not answer ok."""
+    ping, rel = hammer_ping(t)
+    if ping is None:
+        return [block("hammer ping", "cat sos_commands/foreman/hammer_ping", missing="sos_commands/foreman/hammer_ping", learn="hammer_ping")]
+    text, _ = t.read([rel])
+    if not ping:
+        return [block("hammer ping", "cat %s" % rel, (text or "").splitlines()[:ALL_LINES], [rel], learn="hammer_ping",
+                      note="the file holds no per-service answer: hammer could not ask the Satellite when sos ran", empty="(empty file)")]
+    w = max(len(p[0]) for p in ping)
+    lines = ["%-*s  %-6s  %s" % (w, "SERVICE", "STATUS", "RESPONSE")] + [("%-*s  %-6s  %s" % (w, n, s, r.replace("Duration: ", ""))).rstrip() for n, s, r in ping]
+    bad = [p for p in ping if p[1].upper() != "OK"]
+    out = [block("hammer ping", "awk '/^[a-z_0-9]+:$/{s=$1} /Status:/{st=$2} /(Server Response|message):/{sub(/^ *[^:]*: */,\"\"); print s, st, $0}' %s" % rel,
+                 lines, [rel], approx=True, learn="hammer_ping",
+                 note=("%s not ok: %s" % (plural(len(bad), "service"), ", ".join(p[0] for p in bad))) if bad else "%s, all ok" % plural(len(ping), "service"))]
+    out.append(fold(block("hammer ping as collected", "cat %s" % rel, (text or "").splitlines()[:ALL_LINES], [rel], learn="hammer_ping")))
+    return out
+
+
+def s11_postgres(t, ctx):
+    out = []
+    logs = []
+    for g in PG_LOGS:
+        logs += t.glob(g)
+    if not logs:
+        out.append(block("PostgreSQL logs: ERROR / FATAL messages", "grep -hE 'ERROR|FATAL' var/lib/pgsql/data/log/*.log", missing="var/lib/pgsql/data/log/*.log", learn="pg-logs"))
+    else:
+        dead, allh, items, keys = [], [], [], {}
+        rx_lv, rx_cut = re.compile(r"\b(ERROR|FATAL|PANIC):"), re.compile(r"^.*?\b(ERROR|FATAL|PANIC):\s*")
+        per_file = {}
+        for r in logs[-8:]:
+            tx, _ = t.read([r], tail=True, limit=LOG_READ)
+            ne = nd = 0
+            for l in (tx or "").split("\n"):
+                if "ERROR" in l:
+                    ne += 1
+                if ("ERROR:" in l or "FATAL:" in l or "PANIC:" in l) and rx_lv.search(l):   # plain-text check first
+                    allh.append(l)
+                    m_ = rx_cut.match(l)
+                    msg = (m_.group(1) + ": " + l[m_.end():]) if m_ else l
+                    k = keys.get(msg)
+                    if k is None:                     # the same message comes back thousands of times: make its key once
+                        k = keys[msg] = generalize_paths(squash(msg))
+                    mt = _ANY_TIME.search(l[:60])         # the log line prefix is set per site; the time is near the start
+                    items.append((("%s %s" % mt.groups()) if mt else "", k, (r, l)))
+                if ("eadlock" in l or "EADLOCK" in l or "eadLock" in l) and "deadlock" in l.lower():
+                    dead.append((r, l))
+                    nd += 1
+            per_file[r] = (ne, nd)
+        glines, gpairs, gex = recent_groups(items, ALL_LINES)
+        out.append(block("PostgreSQL logs: ERROR / FATAL messages by text, newest first",
+                         "grep -hE '(ERROR|FATAL|PANIC):' %s | sed -E 's/^([0-9-]+ [0-9:]{5})[^E]*.*((ERROR|FATAL|PANIC):.*)/\\1 \\2/' | sort | uniq -c -f2 | sort -k2,3 -r" % " ".join(logs[-8:]),
+                         glines, logs[-8:], approx=True, learn="pg-logs", note=join_notes(plural(len(allh), "line") if allh else "", span_of(allh, ctx), GROUP_NOTE if glines else ""), empty="(no ERROR/FATAL lines)",
+                         refs=raw_refs(None, gpairs, gex)))
+        pe, pd = [], []
+        for r in logs[-8:]:
+            tx, _ = t.read([r], tail=True, limit=LOG_READ)
+            pre_ = (r + ":") if len(logs[-8:]) > 1 else ""
+            pe += [(r, l) for l in (tx or "").split("\n") if "ERROR" in l]
+            pd.append("%s%d ERROR · %d deadlock" % ((pre_,) + per_file.get(r, (0, 0))))
+        many = len(logs[-8:]) > 1
+        out.append(folded_lines_block(t, ctx, "PostgreSQL logs: ERROR lines", pe, "grep -I ERROR %s" % " ".join(logs[-8:]), logs[-8:], many, "pg-logs",
+                                      "lines per file: " + ", ".join(pd), "(0 ERROR lines)"))
+        out[-2] = fold(out[-2])
+        out.append(folded_lines_block(t, ctx, "deadlocks", dead, "grep -h -i deadlock %s" % " ".join(logs[-8:]), logs[-8:], many, None, "", "(none)"))
+    pc, pcrel = t.read(PG_CONF)
+    if pc is None:
+        out.append(block("postgresql.conf without comment and blank lines", "grep -v ^# postgresql.conf | grep -v ^$", missing=PG_CONF))
+    else:
+        out.append(block("postgresql.conf without comment and blank lines", "grep -v ^# %s | grep -v ^$" % pcrel, [l for l in pc.splitlines() if l and not l.startswith("#")], [pcrel]))
+    if ctx["role"] == "satellite" or t.exists("sos_commands/foreman/audits_table_count"):
+        counts, srcs = [], []
+        for name in ("audits_table_count", "logs_table_count"):
+            tx, rel = t.read(["sos_commands/foreman/" + name])
+            if tx:
+                m = re.search(r"^\s*(\d+)\s*$", tx, re.M)
+                counts.append("%-22s %s rows" % (name.replace("_table_count", ""), fmt_n(int(m.group(1))) if m else tx.strip().splitlines()[-1][:60]))
+                srcs.append(rel)
+        out.append(block("rows in the audits and logs tables", "cat %s" % " ".join(srcs or ["sos_commands/foreman/audits_table_count", "sos_commands/foreman/logs_table_count"]),
+                         counts, srcs, approx=True, empty="(audits_table_count and logs_table_count not collected)") if srcs else
+                   block("rows in the audits and logs tables", "cat sos_commands/foreman/audits_table_count", missing=["sos_commands/foreman/audits_table_count"]))
+        out.append(head_table(t, "fact name prefixes by count (fact_names)", ["sos_commands/foreman/fact_names_prefixes"], 12))
+    dus = t.glob("sos_commands/postgresql/du_*")
+    prow, prel_, _ = _ps_rows(t)
+    dl, dsrc = [], []
+    for d in dus[:2]:
+        tx, _ = t.read([d], limit=64 * 1024)
+        dl += [l.strip() for l in (tx or "").splitlines() if l.strip()][:2]
+        dsrc.append(d)
+    if prow is not None:
+        pd = [c[10][:160] for c in prow if re.search(r"postgres\b.* -D ", c[10]) or re.search(r"postmaster\b.* -D ", c[10])]
+        dl += ["process: " + x for x in pd[:2]]
+        if pd:
+            dsrc.append(prel_)
+    if dus or dl:
+        out.append(block("PostgreSQL data directory: size as sos measured it, and the server process", "cat %s; grep -E 'post(gres|master).* -D ' %s" % (" ".join(dus[:2]) or "sos_commands/postgresql/du_-sh_.var.lib.pgsql", prel_ or PS[0]),
+                         dl, dsrc, approx=True, empty="(no size was collected and no server process is in ps)"))
+    return out
+
+
+def _proxy_log_blocks(t, ctx):
+    """foreman-proxy (smart proxy) proxy.log: the first log to open on a Capsule. ERROR/WARN lines per day and by text."""
+    text, rel = t.read(PROXY_LOG, tail=True, limit=64 * 1024 * 1024)
+    if text is None:
+        return [block("smart proxy (proxy.log) ERROR / WARNING lines", "grep -E '\\[[EW]\\]|ERROR|WARN' var/log/foreman-proxy/proxy.log", missing=PROXY_LOG[0])]
+    hits = [l for l in text.splitlines() if re.search(r"\[[EWF]\]|\b(ERROR|WARN|WARNING|FATAL)\b", l)]
+    days, dex, items = {}, {}, []
+    for l in hits:
+        m = re.match(r"^(\d{4}-\d\d-\d\d)", l)
+        if m:
+            days[m.group(1)] = days.get(m.group(1), 0) + 1
+            dex[m.group(1)] = l
+        k = re.sub(r"^\S+\s+", "", l) if re.match(r"^\d{4}-\d\d-\d\d", l) else l
+        k = re.sub(r"^[0-9a-f]{6,}\s+", "", k)               # request id
+        # 'bad Request-Line' quotes whatever bytes were sent to the port: scanners and clients that do not speak HTTP. One group.
+        k = re.sub(r"(bad Request-Line) .*$", r"\1 (data that is not an HTTP request: scanners, TLS or other protocols sent to the port)", k)
+        k = generalize_paths(squash(k))[:150]
+        mt = _PROD_TIME.match(l)
+        items.append((("%s %s" % mt.groups()) if mt else "", k, (rel, l)))
+    glines, gpairs, gex = recent_groups(items, 25)
+    note = " · ".join(x for x in (plural(len(hits), "line") if hits else "", span_of(hits, ctx)) if x)
+    return [block("smart proxy (proxy.log) ERROR / WARNING lines per day", "grep -E '\\[[EW]\\]' %s | cut -c1-10 | sort -r | uniq -c" % rel, bars(days), [rel], approx=True,
+                  note=note, empty="(no ERROR / WARNING lines)", refs=day_refs(rel, days, dex)),
+            block("smart proxy (proxy.log) ERROR / WARNING lines by text, the 25 seen last (newest first)",
+                  "grep -E '\\[[EW]\\]' %s | awk '{t=substr($1,1,16); $1=$2=\"\"; n[$0]++; l[$0]=t} END {for (m in n) print l[m], n[m], m}' | sort -r | head -25" % rel,
+                  glines, [rel], approx=True, empty="(no ERROR / WARNING lines)", note=GROUP_NOTE if glines else "", refs=raw_refs(rel, gpairs, gex))]
+
+
+_ERR_IDS = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b|\b[0-9a-f]{12,}\b")
+_CP_MSG = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d)\S*\s+(?:\[[^\]]*\]\s*)*([A-Z]+)\s+\S+\s+-\s+(.*)$")      # candlepin.log: time [..] [..] LEVEL logger - message
+_ERR_NUM_ID = re.compile(r"(?i)(\bids?\b[:=#]?\s*['\"]?)\d+")                 # 'with ID 5', 'id=12': the number is an id too
+_PROD_TIME = re.compile(r"^(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d)")
+_ANY_TIME = re.compile(r"(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d)")
+_CP_REQ = re.compile(r"\[req=([^,\]\s]+)")                    # candlepin.log: the request id a request and its response share
+
+
+def recent_groups(items, n):
+    """Error lines grouped by message, newest first. items: (time 'YYYY-MM-DD HH:MM' or '', text, (file, line)) in
+    the order read. Lines that differ only in an id (a uuid, a long hex string, the number after 'ID') are one group,
+    shown with the text of its newest line. Returns (lines, pairs, ex): the block's lines, the (text, count) pairs and
+    the newest raw line of each group, for raw_refs."""
+    cnt, last, show, raw = {}, {}, {}, {}
+    for pos, (when, text, src) in enumerate(items):
+        g = _ERR_NUM_ID.sub(r"\1…", _ERR_IDS.sub("…", text))
+        cnt[g] = cnt.get(g, 0) + 1
+        if (when, pos) >= last.get(g, ("", -1)):
+            last[g], show[g], raw[g] = (when, pos), text, src
+    order = sorted(cnt, key=lambda g: last[g], reverse=True)[:n]
+    lines = ["%-16s %6s  %s" % (last[g][0] or "(no time)", fmt_n(cnt[g]), show[g]) for g in order]
+    return lines, [(show[g], cnt[g]) for g in order], dict((show[g], raw[g]) for g in order)
+
+
+GROUP_NOTE = "the time is the message's newest line, the count all its lines · ids are left out when grouping"
+
+
+def s12_foreman_logs(t, ctx):
+    out = []
+    text, rel = t.read(PROD, tail=True, limit=64 * 1024 * 1024)
+    if text is None:
+        if ctx["role"] == "capsule":                         # a Capsule has no Foreman application, only the smart proxy
+            return _proxy_log_blocks(t, ctx)
+        return [block("production.log errors", "grep -F '[E|' var/log/foreman/production.log", missing=PROD[0], learn="production.log")] + _foreman_db_blocks(t) + _proxy_log_blocks(t, ctx)
+    pcopies, pleft = read_copies(t, "var/log/foreman/production.log*", rel)
+    pcopies = [(r, tx) for r, tx in pcopies if r != rel]
+    pall = "var/log/foreman/production.log*" if pcopies else rel
+    rx_e = re.compile(r"\[E\||\bERROR\b|\bFATAL\b")
+    is_err = lambda l: ("[E|" in l or "ERROR" in l or "FATAL" in l) and rx_e.search(l)      # plain-text check first: most lines have none
+    errs, days, dex, drel = [], {}, {}, {}
+    for r_, tx in pcopies[::-1] + [(rel, text)]:            # oldest copy first
+        for l in tx.split("\n"):
+            if is_err(l):
+                errs.append(l)
+                m = re.match(r"^(\d{4}-\d\d-\d\d)", l)
+                if m:
+                    days[m.group(1)] = days.get(m.group(1), 0) + 1
+                    dex[m.group(1)], drel[m.group(1)] = l, r_     # a day's last line, and the copy it is in
+    psrc = [rel] + [r for r, _ in pcopies]
+    out.append(block("production.log error lines per day", "%s -h -F '[E|' %s | cut -c1-10 | sort -r | uniq -c" % ("zgrep" if any(COMPRESSED.search(r) for r in psrc) else "grep", pall), bars(days), psrc, approx=True, learn="production.log",
+                     note=join_notes(plural(len(errs), "error line") if errs else "", span_of(errs, ctx), copies_note([(rel, "")] + pcopies, pleft)), empty="(no error lines)",
+                     refs=day_refs(rel, days, dex, drel)))
+    # grouped by the first ten words of the message, ids taken out so that lines differing only in a uuid are one group;
+    # the groups are listed by the time of their newest line, newest first
+    agg, ex, last, words, plain, oldform = {}, {}, {}, {}, [rel] + [r for r, _ in pcopies if not COMPRESSED.search(r)], False
+    for fi, (r, tx) in enumerate([(r, tx) for r, tx in pcopies[::-1] if not COMPRESSED.search(r)] + [(rel, text)]):     # oldest copy first
+        for l in tx.splitlines():
+            if "[E" in l:
+                w_ = l.split()
+                # older lines: time [app] [E] message (the message is word 4); current lines: time [E|app|id] message (word 3)
+                cur_ = len(w_) > 1 and re.match(r"^\[[A-Z]\|", w_[1])
+                oldform = oldform or not cur_
+                k = " ".join(w_[2:12] if cur_ else w_[3:13])
+                g = _ERR_NUM_ID.sub(r"\1…", _ERR_IDS.sub("…", k))
+                m = _PROD_TIME.match(l)
+                when = (m.group(1) + " " + m.group(2)) if m else ""
+                agg[g] = agg.get(g, 0) + 1
+                if (when, fi) >= last.get(g, ("", -1)):
+                    last[g], ex[g], words[g] = (when, fi), (r, l), k
+    order = sorted(agg, key=lambda g: (last[g], agg[g]), reverse=True)[:40]
+    pairs = [(g, agg[g]) for g in order]
+    out.append(block("production.log errors, the 40 seen last, grouped by the first ten words of the message (newest first)",
+                     "grep -I -F '[E' var/log/foreman/production.log* | awk '{k=$3; for (i=4; i<=12; i++) k=k\" \"$i; n[k]++; t[k]=substr($1,1,16)} "
+                     "END {for (k in n) print t[k], n[k], k}' | sort -r | head -n40",
+                     ["%-16s %6d  %s" % (last[g][0].replace("T", " ") or "(no time)", agg[g], words[g]) for g in order], plain, learn="production.log",
+                     refs=raw_refs(rel, [(words[g], n) for g, n in pairs], dict((words[g], ex[g]) for g in order)), approx=True,
+                     note=join_notes(plural(sum(agg.values()), "line") if agg else "", "the time is the group's newest line, the count all its lines · ids (uuids, long hex, the number after 'ID') are left out when grouping",
+                                     "read %s" % plural(len(plain), "file") if len(plain) > 1 else "",
+                                     ("%s left out, as grep -I does" % plural(len(pcopies) - len(plain) + 1, "compressed copy", "compressed copies")) if len(plain) < len(pcopies) + 1 else ""),
+                     empty="(no line with [E)"))
+    out.append(cat(t, "last 20 lines of foreman cron.log", ["var/log/foreman/cron.log"]) if not t.first(["var/log/foreman/cron.log"]) else
+               block("last 20 lines of foreman cron.log", "tail -20 var/log/foreman/cron.log",
+                     (t.read(["var/log/foreman/cron.log"], tail=True, limit=LOG_READ)[0] or "").splitlines()[-20:], ["var/log/foreman/cron.log"]))
+    out.append(cat(t, "Foreman settings: proxy, download policy, tasks, registration", ["sos_commands/foreman/foreman_settings_table"],
+                   keep=r"^\s*(id|name)\b|proxy|download_policy|foreman_tasks|unregister|registration|default_|ssl_|ignore_puppet|remote_execution_(ssh|connect)", learn="foreman_settings"))
+    out.append(fold(cat(t, "Foreman settings.yaml", ["etc/foreman/settings.yaml"])))
+    if t.exists("var/log/puppetlabs/puppetserver/puppetserver.log"):
+        out.append(fold(grep(t, ctx, "Puppet server: ERROR lines (newest first)", ["var/log/puppetlabs/puppetserver/puppetserver.log"], r"ERROR", last=ALL_LINES, flags=0), approx=True))
+    return out + _foreman_db_blocks(t) + _proxy_log_blocks(t, ctx)
+
+
+def _foreman_db_blocks(t):
+    """What the Foreman database holds about smart proxies and logins, and the web server's workers (sos foreman plugin)."""
+    return [head_table(t, "smart proxies the Satellite knows, with their features (database)", ["sos_commands/foreman/smart_proxies"], 40),
+            head_table(t, "authentication sources (database)", ["sos_commands/foreman/foreman_auth_table"], 20),
+            cat(t, "Puma (Foreman web server) workers as collected", ["sos_commands/foreman/foreman-puma-status", "sos_commands/foreman/pumactl_stats"])]
+
+
+ACCESS_RX = re.compile(r'^(\S+) \S+ \S+ \[([^\]]+)\] "(\S+) (\S+)[^"]*" (\d{3}) ')
+
+
+def s13_httpd(t, ctx):
+    out = []
+    et, erel = t.read(HTTPD_ERR, tail=True, limit=LOG_READ)
+    if et is None:
+        out.append(block("error_log lines with 'queue', per date", "grep -F queue var/log/httpd/error_log | awk '{print $2, $3}' | cut -d: -f1,2 | uniq -c", missing=HTTPD_ERR))
+    else:
+        runs, full = [], 0
+        for l in et.splitlines():
+            if "queue" not in l:
+                continue
+            full += "Request queue is full" in l
+            f = l.split()
+            k = ":".join(" ".join(f[1:3]).split(":")[:2])         # awk '{print $2, $3}' | cut -d: -f1,2
+            if runs and runs[-1][0] == k:                          # uniq -c: equal neighbours only
+                runs[-1][1] += 1
+            else:
+                runs.append([k, 1])
+        out.append(block("error_log lines with 'queue', per date (newest first)",
+                         "grep -F queue %s | awk '{print $2, $3}' | cut -d: -f1,2 | uniq -c | tac" % erel,
+                         ["%7d %s" % (c, k) for k, c in runs[::-1][:ALL_LINES]], [erel],
+                         note=join_notes(plural(full, "'Request queue is full' line"), upto(runs)[1]), empty="(no line with queue)"))
+    text, rel = t.read(ACCESS, tail=True, limit=64 * 1024 * 1024)
+    if text is None:
+        out.append(block("access log", "awk '{print $9}' var/log/httpd/foreman-ssl_access_ssl.log | sort | uniq -c", missing=ACCESS[0], learn="access-log"))
+        return out
+    ips, five, scan = {}, {}, []
+    iph = {}                                     # client address and hour
+    exi, exf = {}, {}
+    n = 0
+    for l in text.splitlines():
+        f = l.split()                               # every line counts, by its fields, as awk counts it
+        fld = lambda i: f[i] if len(f) > i else ""
+        if f:
+            ips[f[0]] = ips.get(f[0], 0) + 1
+            exi[f[0]] = l
+            hk = ":".join((f[0] + " " + fld(3)).split(":")[:3]).rstrip()      # awk '{print $1,$4}' | cut -d: -f1,2,3
+            iph[hk] = iph.get(hk, 0) + 1
+        m = ACCESS_RX.match(l)
+        if not m:
+            continue
+        n += 1
+        ip, when, meth, uri, code = m.groups()
+        if code.startswith("5"):
+            h = when[:14].replace(":", " ", 1)
+            five[h] = five.get(h, 0) + 1
+            exf[h] = l
+        if code == "404" and l.rstrip().endswith('"-" "-"') and len(scan) < 10:
+            scan.append(l)
+    out.append(block("5xx responses per hour (busiest 24)", "awk '$9 ~ /^5/ {print substr($4,2,14)}' %s | uniq -c | sort -rn | head -24" % rel,
+                     counted(sorted(top(five, 24), key=lambda kv: kv[0]) if five else []), [rel], approx=True, empty="(no 5xx responses)", learn="access-log",
+                     note=" · ".join(x for x in (plural(n, "request"), span_of(text.splitlines()[:5] + text.splitlines()[-5:], ctx)) if x),
+                     refs=raw_refs(rel, sorted(top(five, 24), key=lambda kv: kv[0]), exf, q=lambda k: "")))
+    out.append(block("top 20 client addresses", "awk '{print $1}' %s | sort | uniq -c | sort -rn | head -20" % rel, counted(top_nr(ips, 20)), [rel],
+                     approx=True, refs=raw_refs(rel, top_nr(ips, 20), exi, q=lambda k: "re:^" + re.escape(k) + " ")))
+    out.append(fold(block("top 20 client addresses by minute", "awk '{print $1,$4}' %s | cut -d: -f1,2,3 | sort | uniq -c | sort -nr | head -n20" % rel,
+                          counted(top_nr(iph, 20)), [rel], approx=True)))
+    out.append(block("404 responses with no referrer and no user agent (first 10)", "grep -E '^[^ ]+ [^ ]+ [^ ]+ \\[[^]]+\\] \"[^ ]+ [^ ]+[^\"]*\" 404 .*\"-\" \"-\"[[:space:]]*$' %s | head -10" % rel, scan, [rel], empty="(none)"))
+    return out
+
+
+def s14_pulp(t, ctx):
+    out = []                                     # the pulpcore units are in the units block of Services
+    jt, jrel = t.read(JOURNAL, tail=True, limit=64 * 1024 * 1024, largest=True)
+    if jt is None:
+        out.append(block("pulpcore error messages by text", "grep -E 'pulpcore.*(ERROR|Error|Exception)' journal", missing=JOURNAL[0], learn="journal"))
+    else:
+        agg, allh, ex, seen, at = {}, [], {}, {}, {}
+        rx_pre, rx_tb = re.compile(r"^.*?pulpcore-[\w@.-]+\[\d+\]:\s*"), re.compile(r"\s*(File \"|Traceback|raise |\s{2,}\S)")
+        rx_err, rx_req = re.compile(r"\bERROR\b|\w+Error\b|Exception\b|\" 5\d\d "), re.compile(r"pulp \[[^\]]*\]:\s*")
+        rx_low = re.compile(r"^[\w.]+:(?:WARNING|INFO|DEBUG):")     # Pulp's own level: a warning that names a package called *-Exception is not an error
+        for i, l in enumerate(jt.split("\n")):
+            if "pulpcore" not in l:
+                continue
+            if "rror" not in l and "RROR" not in l and "xception" not in l and "\" 5" not in l:
+                continue                           # cannot match rx_err: skip the pattern work
+            msg = rx_pre.sub("", l, 1)
+            if rx_tb.match(msg) or not rx_err.search(msg):
+                continue
+            body = rx_req.sub("", msg, 1)
+            if rx_low.match(body):
+                continue
+            allh.append(l)
+            k = _HEX_ADDR.sub("0x…", generalize_paths(squash(body)))     # 'object at 0x7f31e1eeb470' differs on every line
+            agg[k] = agg.get(k, 0) + 1
+            ex[k], at[k] = l, i
+            seen[k] = len(allh)                    # lines are in time order: the latest position is the newest line
+        order = sorted(agg, key=lambda k: seen[k], reverse=True)[:20]
+        ref = ref_time(ctx)
+        base = t.line_base(jrel, jt)
+
+        def when(l):
+            w = parse_when(l[:40], ref)
+            return w.strftime("%Y-%m-%d %H:%M") if w else "(no time)"
+        out.append(block("pulpcore error messages by text, the 20 seen last (traceback frames left out, newest first)",
+                         "grep -E 'pulpcore.*(ERROR|Error|Exception| 5[0-9]{2} )' %s | grep -v -E ':(WARNING|INFO|DEBUG):' | tac | awk '{m=$0; sub(/^.*pulpcore[^:]*: /, \"\", m)} !(m in n) {o[++i]=$1\" \"$2\" \"$3\" \"m} {n[m]++} "
+                         "END {for (j=1; j<=20 && j<=i; j++) print o[j]}'" % jrel,
+                         ["%-16s %6d  %s" % (when(ex[k]), agg[k], k) for k in order], [jrel], approx=True, learn="journal",
+                         note=join_notes(span_of(allh, ctx), "the time is the group's newest line, the count all its lines" if order else ""), empty="(no pulpcore error lines)",
+                         refs=[{"rel": jrel, "line": base + at[k] + 1, "q": k} for k in order]))   # the line numbers are known here: no search afterwards
+    out.insert(0, pulp_failed_block(t, ctx))
+    out.append(pulp_status_block(t))
+    out.append(cat(t, "Pulp settings", ["etc/pulp/settings.py"], nocomments=True))
+    return out
+
+
+# ---- Pulp's own task table and the steps it recorded for each task ----
+PULP_TASK_TABLE = ["sos_commands/pulpcore/core_task", "sos_commands/pulp/core_task"]
+PULP_STEP_TABLE = ["sos_commands/pulpcore/core_progressreport", "sos_commands/pulp/core_progressreport"]
+PULP_FAILED_ROWS = 20
+_URL_RX = re.compile(r"https?://[^\s'\"()<>]+")
+
+
+def read_pulp_table(t, cands, limit=256 * 1024 * 1024):
+    """(records, rel) of a table sos exported from Pulp's database: ';' separated with a header line on current sos, ','
+    or psql's aligned table on older ones. Each record has '_ln', the line it starts on. records is None when the
+    file is not in the report."""
+    import csv
+    text, rel = t.read(cands, limit=limit)
+    if text is None:
+        return None, cands[0]
+    head = text.split("\n", 1)[0]
+    if head.count("|") >= 2:
+        recs, _ = parse_table(text)
+        return [r for r in recs or [] if "_line" in r], rel
+    try:
+        csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))      # an error cell holds a whole traceback
+    except (OverflowError, ValueError):
+        pass
+    recs, end = [], 1
+    try:
+        rd = csv.DictReader(io.StringIO(text), delimiter=";" if head.count(";") > head.count(",") else ",")
+        for r in rd:
+            r["_ln"], end = end + 1, rd.line_num        # the record's first line (a quoted cell can hold newlines)
+            recs.append(r)
+    except csv.Error:
+        pass
+    return recs, rel
+
+
+def short_urls(text, keep=4):
+    """Long URLs cut in the middle: the scheme and host, then the last `keep` parts of the path."""
+    def cut(m):
+        u = m.group(0)
+        p = re.match(r"(https?://[^/]+)/(.*)$", u)
+        if len(u) <= 60 or not p:
+            return u
+        parts = p.group(2).rstrip("/").split("/")
+        return u if len(parts) <= keep else p.group(1) + "/…/" + "/".join(parts[-keep:])
+    return _URL_RX.sub(cut, text)
+
+
+def pulp_error_text(cell):
+    """Pulp's own words for a failure: the description of the error cell (JSON), else the last line of its traceback."""
+    v = (cell or "").strip()
+    if v in ("", "\\N", "NULL", "{}"):
+        return ""
+    if v[:1] == "{":
+        try:
+            e = json.loads(v)
+            v = e.get("description") or ([l for l in (e.get("traceback") or "").splitlines() if l.strip()] or [""])[-1] or v
+        except (ValueError, AttributeError):
+            pass
+    return squash(str(v))
+
+
+def pulp_task_short(name):
+    """'pulp_rpm.app.tasks.synchronizing.synchronize' -> 'synchronize (pulp_rpm)'."""
+    p = (name or "").strip().split(".")
+    return "%s (%s)" % (p[-1], p[0]) if len(p) > 1 else (name or "").strip() or "(no name)"
+
+
+def pulp_step_text(s):
+    """'Downloading Artifacts (1,203 / 4,512)': the step's message and how far it got."""
+    done, total = (s.get("done") or "").strip(), (s.get("total") or "").strip()
+    n = lambda v: fmt_n(int(v)) if v.isdigit() else v
+    cnt = "%s / %s" % (n(done or "0"), n(total)) if total not in ("", "\\N", "NULL") else n(done) if done not in ("", "\\N", "NULL") else ""
+    return (s.get("message") or s.get("code") or "(unnamed step)").strip() + (" (%s)" % cnt if cnt else "")
+
+
+def pulp_failed_block(t, ctx):
+    """Pulp's failed tasks from its own task table, each with the step Pulp marked failed and how far that step got,
+    from the progress report table sos exports beside it. Tasks with the same name, step and error are one line."""
+    title = "failed Pulp tasks, and the step each failed in (newest first)"
+    cmd = "grep -a ';failed;' %s; grep -a ';failed;' %s"
+    tasks, trel = read_pulp_table(t, PULP_TASK_TABLE)
+    if tasks is None:
+        return block(title, cmd % (PULP_TASK_TABLE[0], PULP_STEP_TABLE[0]), missing=PULP_TASK_TABLE[0], learn="pulp-tables")
+    head = (t.read([trel], limit=8192)[0] or "")[:4000]
+    if PG_ERROR.search(head) and "pulp_id" not in head.split("\n", 1)[0]:     # the query failed when sos ran: its message
+        return block(title, "cat %s" % trel, src=[trel], learn="pulp-tables", error="\n".join(head.strip().splitlines()[:20]))
+    steps, srel = read_pulp_table(t, PULP_STEP_TABLE)
+    h1 = head.split("\n", 1)[0]
+    if h1.count("|") >= 2 and h1.count("|") >= h1.count(";"):         # psql's aligned output: ' failed ' between bars
+        cmd = "grep -E '\\| *failed *\\|' %s; grep -E '\\| *failed *\\|' %s"
+    elif h1.count(",") > h1.count(";"):
+        cmd = "grep -a ',failed,' %s; grep -a ',failed,' %s"
+    cmd = cmd % (trel, srel or PULP_STEP_TABLE[0])
+    if tasks and "state" not in tasks[0]:
+        return block(title, "head -1 %s" % trel, [], [trel], approx=True, learn="pulp-tables", empty="(the table has no state column: no task can be read)")
+    shift = datetime.timedelta(minutes=ctx.get("utc_offset") or 0)
+    local = ctx.get("utc_offset") is not None
+
+    def when(r, *keys):
+        for k in keys:
+            w = parse_when((r.get(k) or "")[:19].replace("T", " "))
+            if w:
+                return w + shift
+        return None
+    by_task = {}
+    for s in steps or []:
+        if (s.get("state") or "").strip() == "failed":
+            by_task.setdefault((s.get("task_id") or "").strip(), []).append(s)
+    seen = [w for w in (when(r, "pulp_last_updated", "finished_at", "started_at") for r in tasks) if w]
+    failed = [r for r in tasks if (r.get("state") or "").strip() == "failed"]
+    groups = {}
+    for r in failed:
+        w = when(r, "finished_at", "pulp_last_updated", "started_at")
+        fs = by_task.get((r.get("pulp_id") or "").strip(), [])
+        step = (pulp_step_text(fs[0]) + (" and %d more" % (len(fs) - 1) if len(fs) > 1 else "")) if fs else \
+            "(steps not collected)" if steps is None else "(no step marked failed)"
+        name = pulp_task_short(r.get("name"))
+        err = short_urls(pulp_error_text(r.get("error")))[:300] or "(no error text)"
+        k = (name, re.sub(r" \([\d,]+(?: / [\d,]+)?\)", "", step), err)
+        g = groups.setdefault(k, {"n": 0, "new": None, "first": None, "step": step, "ln": r.get("_ln")})
+        g["n"] += 1
+        if w and (g["new"] is None or w > g["new"]):
+            g["new"], g["step"], g["ln"] = w, step, r.get("_ln")
+        if w and (g["first"] is None or w < g["first"]):
+            g["first"] = w
+    order = sorted(groups, key=lambda k: groups[k]["new"] or datetime.datetime.min, reverse=True)
+    rows = [("FINISHED", "TASKS", "FAILED IN STEP (done / total)", "WHAT PULP SAID", "TASK · FIRST")]
+    for k in order[:PULP_FAILED_ROWS]:
+        g = groups[k]
+        first = " · first %s" % g["first"].strftime("%Y-%m-%d %H:%M") if g["n"] > 1 and g["first"] and g["first"] != g["new"] else ""
+        rows.append((g["new"].strftime("%Y-%m-%d %H:%M") if g["new"] else "(no time)", fmt_n(g["n"]), g["step"], k[2], k[0] + first))
+    w2 = max(len(r[2]) for r in rows)
+    w3 = max(len(r[3]) for r in rows)
+    lines = ["%-16s  %5s  %-*s  %-*s  %s" % (r[0], r[1], w2, r[2], w3, r[3], r[4]) for r in rows] if order else []
+    span = ""
+    if seen:
+        days = max(1, -(-int((ref_time(ctx) - min(seen)).total_seconds()) // 86400)) if ctx.get("collected") else None
+        span = "the table holds tasks last updated %s → %s%s" % (min(seen).strftime("%Y-%m-%d %H:%M"), max(seen).strftime("%Y-%m-%d %H:%M"),
+                                                                  " (sos exports 7 days unless told otherwise)")
+    else:
+        days = None
+    note = join_notes("" if order else "(no Pulp task failed in this table)" if tasks else "(the table holds no task)",
+                      "%s failed of %s Pulp tasks" % (fmt_n(len(failed)), fmt_n(len(tasks))) if order else plural(len(tasks), "Pulp task") if tasks else "", span,
+                      "tasks with the same step and error are one line, the time is the newest" if order else "",
+                      ("only the %d newest lines" % PULP_FAILED_ROWS) if len(order) > PULP_FAILED_ROWS else "",
+                      "" if not order else ("host time" if local else "UTC"),
+                      "%s is not in this report: the steps are unknown" % PULP_STEP_TABLE[0] if steps is None and order else "")
+    b = block(title, cmd, lines, [trel] + ([srel] if steps is not None else []), approx=True, note=note, learn="pulp-tables",
+              refs=[None] + [{"rel": trel, "line": groups[k]["ln"], "q": ""} if groups[k]["ln"] else None for k in order[:PULP_FAILED_ROWS]])
+    if order:
+        newest = groups[order[0]]["new"]
+        b["pulp"] = {"failed": len(failed), "days": days, "newest": newest.strftime("%Y-%m-%d %H:%M") if newest else ""}
+    return b
+
+
+def pulp_status_block(t):
+    """/pulp/api/v3/status/ as sos fetched it: workers with their last heartbeat, versions, connections, storage."""
+    cands = ["sos_commands/pulpcore/pulp_status", "sos_commands/pulp*/pulp_status"]
+    text, rel = t.read(cands)
+    title = "Pulp status as collected (/pulp/api/v3/status/)"
+    if text is None:
+        return block(title, "python3 -m json.tool sos_commands/pulpcore/pulp_status", missing=cands)
+    try:
+        d = json.loads(text[text.find("{"):]) if "{" in text else None
+    except ValueError:
+        d = None
+    if not isinstance(d, dict):
+        return block(title, "cat %s" % rel, src=[rel], error="\n".join((text.strip().splitlines() or ["(empty)"])[:20]))
+    lines = []
+    for key, label in (("online_workers", "worker"), ("online_api_apps", "api app"), ("online_content_apps", "content app")):
+        items = d.get(key)
+        if isinstance(items, list):
+            lines.append("%-14s %d online" % (label + "s", len(items)))
+            for w in items[:12]:
+                if isinstance(w, dict):
+                    lines.append("    %-48s last heartbeat %s" % (str(w.get("name", ""))[:48], str(w.get("last_heartbeat", ""))[:19]))
+    for k in ("database_connection", "redis_connection"):
+        v = d.get(k)
+        if isinstance(v, dict):
+            lines.append("%-22s connected: %s" % (k.replace("_", " "), v.get("connected")))
+    st = d.get("storage")
+    if isinstance(st, dict) and st.get("total"):
+        lines.append("storage                total %s · used %s · free %s" % (human(st.get("total") or 0), human(st.get("used") or 0), human(st.get("free") or 0)))
+    vers = d.get("versions")
+    if isinstance(vers, list):
+        lines.append("versions               " + ", ".join("%s %s" % (v.get("component"), v.get("version")) for v in vers[:14] if isinstance(v, dict)))
+    return block(title, "python3 -m json.tool %s" % rel, lines, [rel], approx=True, empty="(no status fields)")
+
+
+def s15_candlepin(t, ctx):
+    out = []
+    for name, cands in (("candlepin.log", ["var/log/candlepin/candlepin.log"]), ("error.log", ["var/log/candlepin/error.log"])):
+        text, rel = t.read(cands, tail=True, limit=LOG_READ)
+        if text is None:
+            out.append(block("%s: ERROR lines by message (newest first)" % name, "grep -F ERROR var/log/candlepin/%s" % name, missing=cands[0], learn="candlepin-log"))
+            continue
+        errs = [l for l in text.splitlines() if "ERROR" in l]
+        items = []
+        for l in errs:          # the message alone: the time, [thread=…] and [req=…, csid=…] differ on every line
+            mm = _CP_MSG.match(l)
+            items.append(((mm.group(1)[:16] if mm else ""), clean(("%-5s %s" % (mm.group(2), mm.group(3))) if mm else l, LINE_MAX), (rel, l)))
+        glines, gpairs, gex = recent_groups(items, ALL_LINES)
+        out.append(block("%s: ERROR lines by message (newest first)" % name,
+                         "grep -F ERROR %s | sed -E 's/ \\[[^]]*\\]//g; s/ [a-z.]+[A-Za-z]+ - / /' | awk '{t=$1\" \"substr($2,1,5); $1=$2=\"\"; n[$0]++; l[$0]=t} END {for (m in n) print l[m], n[m], m}' | sort -r" % rel,
+                         glines, [rel], approx=True, learn="candlepin-log",
+                         note=join_notes(plural(len(errs), "ERROR line") if errs else "", span_of(errs, ctx), GROUP_NOTE if glines else ""), empty="(no ERROR lines)",
+                         refs=raw_refs(rel, gpairs, gex)))
+    text, rel = t.read(["var/log/candlepin/candlepin.log"], tail=True, limit=LOG_READ)
+    if text is not None:
+        ccopies, cleft = read_copies(t, "var/log/candlepin/*", rel)
+        csrc = [r for r, _ in ccopies]
+        zg = "zgrep" if any(COMPRESSED.search(r) for r in csrc) else "grep"
+        import heapq
+        top_ans, top_any, sca, seen, reqs, seq = [], [], [], {}, {}, 0
+        rx_time, rx_sca = re.compile(r"\btime=(\d+)"), re.compile(r"content access mode|simple content access|entitlement mode", re.I)
+        for r, tx in ccopies:
+            for l in tx.split("\n"):
+                # plain-text checks first: a Candlepin log holds millions of lines and most have none of these
+                if "time=" in l:
+                    m = rx_time.search(l)
+                    if m:
+                        seq += 1
+                        item = (int(m.group(1)), -seq, l, r)          # the slowest; on a tie the earlier line first
+                        heap = top_ans if "Response:" in l else top_any
+                        if len(heap) < 20:
+                            heapq.heappush(heap, item)
+                        elif item > heap[0]:
+                            heapq.heapreplace(heap, item)
+                if ("ccess" in l or "ntitlement" in l or "CCESS" in l or "NTITLEMENT" in l) and rx_sca.search(l):
+                    # the message alone: time, [thread=…] and [req=…, csid=…] differ on every line; ids are left out when grouping
+                    mm = _CP_MSG.match(l)
+                    k = _ERR_IDS.sub("…", ("%-5s %s" % (mm.group(2), mm.group(3))) if mm else l)
+                    seen[k] = seen.get(k, 0) + 1
+                    sca.append((k, (mm.group(1)[:16] if mm else ""), l, r))
+        answers = bool(top_ans)    # the answer lines; a log that words them another way keeps every line with time=
+        tm = [(ms, l, r) for ms, _, l, r in sorted(top_ans or top_any, reverse=True)]
+        want = set(mq.group(1) for mq in (_CP_REQ.search(l) for _, l, _ in tm) if mq)
+        if want:                   # the request line of each of the twenty: a second pass that only looks at request lines
+            for r, tx in ccopies:
+                for l in tx.split("\n"):
+                    if "Request: verb=" in l:
+                        mq = _CP_REQ.search(l)
+                        if mq and mq.group(1) in want:
+                            mv = re.search(r"Request: verb=(\w+), uri=(\S+)", l)
+                            if mv:
+                                reqs[mq.group(1)] = (mv.group(1), mv.group(2).rstrip(","))
+
+        def slow_line(ms, l):
+            mq, mw = _CP_REQ.search(l), _PROD_TIME.match(l)
+            ms_ = re.search(r"status=(\d+)", l)
+            rq = reqs.get(mq.group(1)) if mq else None
+            what = ("%s %s" % rq) if rq else "(its request line is not in the log)"
+            return "%7s ms  %-16s  %s%s" % (fmt_n(ms), ("%s %s" % mw.groups()) if mw else "", clean(what, 140), ("  → %s" % ms_.group(1)) if ms_ else "")
+        paired = sum(1 for _, l, _ in tm[:20] if _CP_REQ.search(l) and _CP_REQ.search(l).group(1) in reqs)
+        out.append(block("slowest Candlepin requests, top 20, with what was asked",
+                         "%s -h '%stime=' var/log/candlepin/* | awk -F'time=' '{print $NF+0, $0}' | sort -nr | head -20   # + the 'Request: verb=' line with the same req=" % (zg, "Response: .*" if answers else ""),
+                         [slow_line(ms, l) for ms, l, _ in tm[:20]], csrc, approx=True, empty="(no time= fields)",
+                         note=join_notes(copies_note(ccopies, cleft), ("each answer is matched to its request by their req= id" + ("" if paired == min(20, len(tm)) else " · %d of %d found" % (paired, min(20, len(tm))))) if tm else ""),
+                         refs=[None if COMPRESSED.search(r) else {"rel": r, "raw": l, "q": ""} for ms, l, r in tm[:20]]))
+        out[-1]["show"] = 5               # the five slowest; the other fifteen open under them
+        newest = {}
+        for k, when, l, r in sca:
+            if when >= newest.get(k, ("",))[0]:
+                newest[k] = (when, l, r)
+        corder = sorted(newest, key=lambda k: newest[k][0], reverse=True)[:ALL_LINES]
+        out.append(block("content access mode messages, each once (newest first)",
+                         "%s -h -iE 'content access mode|simple content access|entitlement mode' var/log/candlepin/* | sed -E 's/ \\[[^]]*\\]//g; s/ [a-z.]+[A-Za-z]+ - / /' | "
+                         "awk '{t=$1\" \"substr($2,1,5); $1=$2=\"\"; n[$0]++; if (t > l[$0]) l[$0]=t} END {for (m in n) print l[m], n[m], m}' | sort -r" % zg,
+                         ["%-16s %6d  %s" % (newest[k][0] or "(no time)", seen[k], k) for k in corder], csrc, approx=True, empty="(none)",
+                         note=join_notes(plural(len(sca), "line") if sca else "", "the time is the message's newest line, the count all its lines" if sca else "", copies_note(ccopies, cleft)),
+                         refs=[None if COMPRESSED.search(newest[k][2]) else {"rel": newest[k][2], "raw": newest[k][1], "q": ""} for k in corder]))
+    dus = t.glob("sos_commands/candlepin/du_*")
+    if dus:
+        out.append(cat(t, "Candlepin storage (du)", dus[:1]))
+    ctx_, crel = t.read(["var/log/candlepin/candlepin.log"], tail=True, limit=LOG_READ)
+    if ctx_ is not None:
+        cl_ = ctx_.splitlines()
+        hits_ = [i for i, l in enumerate(cl_) if "Updated" in l]
+        up, prev = [], -1
+        for i in hits_:                              # as grep -B1 prints it: the line before each match, '--' between groups
+            if prev >= 0 and i - 1 > prev + 1:
+                up.append("--")
+            if i - 1 > prev and i > 0:
+                up.append(cl_[i - 1])
+            up.append(cl_[i])
+            prev = i
+        out.append(fold(block("candlepin.log: 'Updated' lines, each with the line before it", "grep -F -B1 Updated %s" % crel + (" | tail -%d" % ALL_LINES if len(up) > ALL_LINES else ""), up[-ALL_LINES:], [crel],
+                              note=join_notes(plural(len(hits_), "'Updated' line") if hits_ else "", ("the last %d lines shown" % ALL_LINES) if len(up) > ALL_LINES else ""),
+                              empty="(no 'Updated' line)")))
+    et, erel = t.read(["var/log/candlepin/error.log"], tail=True, limit=LOG_READ)
+    if et is not None:
+        out.append(fold(block("last 30 lines of Candlepin error.log", "tail -30 %s" % erel, et.splitlines()[-30:], [erel], empty="(empty file)")))
+    return out
+
+
+def s16_rhsm(t, ctx):
+    out = []
+    text, rel = t.read(["var/log/rhsm/rhsm.log"], tail=True, limit=LOG_READ)
+    if text is None:
+        out.append(block("rhsm.log ERROR / WARNING by source", "grep -E '\\[(ERROR|WARNING)\\]' var/log/rhsm/rhsm.log", missing="var/log/rhsm/rhsm.log", learn="rhsm.log"))
+    else:
+        allh, qk, items = [], {}, []
+        for l in text.splitlines():
+            # "[WARNING] dnf:17590:MainThread @logutil.py:175 - ..."  /  "[ERROR] @virt.py:416 - ..." (virt-who has no process field)
+            m = RHSM_LINE.match(l)
+            if m:
+                allh.append(l)
+                proc = m.group(2) or ("virt-who" if re.match(r"virt|executor|manager", m.group(3) or "") else "?")
+                k = "%-7s %-24s %s" % (m.group(1), proc, generalize_paths(squash(m.group(4)))[:100])
+                qk[k] = squash(m.group(4))[:100]
+                mt = _PROD_TIME.match(l)
+                items.append((("%s %s" % mt.groups()) if mt else "", k, (rel, l)))
+        glines, gpairs, gex = recent_groups(items, ALL_LINES)
+        out.append(fold(block("rhsm.log ERROR / WARNING by process and text, newest first (subscription-manager, rhsmcertd, virt-who…)",
+                         "grep -E '\\[(ERROR|WARNING)\\]' %s | sed -E 's/:[0-9]+ @/ @/' | awk '{t=$1\" \"substr($2,1,5); $1=$2=\"\"; n[$0]++; l[$0]=t} END {for (m in n) print l[m], n[m], m}' | sort -r" % rel,
+                         glines, [rel], approx=True, learn="rhsm.log", note=join_notes(plural(len(allh), "line") if allh else "", span_of(allh, ctx), GROUP_NOTE if glines else ""), empty="(no ERROR/WARNING lines)",
+                         refs=raw_refs(rel, gpairs, gex, q=lambda k: qk.get(k, "")))))
+        for word in ("ERROR", "WARNING"):
+            wl = [l for l in text.splitlines() if word in l]
+            runs = collapse_repeats(wl[::-1])           # the same line over and over is one line with its count
+            if len(runs) == len(wl):                    # nothing repeats: the lines as the log wrote them
+                out.append(block("rhsm.log lines with %s (newest first)" % word, "grep -F %s %s | tac" % (word, rel), wl[::-1][:ALL_LINES], [rel], learn="rhsm.log",
+                                 note=join_notes(plural(len(wl), "line"), span_of(wl, ctx), upto(wl)[1]), empty="(0 lines)"))
+                continue
+            out.append(block("rhsm.log lines with %s (newest first, repeats of a line on one line)" % word,
+                             "grep -F %s %s | tac | sed -E 's/^(\\S+ [0-9:]{5})\\S* /\\1 /' | uniq -c -f2" % (word, rel),
+                             repeat_lines(runs[:ALL_LINES]), [rel], learn="rhsm.log", approx=True,
+                             note=join_notes("%s on %s" % (plural(len(wl), "line"), plural(len(runs), "line")) if wl else "", span_of(wl, ctx), upto(runs)[1]), empty="(0 lines)",
+                             refs=[{"rel": rel, "raw": r[4], "q": ""} for r in runs[:ALL_LINES]]))
+        dup = sorted(set(m.group(1) for m in re.finditer(r"'([^']*)' is assigned to 2 different systems", text)))
+        out.append(block("hypervisors reported as assigned to 2 different systems", "grep -o \"'[^']*' is assigned to 2 different systems\" %s | cut -d\"'\" -f2 | sort -u" % rel,
+                         dup, [rel], note=plural(len(dup), "hypervisor"), empty="(0 hypervisors)"))
+        h2g = [l for l in text.splitlines() if "Sending updated Host-to-guest" in l]
+        runs = []                                   # newest first; reports in a row with the same text are one line
+        for l in h2g[::-1]:
+            m = re.match(r"^(\d{4}-\d\d-\d\d \d\d:\d\d)\S*\s.*?(Sending updated Host-to-guest.*)$", l)
+            when, msg = (m.group(1), m.group(2).rstrip()) if m else ("", l.rstrip())
+            if runs and runs[-1][3] == msg:
+                runs[-1][1], runs[-1][2] = when, runs[-1][2] + 1
+            else:
+                runs.append([when, when, 1, msg])
+        out.append(block("virt-who host-to-guest reports sent (newest first, reports in a row with the same numbers on one line)",
+                         "grep -F 'Sending updated Host-to-guest' %s | tac | sed -E 's/^(\\S+ [0-9:]{5})\\S* .* - /\\1 /' | uniq -c -f2" % rel,
+                         ["%-16s %6s  %-22s %s" % (a, "×%d" % n, ("since %s" % b) if n > 1 else "", msg) for a, b, n, msg in runs[:ALL_LINES]], [rel], approx=True,
+                         note=join_notes("%s on %s" % (plural(len(h2g), "report"), plural(len(runs), "line")), span_of(h2g, ctx), upto(runs)[1]) if h2g else "",
+                         empty="(no 'Sending updated Host-to-guest' lines in rhsm.log)"))
+    ut, urel = t.read(UNITS)
+    if ut is not None:
+        out.append(block("virt-who unit", "grep virt-who %s | sed -E 's/^\\W+//'" % urel, [re.sub(r"^\W+", "", l) for l in ut.splitlines() if "virt-who" in l], [urel], empty="(no virt-who unit)"))
+    confs = [n for n in t.listdir("etc/virt-who.d") if n.endswith(".conf")]
+    vd = t.listdir("etc/virt-who.d")
+    if vd:
+        vl = ls_names(t, "etc/virt-who.d")
+        out.append(block("files in etc/virt-who.d", "ls etc/virt-who.d", vl or sorted(vd), ["etc/virt-who.d/"], approx=vl is None, note=NAMES_ONLY))
+    if confs:
+        lines, plain = [], []
+        for n in confs:
+            tx, _ = t.read(["etc/virt-who.d/" + n], limit=128 * 1024)
+            lines.append("== etc/virt-who.d/%s" % n)
+            plain.append("== etc/virt-who.d/%s" % n)
+            plain += (tx or "").rstrip("\n").split("\n")
+            for l in (tx or "").rstrip("\n").split("\n"):
+                vis = l.replace("\t", "^I").replace("\r", "^M")
+                vis = "".join(ch if (32 <= ord(ch) < 127 or ch in "^") else "M-?" for ch in vis)
+                lines.append(vis + "$")
+        out.append(block("virt-who configuration files", "for b in etc/virt-who.d/*.conf; do echo \"== $b\"; cat $b; done",
+                         plain[:ALL_LINES], ["etc/virt-who.d/"], approx=True, learn="virt-who", note=upto(plain)[1]))
+        out.append(fold(block("virt-who configuration files, hidden characters shown (cat -vet)", "cat -vet etc/virt-who.d/*.conf",
+                              lines[:ALL_LINES], ["etc/virt-who.d/"], approx=True, learn="virt-who", note=upto(lines)[1])))
+    else:
+        out.append(block("virt-who configuration", "cat -vet etc/virt-who.d/*.conf 2>/dev/null", [], ["etc/virt-who.d/"], empty="(no files in etc/virt-who.d)"))
+    if confs:
+        srv, gl = {}, {}
+        for n in confs:
+            tx, _ = t.read(["etc/virt-who.d/" + n], limit=128 * 1024)
+            for l in (tx or "").split("\n"):
+                if l.startswith("server"):
+                    g = ("etc/virt-who.d/%s:%s" % (n, l)) if len(confs) > 1 else l
+                    gl[g] = gl.get(g, 0) + 1
+                    srv.setdefault(re.sub(r"\s+", "", l.strip()), []).append(n)
+        sl_ = ["%7d %s" % (c, g) for g, c in sorted(gl.items())]
+        sl_ += ["the same line in %d files: %s · %s" % (len(v), k, ", ".join(v)) for k, v in sorted(srv.items()) if len(v) > 1]
+        out.append(block("virt-who: server lines, and the ones in more than one file", "grep ^server etc/virt-who.d/*.conf | sort | uniq -c", sl_, ["etc/virt-who.d/"],
+                         approx=True, empty="(no server line)"))
+    at, arel = t.read(ACCESS, tail=True, limit=64 * 1024 * 1024)
+    if at is not None:
+        vh = {}
+        for l in at.splitlines():
+            if "cmd=virt-who" in l:
+                ip = l.split(" ", 1)[0]
+                vh[ip] = vh.get(ip, 0) + 1
+        out.append(fold(block("hosts that send virt-who reports (web server log)", "grep -F 'cmd=virt-who' %s | awk '{print $1}' | sort | uniq -c | sort -rn" % arel,
+                              counted(top(vh, 20)), [arel], approx=True, empty="(no request with cmd=virt-who)")))
+    if not (ctx.get("rhel_major") or 0) >= 8 or t.exists("etc/sysconfig/virt-who"):   # RHEL 8+ uses etc/virt-who.conf and etc/virt-who.d/
+        out.append(cat(t, "/etc/sysconfig/virt-who", ["etc/sysconfig/virt-who"], nocomments=True))
+    return out
+
+
+TUNING_SATCAP = "installer tuning profile, installer answers, configured vs running"
+
+
+def s17_tuning(t, ctx):
+    # on a plain host with none of the installer's files, the three blocks that read them would only say 'not collected'
+    plain = ctx.get("role") not in ("satellite", "capsule") and not t.exists("etc/foreman-installer")
+    out = [] if plain else [
+        cat(t, "installer tuning profile", SCENARIO, keep=r"tuning|answer_file"),
+        cat(t, "installer answers: workers, puma, connections, memory", ANSWERS,
+            keep=r"tuning|puma|worker|max_connections|shared_buffers|work_mem|java_opts|Xmx|pool|keepalive|timeout|cache")]
+    text, rel = t.read(PG_CONF)
+    if text is not None:
+        out.append(block("PostgreSQL memory and connection settings", "grep -E '^\\s*(max_connections|shared_buffers|work_mem|effective_cache_size|maintenance_work_mem|autovacuum\\w*|checkpoint\\w*)\\s*=' %s" % rel,
+                         [l for l in text.splitlines() if re.match(r"^\s*(max_connections|shared_buffers|work_mem|effective_cache_size|maintenance_work_mem|autovacuum\w*|checkpoint\w*)\s*=", l)], [rel], empty="(defaults: none set)"))
+    rows, prel, _ = _ps_rows(t)
+    if rows is not None:
+        java = []
+        for c in rows:
+            if "java" in c[10] or "tomcat" in c[10]:
+                java += ["%-10s %s" % (c[0], " ".join(re.findall(r"-Xm[sx]\S+", c[10])) or "(no -Xms/-Xmx)")]
+        tc, tcrel = t.read(["etc/tomcat/tomcat.conf"], limit=256 * 1024)
+        jo = ["%-26s %s" % (tcrel, l.strip()) for l in (tc or "").splitlines() if "JAVA_OPTS" in l]
+        out.append(block("Tomcat / Java heap: JAVA_OPTS in tomcat.conf, and -Xms / -Xmx of the running process", "grep -sF JAVA_OPTS etc/tomcat/tomcat.conf; grep -oE -- '-Xm[sx][^ ]+' %s" % prel,
+                         jo + java, [x for x in (tcrel, prel) if x], approx=True, empty="(no JAVA_OPTS line and no java process)"))
+    hits, srcs = [], []
+    for r in sorted(set(t.glob("etc/httpd/conf*/*.conf") + t.glob("etc/httpd/conf.modules.d/*.conf") + t.glob("etc/httpd/conf.d/*/*.conf"))):
+        tx, _ = t.read([r], limit=256 * 1024)
+        for l in (tx or "").splitlines():
+            if re.match(r"^\s*(MaxRequestWorkers|ServerLimit|ThreadsPerChild|MaxClients|KeepAlive\w*|MaxKeepAliveRequests|Timeout|ProxyTimeout|PassengerMinInstances)\b", l):
+                hits.append("%-46s %s" % (r, l.strip()))
+                srcs.append(r)
+    hglobs = [g for g in ("etc/httpd/conf*/*.conf", "etc/httpd/conf.d/*/*.conf") if t.glob(g)]
+    hcmd = ("grep -sE '^\\s*(MaxRequestWorkers|ServerLimit|KeepAlive|MaxKeepAliveRequests|Timeout|ProxyTimeout)' %s" % " ".join(hglobs)) if hglobs else \
+        "find etc -path 'etc/httpd/*.conf'"          # no httpd configuration in the report: the command lists none
+    out.append(block("httpd limits", hcmd, hits, sorted(set(srcs)),
+                     approx=True, empty="(none set: httpd defaults)"))
+    lim, lsrc = [], []
+    for r in t.glob("etc/systemd/system/*.service.d/*.conf"):
+        tx, _ = t.read([r], limit=64 * 1024)
+        for l in (tx or "").splitlines():
+            if re.match(r"^\s*Limit\w+\s*=", l):
+                lim.append("%-62s %s" % (r, l.strip()))
+                lsrc.append(r)
+    out.append(block("service limits set in systemd drop-ins (LimitNOFILE and others)",
+                     "grep -sE '^\\s*Limit[A-Za-z]+ *=' etc/systemd/system/*.service.d/*.conf" if t.glob("etc/systemd/system/*.service.d/*.conf")
+                     else "find etc -path 'etc/systemd/system/*.service.d/*.conf'",
+                     lim, sorted(set(lsrc)), approx=True, empty="(none set)"))
+    if not plain:
+        out.append(configured_vs_running(t))
+    out.append(cat(t, "sysctl settings changed in /etc", ["etc/sysctl.conf"], nocomments=True))
+    if plain:
+        out.append(block(TUNING_SATCAP, "ls -d etc/foreman-installer 2>/dev/null", [], empty="(only on a Satellite or Capsule; this host is a plain RHEL host)"))
+    return out
+
+
+def configured_vs_running(t):
+    """What the configuration asks for, next to what ps shows running at collection. Both are facts; the gap is for the reader."""
+    rows, srcs = [], []
+    conf, crel = t.read(SCENARIO)
+    tun = re.search(r"^\s*:?tuning:\s*(\S+)", conf or "", re.M)
+    ans, arel = t.read(ANSWERS, limit=4 * 1024 * 1024)
+    pg, prel = t.read(PG_CONF)
+    ps, psrel, _ = _ps_rows(t)
+    if conf is None and ans is None:            # no Satellite or Capsule configuration in this report
+        return block("configured vs running (configuration files, and processes in ps)", "cat %s" % SCENARIO[0], missing=SCENARIO + ANSWERS)
+    def ans_val(rx):
+        m = re.search(rx, ans or "", re.M)
+        return m.group(1).strip().strip("'\"") if m else None
+    def count(rx):
+        return sum(1 for c in (ps or []) if re.search(rx, c[10])) if ps is not None else None
+    if crel:
+        srcs.append(crel)
+    if arel:
+        srcs.append(arel)
+    if psrel:
+        srcs.append(psrel)
+    if not (crel or arel or prel or psrel):
+        return block("configured vs running (configuration files, and processes in ps)", "grep -E 'tuning|puma|worker_count|max_connections' %s" % ANSWERS[0],
+                     missing=[SCENARIO[0], ANSWERS[0], PG_CONF[0], PS[0]])
+    rows.append("%-34s %-28s %s" % ("", "configured", "running at collection"))
+    rows.append("%-34s %-28s %s" % ("tuning profile", tun.group(1) if tun else "(not set)", ""))
+    for label, rx_conf, rx_ps in (("Puma (Foreman) workers", r"^\s*foreman_service_puma_workers:\s*(\S+)", r"puma: cluster worker|puma.*worker"),
+                                  ("Puma threads (max)", r"^\s*foreman_service_puma_threads_max:\s*(\S+)", None),
+                                  ("Pulp workers", r"^\s*(?:worker_count|pulpcore_worker_count):\s*(\S+)", r"pulpcore-worker|rq worker|pulpcore\.tasking"),
+                                  ("Pulp API (gunicorn) workers", r"^\s*(?:api_service_worker_count|pulpcore_api_service_worker_count):\s*(\S+)", r"pulpcore-api|gunicorn.*pulpcore\.app\.wsgi"),
+                                  ("Pulp content workers", r"^\s*(?:content_service_worker_count|pulpcore_content_service_worker_count):\s*(\S+)", r"pulpcore-content|gunicorn.*pulpcore\.content"),
+                                  ("Dynflow (sidekiq) processes", None, r"sidekiq")):
+        c = ans_val(rx_conf) if rx_conf else None
+        r = count(rx_ps) if rx_ps else None
+        rows.append("%-34s %-28s %s" % (label, c if c is not None else "(default)", "%d processes" % r if r is not None else ""))
+    mc = re.search(r"^\s*max_connections\s*=\s*(\d+)", pg or "", re.M)
+    if prel:
+        srcs.append(prel)
+    pgc = count(r"^postgres: ")
+    rows.append("%-34s %-28s %s" % ("PostgreSQL connections", ("max_connections = %s" % mc.group(1)) if mc else "(default)", "%d backends" % pgc if pgc is not None else ""))
+    confs = [x for x in (crel, arel, prel) if x]
+    cmd = ("grep -E 'tuning|puma|worker_count|max_connections' %s" % " ".join(confs)) if confs else ""
+    if psrel:
+        cmd += "; " if cmd else ""
+        cmd += "grep -oE 'puma: cluster worker|pulpcore-(worker|api|content)|sidekiq|postgres: ' %s | sort | uniq -c" % psrel
+    return block("configured vs running (configuration files, and processes in ps)", cmd, rows, srcs, approx=True,
+                 note="ps is a single moment: processes counted at collection")
+
+
+def s18_cron(t, ctx):
+    out = [cat(t, "/etc/crontab", ["etc/crontab"], nocomments=True)]
+    files = t.listdir("etc/cron.d")
+    lines = []
+    for n in files:
+        tx, _ = t.read(["etc/cron.d/" + n], limit=64 * 1024)
+        body = [l for l in (tx or "").splitlines() if l.strip() and not l.strip().startswith("#") and not re.match(r"^\s*(SHELL|PATH|MAILTO|HOME)=", l)]
+        lines.append("== etc/cron.d/%s" % n)
+        lines += body
+    out.append(block("jobs in /etc/cron.d", "grep -svE '^\\s*(#|$|SHELL=|PATH=|MAILTO=)' etc/cron.d/*", lines, ["etc/cron.d/"], approx=True, empty="(empty)"))
+    spool = [n for n in t.listdir("var/spool/cron") if os.path.isfile(os.path.join(t.root, "var/spool/cron", n))]
+    if not spool:
+        ct, crel = t.read(["sos_commands/cron/root_crontab", "sos_commands/cron/crontab_-l_-u_root"])
+        if ct is not None:
+            out.append(block("root crontab", "cat %s" % crel, ct.splitlines()[:ALL_LINES], [crel], empty="(empty)"))
+    if spool:
+        sl = ls_names(t, "var/spool/cron")
+        out.append(block("crontabs in var/spool/cron", "ls var/spool/cron", sl or sorted(spool), ["var/spool/cron/"], approx=sl is None, note=NAMES_ONLY))
+    if spool:
+        ol = []
+        for n in spool:
+            tx, _ = t.read(["var/spool/cron/" + n], limit=64 * 1024)
+            ol.append("== var/spool/cron/%s" % n)
+            ol += (tx or "").splitlines()
+        out.append(block("crontabs in var/spool/cron, each file", "for b in $(ls var/spool/cron | LC_ALL=C sort); do echo \"== var/spool/cron/$b\"; cat var/spool/cron/$b; done", ol[:ALL_LINES], ["var/spool/cron/"], note=upto(ol)[1]))
+    cf = []
+    for d in sorted(n for n in t.listdir("etc") if n.startswith("cron")):
+        p = os.path.join(t.root, "etc", d)
+        if os.path.isdir(p):
+            cf += ["%s/%s" % (d, n) for n in t.listdir("etc/" + d)]
+        else:
+            cf.append(d)
+    out.append(fold(block("files in /etc/cron*", "find etc/cron* -type f 2>/dev/null | sed 's,^etc/,,'", cf, ["etc/cron.d/"], approx=True, empty="(none)")))
+    return out
+
+
+LEAPP_LOG_BLOCKS = 9          # the Leapp report (5), the two variables in the upgrade log, its ERROR lines and its last 40 lines
+
+
+def s19_leapp(t, ctx):
+    """One block per check, in the order an upgrade is looked at: packages, the boot loader, the Leapp report, the Leapp log."""
+    out = []
+    rp, rprel = t.read(["installed-rpms"], limit=16 * 1024 * 1024)
+    for title, word in (("leapp packages", "leapp"), ("grub packages", "grub")):
+        if rp is None:
+            out.append(block(title, "grep %s installed-rpms | sort" % word, missing="installed-rpms"))
+        else:
+            out.append(block(title, "grep %s %s | sort" % (word, rprel), sorted(l for l in rp.splitlines() if word in l), [rprel], empty="(none installed)"))
+    # /boot as the host listed it when sos ran (owners, sizes and dates of the host); the report's own boot/ folder holds
+    # only the few files sos copied, with the owner and dates of whoever extracted it
+    bt, brel = t.read(["sos_commands/boot/ls_-lanR_.boot", "sos_commands/boot/ls_-alZR_.boot", "sos_commands/boot/ls_-lanR_boot", "sos_commands/boot/ls_-alZR_boot"])
+    if bt is not None and bt.strip():
+        first = []
+        for l in bt.splitlines():
+            if not l.strip():
+                break
+            first.append(l)
+        out.append(block("files in /boot (as the host listed them)", "awk '/^$/{exit} {print}' %s" % brel, first, [brel],
+                         note="the subfolders are further down in this file"))
+    elif t.listdir("boot"):
+        bl = ls_names(t, "boot")
+        out.append(block("files in /boot", "ls boot", bl or sorted(t.listdir("boot")), ["boot/"], approx=bl is None,
+                         note=join_notes("the files sos copied", NAMES_ONLY)))
+    else:
+        out.append(block("files in /boot", "ls boot", missing="boot/"))
+    out.append(cat(t, "/etc/default/grub", ["etc/default/grub"]))
+    gcands = ["boot/grub2/grub.cfg", "boot/efi/EFI/redhat/grub.cfg"]
+    gc, grel = t.read(gcands, limit=8 * 1024 * 1024)
+    ents = [r for r in t.glob("boot/loader/entries/*.conf")]       # RHEL 8 and later: one file per menu entry (BLS)
+    glines, gsrc = [l for l in (gc or "").splitlines() if "upgrade" in l], ([grel] if grel else [])
+    for r in ents:
+        et_, _ = t.read([r], limit=64 * 1024)
+        hit = [l for l in (et_ or "").splitlines() if "upgrade" in l]
+        if hit:
+            gsrc.append(r)
+            glines += ["%s:%s" % (r, l) for l in hit]
+    gfiles = ([grel] if grel else []) + (["boot/loader/entries/*.conf"] if ents else [])
+    out.append(block("upgrade entry in the grub menu", "grep upgrade %s" % (" ".join(gfiles) or gcands[0]) if len(gfiles) < 2 else "grep -H upgrade %s" % " ".join(gfiles),
+                     glines, gsrc, approx=len(gfiles) > 1, missing=None if gfiles else gcands, empty="(no line with upgrade)"))
+    rt, rrel = t.read(["var/log/leapp/leapp-report.txt"])
+    rl = (rt or "").splitlines()
+    if rt is None and not t.glob("var/log/leapp/*") and not t.exists("var/log/leapp"):
+        # Leapp never ran here: one line in place of the blocks that would each say 'not collected'
+        mt, mrel = t.read(["mount", "sos_commands/filesys/mount_-l"])
+        out.append(block("overlay filesystems (mount)", "grep overlay %s" % (mrel or "mount"), [l for l in (mt or "").splitlines() if "overlay" in l], [mrel] if mrel else [],
+                         missing=None if mt is not None else "mount", empty="(none)"))
+        out.append(block("Leapp report and logs", "ls -d var/log/leapp 2>/dev/null", [], learn="leapp",
+                         empty="(Leapp has not run on this host: var/log/leapp is not in this report · the %d blocks about them are left out)" % LEAPP_LOG_BLOCKS))
+        return out
+
+    def report_block(title, cmd, lines, **kw):
+        if rt is None:
+            return block(title, cmd % "var/log/leapp/leapp-report.txt", missing="var/log/leapp/leapp-report.txt", learn="leapp")
+        return block(title, cmd % rrel, lines[:ALL_LINES], [rrel], learn="leapp", note=upto(lines)[1], **kw)
+
+    def ranges(rx):                     # awk '/rx/,/^---/'
+        o, on = [], False
+        for l in rl:
+            if not on and re.search(rx, l):
+                on = True
+            if on:
+                o.append(l)
+                if re.match(r"^---", l):
+                    on = False
+        return o
+    out.append(report_block("Leapp report: inhibitor lines and the line after each", "grep inhibitor -A1 %s", grep_context(rl, lambda l: "inhibitor" in l, after=1), empty="(no inhibitor)"))
+    out.append(fold(report_block("Leapp report: full text of each inhibitor", "awk '/.*inhibitor.*/,/^---/' %s", ranges(r"inhibitor"), empty="(no inhibitor)")))
+    out.append(report_block("Leapp report: (error) lines and the line after each", "grep '(error)' -A1 %s", grep_context(rl, lambda l: "(error)" in l, after=1), empty="(no (error) entry)"))
+    out.append(fold(report_block("Leapp report: full text of each (error) entry", "awk '/.*\\(error\\).*/,/^---/' %s", ranges(r"\(error\)"), empty="(no (error) entry)")))
+    out.append(report_block("Leapp report: 'failed with exit'", "grep 'failed with exit' %s", [l for l in rl if "failed with exit" in l], empty="(none)"))
+    ut, urel = t.read(["var/log/leapp/leapp-upgrade.log"], tail=True, limit=LOG_READ)
+    for title, var in (("Leapp: LEAPP_UNSUPPORTED", "LEAPP_UNSUPPORTED"), ("Leapp: target release (LEAPP_UPGRADE_PATH_TARGET_RELEASE)", "LEAPP_UPGRADE_PATH_TARGET_RELEASE")):
+        cmd = "grep -o %s.* %%s | awk '{print $1}' | sort -u | sed \"s/',//g\"" % var
+        if ut is None:
+            out.append(block(title, cmd % "var/log/leapp/leapp-upgrade.log", missing="var/log/leapp/leapp-upgrade.log"))
+            continue
+        vals = sorted(set(m.group(0).split()[0].replace("',", "") for m in re.finditer(var + r".*", ut)))
+        out.append(block(title, cmd % urel, vals, [urel], empty="(not in the Leapp log)"))
+    mt, mrel = t.read(["mount", "sos_commands/filesys/mount_-l"])
+    out.append(block("overlay filesystems (mount)", "grep overlay %s" % (mrel or "mount"), [l for l in (mt or "").splitlines() if "overlay" in l], [mrel] if mrel else [],
+                     missing=None if mt is not None else "mount", empty="(none)"))
+    if ut is None:
+        out.append(block("ERROR lines in leapp-upgrade.log (newest first)", "grep ERROR var/log/leapp/leapp-upgrade.log | tac", missing="var/log/leapp/leapp-upgrade.log"))
+        out.append(block("last 40 lines of leapp-upgrade.log", "tail -n 40 var/log/leapp/leapp-upgrade.log", missing="var/log/leapp/leapp-upgrade.log"))
+    else:
+        e = [l for l in ut.splitlines() if "ERROR" in l]
+        out.append(block("ERROR lines in leapp-upgrade.log (newest first)", "grep ERROR %s | tac" % urel, e[::-1][:ALL_LINES], [urel],
+                         note=join_notes(plural(len(e), "line"), span_of(e, ctx), upto(e)[1]), empty="(0 lines)"))
+        out.append(block("last 40 lines of leapp-upgrade.log", "tail -n 40 %s" % urel, ut.splitlines()[-40:], [urel]))
+    return out
+
+
+# ---- blocks that read several sources ------------------------------------------------------
+
+NET_LOGS = [("var/log/dnf.log", None), ("var/log/dnf.librepo.log", None), ("var/log/dnf5.log", None), ("var/log/rhsm/rhsm.log", None),
+            ("var/log/foreman/production.log", None), ("var/log/foreman-proxy/proxy.log", None),
+            ("var/log/httpd/foreman-ssl_error_ssl.log", None), ("var/log/httpd/error_log", None),
+            ("var/log/candlepin/candlepin.log", None), ("var/log/candlepin/error.log", None),
+            ("var/log/insights-client/insights-client.log", None), (None, LOGS)]
+NET_LITS = ["Failed to open TCP connection to", "Failed to connect to", "Cannot connect to host", "ConnectionPool(host=", "Could not resolve host",
+            "Status code: 4", "Status code: 5", "Curl error (", "Cannot download", "Errors during downloading metadata", "Connection refused",
+            "certificate verify failed", "No route to host", "Name or service not known", "Network is unreachable",
+            "Temporary failure in name resolution", "Connection timed out", "Connection reset by peer", "certificate has expired",
+            "HTTP error (", " Client Error", " Server Error", "ClientResponseError", "ServerDisconnectedError", "ServerTimeoutError",
+            "Proxy Authentication Required", "Net::OpenTimeout", "Net::ReadTimeout", "attempt to connect to", "failed to make connection to backend",
+            "error reading status line from remote server", "Error reading from remote server", "refused. Check that the hostname and port",
+            "HTTP Status: 4", "HTTP Status: 5"]
+_NET_DEST = [re.compile(p) for p in (
+    r"(?:repository|repo) '([^']+)'",
+    r"TCP connection to ([\w.-]+:\d+)",
+    r"Failed to connect to ([\w.-]+) port (\d+)",
+    r"Cannot connect to host ([\w.-]+(?::\d+)?)",
+    r"Could not resolve host:? ([\w.-]+)",
+    r"host='([\w.-]+)'(?:, port=(\d+))?",
+    r"attempt to connect to Unix domain socket (\S+)",
+    r"attempt to connect to [\d.:a-f]+ \(([\w.-]+)\)",
+    r"connection to backend: ([\w.-]+)",
+    r"from remote server ([\w.-]+(?::\d+)?)",
+    r"Connection to ([\w.-]+:\d+) refused",
+    r"connect\(2\) for \"?([\w.-]+)\"?(?: port |:)(\d+)",
+    r"https?://([\w.-]+(?::\d+)?)")]
+
+# what the numbers in a failure line mean, in a few words. The number stays beside it.
+CURL_MEANS = {5: "proxy name not resolved", 6: "name not resolved", 7: "could not connect", 16: "HTTP/2 error", 18: "transfer cut short",
+              22: "HTTP error", 23: "could not write the download", 28: "timed out", 35: "TLS handshake failed", 47: "too many redirects",
+              51: "certificate not accepted", 52: "empty reply", 55: "sending failed", 56: "receiving failed", 58: "client certificate problem",
+              59: "TLS cipher problem", 60: "certificate not trusted", 77: "CA file not readable", 92: "HTTP/2 stream error"}
+ERRNO_MEANS = {-2: "name not resolved", -3: "name not resolved", 101: "network unreachable", 104: "connection reset", 110: "timed out",
+               111: "connection refused", 113: "no route to host"}
+HTTP_MEANS = {400: "bad request", 401: "login refused", 403: "forbidden", 404: "not found", 407: "proxy login needed", 408: "request timed out",
+              429: "too many requests", 500: "server error", 502: "bad gateway", 503: "service unavailable", 504: "gateway timed out"}
+_CERT_WHY = [(re.compile(p, re.I), k) for p, k in (
+    (r"certificate has expired|certificate expired", "certificate expired"),
+    (r"not yet valid", "certificate not yet valid"),
+    (r"hostname mismatch|doesn'?t match|does not match|IP address mismatch|not valid for|no alternative certificate subject name", "certificate: name mismatch"),
+    (r"unable to get (?:local )?issuer certificate|unknown ca|self.signed certificate in certificate chain|unable to verify the first certificate", "certificate: unknown issuer"),
+    (r"self.signed certificate", "certificate: self-signed"),
+    (r"certificate verify failed|SSL certificate problem|CERTIFICATE_VERIFY_FAILED", "certificate not trusted"))]
+_NET_TEXT = [(re.compile(p, re.I), k) for p, k in (
+    (r"Connection refused|refused\. Check that", "connection refused"), (r"Connection reset", "connection reset"), (r"No route to host", "no route to host"),
+    (r"Network is unreachable", "network unreachable"),
+    (r"Could not resolve host|Name or service not known|Temporary failure in name resolution", "name not resolved"),
+    (r"timed? ?out|Timeout was reached|ReadTimeout|OpenTimeout|ServerTimeoutError", "timed out"),
+    (r"ServerDisconnectedError|Remote end closed|EOF occurred", "server closed the connection"),
+    (r"error reading status line from remote server|Error reading from remote server", "backend did not answer"),
+    (r"Cannot connect to host|Failed to (?:open TCP connection|connect) to|Connect call failed|attempt to connect to|failed to make connection", "could not connect"))]
+_NET_CURL = re.compile(r"Curl error \((\d+)\)")
+_NET_ERRNO = re.compile(r"\[Errno (-?\d+)\]|\((\d{2,3})\)(?=[A-Z][a-z])")
+_NET_HTTP = re.compile(r"Stat(?:us code|us): (\d{3})|HTTPS? [Ee]rror:? \(?(\d{3})|\b(\d{3}) (?:Client|Server) Error|ClientResponseError: (\d{3})|(Proxy Authentication Required)")
+_NET_HOW = {}
+
+
+def _net_dest(l):
+    """Where a line says it was going: a host (with its port when it is not 443 or 80), a socket path, or, when the line
+    names no address, the repository ('repo NAME')."""
+    for rx in _NET_DEST[1:]:
+        m = rx.search(l)
+        if m:
+            d = ":".join(g for g in m.groups() if g)
+            return re.sub(r":(?:443|80)$", "", d.rstrip(".").lower()) if not d.startswith("/") else d
+    m = _NET_DEST[0].search(l)
+    return ("repo " + m.group(1)) if m else ""
+
+
+def _net_how(l):
+    """How a line says it failed: (a few words, the code it carries or ''), or None for a line that reports no failure
+    (an HTTP status under 400). Lines that say the same in other words are one group: curl 6, errno -2 and 'Could not
+    resolve host' are all 'name not resolved'."""
+    key = l[24:]
+    hit = _NET_HOW.get(key, 0)
+    if hit != 0:
+        return hit
+    low = l.lower()
+    cert = None
+    if "certif" in low or "ssl" in low or "tls" in low:
+        cert = next((k for rx, k in _CERT_WHY if rx.search(l)), None)
+    how = None
+    m = _NET_CURL.search(l)
+    if m:
+        n = int(m.group(1))
+        how = (cert if cert and n in (35, 51, 60) and cert != "certificate not trusted" else CURL_MEANS.get(n, "curl error"), "curl %d" % n)
+        if n == 22:
+            s = re.search(r"error: (\d{3})", l)
+            if s:
+                how = (HTTP_MEANS.get(int(s.group(1)), "HTTP error"), "HTTP %s" % s.group(1))
+    if how is None and cert:
+        how = (cert, "")
+    if how is None:
+        m = _NET_ERRNO.search(l)
+        n = int(m.group(1) or m.group(2)) if m else None
+        if n in ERRNO_MEANS:
+            how = (ERRNO_MEANS[n], "errno %d" % n)
+    if how is None:
+        m = _NET_HTTP.search(l)
+        if m:
+            s = 407 if m.group(5) else int(next(g for g in m.groups()[:4] if g))
+            how = ((HTTP_MEANS[s], "HTTP %d" % s) if s in HTTP_MEANS else ("HTTP %d" % s, "")) if s >= 400 else False
+    if how is None:
+        how = next(((k, "") for rx, k in _NET_TEXT if rx.search(l)), None)
+    if how is None:
+        if "Cannot download" in l or "Errors during downloading metadata" in l:
+            how = ("metadata download failed", "")
+        else:
+            how = ("connection failed", "")
+    how = how or None
+    if len(_NET_HOW) < 20000:
+        _NET_HOW[key] = how
+    return how
+
+
+_NET_STAMP = re.compile(r"^(\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d|[A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d \S+ [^\s:\[]+(?:\[\d+\])?)")
+_NET_REQ = re.compile(r"\[\w\|\w+\|([0-9a-f]{8})\]|^\S+ ([0-9a-f]{8}) \[")
+_REX_MARKS = ("Net::SSH::", "ssh: connect to host", "Host key verification failed", "REMOTE HOST IDENTIFICATION")
+
+
+def _near_dest(text, ls, l):
+    """The destination of a failure line that names none, from the lines next to it: a line it continues (dnf writes the
+    reason indented under the line with the address), or a line of the same second and the same request or process."""
+    st, rq = _NET_STAMP.match(l), _NET_REQ.search(l)
+    cont = l[:1] in (" ", "\t", "-")
+
+    def fits(c):
+        if cont or c[:1] in (" ", "\t", "-"):
+            return True
+        if " NETWORK " in c[:60] and " NETWORK " in l[:60]:      # insights-client: the request, then its 'HTTP Status' on the next line
+            return True
+        cs = _NET_STAMP.match(c)
+        if not (st and cs and st.group(1) == cs.group(1)):
+            return False
+        crq = _NET_REQ.search(c)
+        return not (rq and crq) or [g for g in rq.groups() if g] == [g for g in crq.groups() if g]
+    pe = ls
+    for _ in range(5):                       # the lines before
+        if pe <= 0:
+            break
+        ps = text.rfind("\n", 0, pe - 1) + 1
+        c = text[ps:pe - 1]
+        d = _net_dest(c)
+        if d and not d.startswith("repo ") and fits(c):
+            return d
+        if not c[:1] in (" ", "\t", "-") and cont:
+            break                            # the dated line this one hangs under: nothing further up belongs to it
+        pe = ps
+    ne = text.find("\n", ls)
+    for _ in range(3):                       # the lines after
+        if ne < 0:
+            break
+        nn = text.find("\n", ne + 1)
+        c = text[ne + 1:nn if nn >= 0 else len(text)]
+        d = _net_dest(c)
+        if d and not d.startswith("repo ") and fits(c):
+            return d
+        ne = nn
+    return ""
+
+
+def net_failures(t, ctx):
+    """Lines in the main logs that report a failed download or connection, grouped by where they were going and how
+    they failed, with counts and first/last time. Literal anchors find candidate lines fast. Lines that say the same
+    thing in other words are one group; a destination that is not on the failing line itself is shown in ( )."""
+    ref = ref_time(ctx)
+    groups, srcs, read = {}, [], set()
+    rc, _ = t.read(["etc/rhsm/rhsm.conf"])
+    rserver = ""
+    if rc is not None:
+        sv = _rhsm_conf(rc).get("server", {})
+        if sv.get("hostname"):
+            rserver = re.sub(r":443$", "", "%s:%s" % (sv["hostname"].lower(), sv.get("port") or "443"))
+    echo = 0                                     # dnf's lines that only repeat a reason given beside them
+    rex = ctx.get("role") != "rhel"              # SSH failures of remote execution have their own block there
+    for rel0, cands in NET_LOGS + ([("", STEPS)] if ctx.get("role") != "rhel" else []):
+        if cands is STEPS:                       # the errors of task steps: a failed sync or Capsule sync says here where it could not connect
+            prow, pk, rel, _ = t.table(STEPS, limit=64 * 1024 * 1024, tail=True, keep=STEP_COLS)
+            if prow is None or pk not in ("csv", "pipe"):
+                continue
+            text = "\n".join((x.get("started_at") or "")[:19] + " " + (x.get("error") or "").replace("\n", " ") for x in prow
+                             if (x.get("state") or "").lower() != "skipped" and x.get("error") not in (None, "", "\\N", "NULL"))
+        else:
+            text, rel = t.read([rel0] if rel0 else cands, tail=True, limit=LOG_READ, largest=cands is not None)
+        if text is None or rel in read:
+            continue
+        read.add(rel)
+        starts = set()
+        for lit in NET_LITS:
+            pos = text.find(lit)
+            while pos >= 0:
+                starts.add(text.rfind("\n", 0, pos) + 1)
+                le = text.find("\n", pos)
+                pos = text.find(lit, le if le >= 0 else len(text))
+        name = rel.rsplit("/", 1)[-1]
+        used, insights = False, "insights-client" in rel
+        for ls in sorted(starts):
+            le = text.find("\n", ls)
+            l = text[ls:le if le >= 0 else len(text)]
+            if rex and any(x in l for x in _REX_MARKS):
+                continue
+            if insights and " DEBUG " in l[:60]:      # insights-client logs the commands it runs, with the texts it greps for
+                continue
+            how = _net_how(l)
+            if how is None:
+                continue
+            if how[0] == "metadata download failed":     # dnf's heading over the reasons: when a reason follows, the reason is the row
+                nx, follows = le, False
+                for _ in range(4):
+                    if nx < 0:
+                        break
+                    if nx + 1 in starts:
+                        follows = True
+                        break
+                    nx = text.find("\n", nx + 1)
+                if follows:
+                    echo += 1
+                    continue
+            dest, told = _net_dest(l), True
+            if not dest or (dest.startswith("repo ") and how[0] != "metadata download failed"):
+                near = _near_dest(text, ls, l)
+                if near:
+                    dest, told = near, False
+                elif name.startswith("rhsm.log") and rserver:
+                    dest, told = rserver, False
+                elif not dest:
+                    dest = "(no host on the line)"
+            used = True
+            g = groups.setdefault((dest, how[0]), {"n": 0, "first": None, "last": None, "files": set(), "ex": None, "codes": set(), "told": False})
+            orig = l
+            g["n"] += 1
+            g["files"].add(name)
+            g["told"] = g["told"] or told
+            if how[1]:
+                g["codes"].add(how[1])
+            w = parse_when(l[:100], ref)
+            back, pe = 0, ls
+            while w is None and back < 3 and pe > 0 and l[:1] and l[:1] in " \t-":    # dnf: "  - Status code: 404 for …" under a dated line
+                ps = text.rfind("\n", 0, pe - 1) + 1
+                l = text[ps:pe - 1]
+                w = parse_when(l[:100], ref)
+                pe, back = ps, back + 1
+            if w is not None:
+                g["first"] = w if g["first"] is None or w < g["first"] else g["first"]
+                if g["last"] is None or w >= g["last"]:
+                    g["last"], g["ex"] = w, (rel, orig)
+            elif g["ex"] is None:
+                g["ex"] = (rel, orig)
+        if used:
+            srcs.append(rel)
+    # dnf ends a failed download with 'Cannot download repomd.xml: All mirrors were tried'. When its logs also hold the
+    # reason (a curl error, a status code), those lines only repeat it.
+    dnf_logs = lambda g: all(f.startswith(("dnf", "messages", "journalctl")) for f in g["files"])
+    if any(k[1] != "metadata download failed" and any(f.startswith("dnf") for f in g["files"]) for k, g in groups.items()):
+        for k in [k for k, g in groups.items() if k[1] == "metadata download failed" and dnf_logs(g)]:
+            echo += groups.pop(k)["n"]
+    title = "download and connection failures, by destination (newest first)"
+    cmd = "grep -hE '%s' %s" % ("|".join(ere_escape(x) for x in NET_LITS),           # every phrase the block looks for
+                                " ".join(sorted(read) or ["var/log/dnf.log", "var/log/rhsm/rhsm.log", "var/log/messages"]))
+    if not read:
+        ctx["net_dests"] = []
+        return block(title, cmd, approx=True, missing=[r or c[0] for r, c in NET_LOGS])
+    # newest first: by the last time each group was seen; groups with no time on their lines go last, by count
+    rows = sorted(groups.items(), key=lambda kv: (kv[1]["last"] is None, -(kv[1]["last"] - datetime.datetime(1970, 1, 1)).total_seconds() if kv[1]["last"] else -kv[1]["n"], kv[0]))
+    items, shown, guessed = [], rows[:NET_ROWS], False
+    for (dest, kind), g in shown:
+        if not g["told"] and not dest.startswith("("):
+            dest, guessed = "(%s)" % dest, True
+        how = kind + ((" (%s)" % ", ".join(sorted(g["codes"]))) if g["codes"] else "")
+        items.append((g, dest[:40], how[:38]))
+    lines = last_seen_rows(items)
+    ctx["net_dests"] = []
+    for (dest, _), g in shown:
+        if not dest.startswith(("(", "repo ", "/")) and dest not in ctx["net_dests"]:
+            ctx["net_dests"].append(dest)
+    searched = ", ".join(r.rsplit("/", 1)[-1] for r in sorted(read))
+    note = "%s in %s · last seen, lines, destination, how, since when · searched: %s" % (plural(sum(g["n"] for g in groups.values()), "line"), plural(len(groups), "group"), searched) if groups else \
+           "(none) · searched: %s" % searched
+    if len(rows) > NET_ROWS:
+        note += " · %d older groups not shown" % (len(rows) - NET_ROWS)
+    if echo:
+        note += " · %s of dnf's 'Cannot download' that only repeat a reason above are left out" % plural(echo, "line")
+    if guessed:
+        note += " · a destination in ( ) is not on the failing line: it is from the lines next to it or, for rhsm.log, the server in rhsm.conf"
+    refs = [{"rel": g["ex"][0], "raw": g["ex"][1], "q": ""} if g["ex"] else None for _, g in shown]
+    return block(title, cmd, lines, srcs or sorted(read), approx=True, note=note, empty="(none)", refs=refs)
+
+
+NET_ROWS = 12
+
+
+def last_seen_rows(items):
+    """The rows of a newest-first table of failures, from (group, destination, how). When it was last seen comes first,
+    since the rows are in that order; then how many lines, where to, how it failed, since when (for a failure seen at
+    more than one time; the column is left out when no row has one) and the logs."""
+    stamp = "%Y-%m-%d %H:%M"
+    rows = []
+    for g, dest, how in items:
+        last = g["last"].strftime(stamp) if g["last"] else "(no time)"
+        since = ("since " + g["first"].strftime(stamp)) if g["first"] and g["first"].strftime(stamp) != last else ""
+        rows.append((last, fmt_n(g["n"]), dest, how, since, ", ".join(sorted(g["files"]))))
+    wide = any(r[4] for r in rows)
+    return [("%-16s  %6s  %-40s %-38s %-22s %s" % r) if wide else ("%-16s  %6s  %-40s %-38s %s" % (r[:4] + r[5:])) for r in rows]
+
+
+def net_facts(t, ctx):
+    """What the report itself holds about the destinations of the failures above: is the name in /etc/hosts, is it the
+    server this host registers to, which name servers and proxies are set. Facts as written in the files; nothing is tested."""
+    dests = ctx.get("net_dests") or []
+    if not dests:
+        return None
+    srcs, lines = [], []
+    hosts_t, hrel = t.read(["etc/hosts"])
+    by_name, by_ip = {}, {}
+    if hosts_t is not None:
+        srcs.append(hrel)
+        for l in hosts_t.splitlines():
+            f = l.split("#", 1)[0].split()
+            if len(f) >= 2:
+                by_ip.setdefault(f[0], []).extend(f[1:])
+                for n in f[1:]:
+                    by_name.setdefault(n.lower(), f[0])
+    rc, rrel = t.read(["etc/rhsm/rhsm.conf"])
+    sv, rh = ({}, {}) if rc is None else (_rhsm_conf(rc).get("server", {}), _rhsm_conf(rc).get("rhsm", {}))
+    if rc is not None:
+        srcs.append(rrel)
+    sp, sprel = t.read(["sos_commands/foreman/smart_proxies"])
+    me = (ctx.get("hostname") or "").lower()
+    plain = []
+    for d in dests[:NET_ROWS]:
+        host = d.rsplit(":", 1)[0] if re.search(r":\d+$", d) else d
+        parts = []
+        if host in ("localhost", "127.0.0.1", "::1"):
+            parts.append("this host (loopback)")
+        elif me and host == me:
+            parts.append("this host")
+        if re.match(r"^[\d.]+$", host):
+            parts.append(("/etc/hosts: %s" % ", ".join(by_ip[host][:3])) if host in by_ip else "not in /etc/hosts" if hosts_t is not None else "")
+        else:
+            parts.append(("/etc/hosts: %s" % by_name[host]) if host in by_name else "not in /etc/hosts" if hosts_t is not None else "")
+        if sv.get("hostname", "").lower() == host:
+            parts.append("the server this host registers to (rhsm.conf)")
+        if host and host in (rh.get("baseurl", "").lower()):
+            parts.append("content source (rhsm.conf baseurl)")
+        if sv.get("proxy_hostname", "").lower() == host:
+            parts.append("the proxy set in rhsm.conf")
+        if sp and host in sp.lower() and host != me:
+            parts.append("a smart proxy the Satellite knows")
+            if sprel not in srcs:
+                srcs.append(sprel)
+        parts = [p for p in parts if p]
+        if parts == ["not in /etc/hosts"]:
+            plain.append(d)                      # nothing else to say about it: one line for all of these
+        elif parts:
+            lines.append("%-40s %s" % (d[:40], " · ".join(parts)))
+    if plain:
+        lines.append("%-40s %s" % ("not in /etc/hosts", ", ".join(plain)))
+    rs, rsrel = t.read(["etc/resolv.conf"])
+    if rs is not None:
+        srcs.append(rsrel)
+        ns = re.findall(r"(?m)^\s*nameserver\s+(\S+)", rs)
+        lines.append("%-40s %s" % ("name servers (resolv.conf)", ", ".join(ns) if ns else "(no nameserver line)"))
+    px = []
+    if sv.get("proxy_hostname"):
+        px.append("rhsm.conf %s:%s" % (sv["proxy_hostname"], sv.get("proxy_port") or "(no port)"))
+        if sv.get("no_proxy"):
+            px.append("rhsm.conf no_proxy=%s" % sv["no_proxy"])
+    for cands, label in ((["etc/dnf/dnf.conf", "etc/yum.conf"], "dnf.conf"), (["etc/environment"], "/etc/environment")):
+        ct, crel = t.read(cands)
+        for l in (ct or "").splitlines():
+            m = re.match(r"^\s*(?:export\s+)?((?:https?_|no_)?proxy)\s*=\s*(\S+)", l, re.I)
+            if m:
+                px.append("%s %s=%s" % (label, m.group(1), re.sub(r"//[^/@\s]+@", "//…@", m.group(2).strip("'\""))))
+                if crel not in srcs:
+                    srcs.append(crel)
+    lines.append("%-40s %s" % ("proxy", " · ".join(px) if px else "none set in rhsm.conf, dnf.conf or /etc/environment"))
+    names = [ere_escape(d.rsplit(":", 1)[0] if re.search(r":\d+$", d) else d) for d in dests[:NET_ROWS]]
+    cmd = "grep -sE '%s' etc/hosts; grep -s nameserver etc/resolv.conf; grep -sE '^ *(proxy|no_proxy|hostname|baseurl)' etc/rhsm/rhsm.conf etc/dnf/dnf.conf" % "|".join(names)
+    return block("what this report holds about those destinations (as written in its files; nothing was tested)", cmd, lines, srcs, approx=True)
+
+
+def ere_escape(text):
+    """text as a grep -E pattern: only the characters that mean something there get a backslash (re.escape also puts
+    one before '-', which grep 3.8 and later warn about)."""
+    return re.sub(r"([.^$*+?()\[\]{}|\\])", r"\\\1", text)
+
+
+REX_LITS = ["Net::SSH::", "ssh: connect to host", "Host key verification failed", "REMOTE HOST IDENTIFICATION HAS CHANGED", "Permission denied (",
+            "Could not resolve hostname", "Authentication failed for user", "kex_exchange_identification", "Too many authentication failures",
+            "sudo: a password is required"]
+_REX_HOW = [(re.compile(p, re.I), k) for p, k in (
+    (r"HostKeyMismatch|Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED|fingerprint .* does not match", "host key changed or not known"),
+    (r"AuthenticationFailed|Authentication failed for user|Permission denied \(|Too many authentication failures", "login refused (key or password)"),
+    (r"sudo: a password is required", "sudo asks for a password"),
+    (r"Could not resolve hostname|Name or service not known|getaddrinfo", "name not resolved"),
+    (r"ConnectionTimeout|timed? ?out", "timed out"),
+    (r"Connection refused|ECONNREFUSED", "connection refused"),
+    (r"No route to host|EHOSTUNREACH", "no route to host"),
+    (r"Net::SSH::Disconnect|Connection closed by|kex_exchange_identification|Connection reset", "connection closed by the host"))]
+_REX_HOST = [re.compile(p) for p in (
+    r"ssh: connect to host ([\w.-]+) port", r"Could not resolve hostname ([\w.-]+)", r"for user [\w.-]+@([\w.-]+)", r"[\w.-]+@([\w.-]+\.[\w-]+)",
+    r"Connection closed by ([\w.:-]+)", r"does not match for \"?([\w.-]+)", r"\bhost[= ]'?([\w-]+\.[\w.-]+)", r"\bfor ([\w-]+\.[\w.-]+\.[a-z]{2,})\b")]
+REX_LOGS = ["var/log/foreman-proxy/proxy.log", "var/log/foreman-proxy/smart_proxy_dynflow_core.log"]
+
+
+def rex_failures(t, ctx):
+    """SSH failures of remote execution, by host and how they failed: from the smart proxy's log and the errors of task
+    steps. One row per host and reason, newest first."""
+    ref = ref_time(ctx)
+    groups, read = {}, []
+    texts = []
+    for rel0 in REX_LOGS:
+        text, rel = t.read([rel0], tail=True, limit=LOG_READ)
+        if text is not None:
+            texts.append((rel, text))
+    prow, pk, srel, _ = t.table(STEPS, limit=64 * 1024 * 1024, tail=True, keep=STEP_COLS)
+    if prow is not None and pk in ("csv", "pipe"):
+        texts.append((srel, "\n".join((x.get("started_at") or "")[:19] + " " + (x.get("error") or "").replace("\n", " ") for x in prow
+                                      if x.get("error") not in (None, "", "\\N", "NULL"))))
+    for rel, text in texts:
+        read.append(rel)
+        starts = set()
+        for lit in REX_LITS:
+            pos = text.find(lit)
+            while pos >= 0:
+                starts.add(text.rfind("\n", 0, pos) + 1)
+                le = text.find("\n", pos)
+                pos = text.find(lit, le if le >= 0 else len(text))
+        for ls in starts:
+            le = text.find("\n", ls)
+            l = text[ls:le if le >= 0 else len(text)]
+            how = next((k for rx, k in _REX_HOW if rx.search(l)), "SSH failed")
+            host = next((m.group(1).rstrip(".").lower() for m in (rx.search(l) for rx in _REX_HOST) if m), "(no host on the line)")
+            g = groups.setdefault((host, how), {"n": 0, "first": None, "last": None, "files": set(), "ex": (rel, l)})
+            g["n"] += 1
+            g["files"].add(rel.rsplit("/", 1)[-1])
+            w = parse_when(l[:100], ref)
+            if w is not None:
+                g["first"] = w if g["first"] is None or w < g["first"] else g["first"]
+                if g["last"] is None or w >= g["last"]:
+                    g["last"], g["ex"] = w, (rel, l)
+    title = "remote execution: SSH failures by host (newest first)"
+    cmd = "grep -hE '%s' %s" % ("|".join(ere_escape(x) for x in REX_LITS), " ".join(read or REX_LOGS[:1]))       # every phrase the block looks for
+    if not read:
+        return block(title, cmd, approx=True, missing=REX_LOGS[0])
+    rows = sorted(groups.items(), key=lambda kv: (kv[1]["last"] is None, -(kv[1]["last"] - datetime.datetime(1970, 1, 1)).total_seconds() if kv[1]["last"] else -kv[1]["n"], kv[0]))
+    shown = rows[:NET_ROWS]
+    lines = last_seen_rows([(g, host[:40], how) for (host, how), g in shown])
+    searched = ", ".join(r.rsplit("/", 1)[-1] for r in read)
+    note = ("%s on %s · searched: %s" % (plural(sum(g["n"] for g in groups.values()), "line"), plural(len(set(h for h, _ in groups)), "host"), searched)) if groups else ""
+    if len(rows) > NET_ROWS:
+        note += " · %d older groups not shown" % (len(rows) - NET_ROWS)
+    return block(title, cmd, lines, read, approx=True, note=note, empty="(none in %s)" % searched,
+                 refs=[{"rel": g["ex"][0], "raw": g["ex"][1], "q": ""} for _, g in shown])
+
+
+HISTORY = ["sos_commands/dnf/dnf_history", "sos_commands/dnf/dnf_history_list", "sos_commands/yum/yum_history",
+           "sos_commands/dnf/dnf_-C_history", "sos_commands/dnf/dnf*history*"]
+BOOTS = ["sos_commands/systemd/journalctl_--list-boots", "sos_commands/logs/journalctl_--list-boots",
+         "sos_commands/logs/journalctl_--no-pager_--list-boots"]
+_HIST_ROW = re.compile(r"^\s*(\d+)\s*\|?\s*(.*?)\s*\|?\s*(\d{4}-\d\d-\d\d \d\d:\d\d(?::\d\d)?)\s*\|?\s*(.*?)\s*$")
+
+
+# satellite-maintain commands that only look: they change nothing on the host, so they are counted, not listed
+_INST_LOOK = ("--help", "-h", "--full-help", "--version", "--list-scenarios", "--noop", "-n")
+
+
+def installer_args(line):
+    """The arguments on a 'Running installer with args [[...]]' line, as a list; None for any other line."""
+    m = re.search(r"Running installer with args\s*(.*)$", line)
+    if not m:
+        return None
+    return re.findall(r'"([^"]*)"', m.group(1))
+
+
+def installer_looks(args):
+    """True when a run with these arguments changes nothing: help, a dry run, listing scenarios, or only words the installer
+    does not take as options ('version'), which it rejects and exits 1 before doing anything."""
+    if not args:
+        return False
+    opts = [a.split("=", 1)[0] for a in args if a.startswith("-")]
+    return not opts or any(o in _INST_LOOK for o in opts)
+
+
+_MAINT_LOOK = re.compile(r"^(service (status|list)|health (check|list|list-tags)|upgrade (check|list-versions)|update check|report (generate|condense)|"
+                         r"maintenance-mode status|packages (status|-h|--help)|plugin list|.*\s(-h|--help))(\s|$)|^(-h|--help)$")
+
+
+def recent_changes(t, ctx):
+    """Package transactions, installer and satellite-maintain runs and boots, merged into one list by time.
+    Each row is a recorded event from the file named at its end."""
+    ev, srcs = [], []
+    ref = ref_time(ctx)
+    text, rel = t.read(HISTORY)
+    if text is not None:
+        srcs.append(rel)
+        for l in text.splitlines():
+            m = _HIST_ROW.match(l)
+            if not m:
+                continue
+            tid, cmdl, when, rest = m.groups()
+            w = parse_when(when)
+            parts = [x.strip() for x in rest.split("|")] if "|" in rest else rest.split()
+            altered = next((re.match(r"\d+", x).group(0) for x in reversed(parts) if re.match(r"\d+", x)), "")
+            actions = ", ".join(x for x in parts if x and not re.match(r"^\d+", x))[:30]
+            what = cmdl.strip(" |") or actions
+            desc = "package transaction %s: %s" % (tid, what[:60])
+            if altered:
+                desc += " (%s package%s)" % (altered, "" if altered == "1" else "s")
+            if w:
+                ev.append((w, desc, rel.rsplit("/", 1)[-1], rel, l))
+    text, rel = t.read(INSTALLER, tail=True, limit=LOG_READ)
+    ilooks = []
+    if text is not None:
+        hit = False
+        prog = rel.rsplit("/", 1)[-1].replace(".log", "-installer")
+        for l in text.splitlines():
+            if "Running installer with" not in l:
+                continue
+            w = parse_when(l[:100], ref)
+            if not w:
+                continue
+            if "Running installer with args" in l:
+                al = installer_args(l)
+                args = " ".join(al) or re.sub(r"^.*Running installer with args\s*", "", l)
+                e = (w, "%s %s" % (prog, args[:70]), rel.rsplit("/", 1)[-1], rel, l)
+                if installer_looks(al):
+                    ilooks.append(e)
+            elif "log based terminal output" in l:          # the other line a run starts with; some runs log only this one
+                e = (w, "%s (arguments not in the log)" % prog, rel.rsplit("/", 1)[-1], rel, l)
+            else:
+                continue
+            # one run logs both lines a moment apart: keep one, the one with the arguments
+            if hit and ev[-1][3] == rel and abs((ev[-1][0] - w).total_seconds()) <= 120:
+                if "(arguments not in the log)" in ev[-1][1]:
+                    ev[-1] = e
+                continue
+            ev.append(e)
+            hit = True
+        if ilooks:              # runs that change nothing (help, a dry run, 'version') are a count, not a change
+            ev[:] = [e for e in ev if e not in ilooks]
+        if hit:
+            srcs.append(rel)
+    looks = 0
+    text, rel = t.read(["var/log/foreman-maintain/foreman-maintain.log"], tail=True, limit=LOG_READ)
+    if text is not None:
+        hit = False
+        for l in text.splitlines():
+            m = re.search(r"maintain command with arguments \[(.*)\]", l)
+            if m:
+                w = parse_when(l[:100], ref)
+                args = " ".join(re.findall(r'"([^"]*)"', m.group(1)))
+                if w and _MAINT_LOOK.match(args.strip()):
+                    looks += 1
+                    hit = True
+                elif w:
+                    ev.append((w, "satellite-maintain %s" % args[:70], "foreman-maintain.log", rel, l))
+                    hit = True
+        if hit:
+            srcs.append(rel)
+    text, rel = t.read(BOOTS)
+    if text is not None:
+        srcs.append(rel)
+        for l in text.splitlines():
+            m = re.search(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", l)
+            w = parse_when(m.group(1)) if m else None
+            if w:
+                ev.append((w, "boot", rel.rsplit("/", 1)[-1], rel, l))
+    else:
+        text, rel = t.read(["last", "sos_commands/login/last_-F", "sos_commands/login/last"])
+        if text is not None:
+            srcs.append(rel)
+            for l in text.splitlines():
+                if l.startswith("reboot"):
+                    m = re.search(r"\w{3} (\w{3}\s+\d+ \d\d:\d\d:\d\d \d{4})", l)
+                    w = parse_when("Mon " + m.group(1)) if m else None
+                    if w:
+                        ev.append((w, "boot", rel.rsplit("/", 1)[-1], rel, l))
+    cmd = "; ".join(("grep -E 'Running installer with (args|log based)' %s" if x in INSTALLER else "grep 'command with arguments' %s" if "maintain" in x else "cat %s") % x
+                    for x in (srcs or [HISTORY[0], INSTALLER[0], "var/log/foreman-maintain/foreman-maintain.log", BOOTS[0]]))
+    if not srcs:
+        return block("recent changes: packages, installer, satellite-maintain, boots", cmd, approx=True,
+                     missing=[HISTORY[0], INSTALLER[0], "var/log/foreman-maintain/foreman-maintain.log", BOOTS[0]])
+    ev.sort(key=lambda e: e[0])
+    t._events = ev                               # for the configuration files changed, which says which change each file came with
+    shown = ev[-15:][::-1]                       # newest first
+    lines = ["%s  %-62s %s" % (w.strftime("%Y-%m-%d %H:%M"), d[:62], f) for w, d, f, _, _ in shown]
+    note = ("%d changes · showing the newest 15" % len(ev)) if len(ev) > 15 else ""
+    if ilooks:
+        note = (note + " · " if note else "") + "%s that %s nothing left out (%s)" % (
+            plural(len(ilooks), "installer run"), "changes" if len(ilooks) == 1 else "change", ", ".join(sorted(set(" ".join(installer_args(e[4])) for e in ilooks)))[:60])
+    if looks:
+        note = (note + " · " if note else "") + "%s that only look left out (service status, health check, update check, report)" % plural(looks, "satellite-maintain run")
+    return block("recent changes: packages, installer, satellite-maintain, boots (newest first)", cmd, lines, srcs, approx=True,
+                 note=note, empty="(no dated events in these files)", refs=[{"rel": r, "raw": raw, "q": ""} for _, _, _, r, raw in shown])
+
+
+CONF_DAYS = 7            # configuration files changed this many days before collection
+CONF_FILES = 20          # more than this: one row per folder, the files in a closed block
+CONF_DIFF_BYTES = 512 * 1024
+CONF_DIFF_CELLS = 4000000        # lines of the copy × lines of the file: about a second of difflib at worst
+CONF_DIFF_SECONDS = 5
+# an earlier copy left beside a file: file.1234.2026-10-26@08:41:22~ (Ansible), file~, file.bak, .orig, .rpmsave, .old, .backup, .save
+_CONF_COPY = re.compile(r"(?:\.\d+\.\d{4}-\d\d-\d\d@\d\d:\d\d:\d\d~|~|\.(?:bak|orig|rpmsave|old|backup|save)(?:[._-][\w.@:-]*)?)$")
+_CONF_NO_DIFF = re.compile(r"(^|/)(pki|private)/|\.(pem|key|crt|cer|der|p12|pfx|jks|keystore|truststore|db|gz|xz|bz2|zip|rpm)$", re.I)
+_EPOCH = datetime.datetime(1970, 1, 1)
+
+
+# files that programs rewrite on their own (registration, Insights, printing, the clock, the linker): they change without anybody
+# changing anything, so they are counted on one line instead of listed
+_CONF_AUTO = re.compile(r"^etc/(rhsm/facts/|insights-client/|pki/entitlement/|rhsm/syspurpose/|yum\.repos\.d/redhat\.repo$|cups/subscriptions\.conf|"
+                        r"adjtime$|ld\.so\.cache$|machine-id$|\.updated$|lvm/(archive|backup)/|tuned/active_profile$|tuned/profile_mode$)")
+_CONF_AUTO_NAME = [("rhsm/facts/", "rhsm facts"), ("insights-client/", "insights-client"), ("pki/entitlement/", "entitlement certificates"),
+                   ("rhsm/syspurpose/", "syspurpose"), ("redhat.repo", "redhat.repo"), ("cups/", "cups"), ("adjtime", "adjtime"),
+                   ("ld.so.cache", "ld.so.cache"), ("machine-id", "machine-id"), (".updated", ".updated"), ("lvm/", "LVM metadata copies"), ("tuned/", "tuned state")]
+
+
+def conf_cause(epoch_utc, off, events):
+    """The recorded change a file's change time falls in with: an installer or satellite-maintain run up to 90 minutes
+    before it, or a package transaction up to 10 minutes either side. '' when none."""
+    if not events:
+        return ""
+    when = _EPOCH + datetime.timedelta(seconds=epoch_utc, minutes=off or 0)        # host clock, as the events are
+    best = None
+    for w, desc, _, _, _ in events:
+        d = (when - w).total_seconds()
+        if desc.startswith("package transaction"):
+            ok = -600 <= d <= 600
+            what = "package transaction %s" % w.strftime("%H:%M")
+        elif desc == "boot":
+            continue
+        else:
+            ok = -120 <= d <= 5400
+            what = ("installer run %s" if "installer" in desc else "satellite-maintain run %s") % w.strftime("%H:%M")
+        if ok and (best is None or abs(d) < best[0]):
+            best = (abs(d), what)
+    return best[1] if best else ""
+
+
+def conf_changes(t, ctx):
+    """Files under etc/ whose change time falls in the CONF_DAYS days before collection, as the archive kept them:
+    {"rows": [(epoch, rel, size, [copies, newest first])], "total": files under etc/, "kept": True/False, "why": ...,
+    "start": epoch, "off": minutes or None}. None when etc/ was not collected or the collection time is unknown.
+    sos keeps each file's change time in the archive; a copy extracted without them gives one time to every file."""
+    if getattr(t, "_conf", 0) != 0:
+        return t._conf
+    t._conf = None
+    ref = parse_when(ctx.get("collected", "")) or parse_when(ctx.get("ref", ""))
+    etc = [(r, full) for r, full, _ in t.files() if r.startswith("etc/")]
+    if not ref or not etc:
+        return None
+    off = ctx.get("utc_offset")
+    end = (ref - _EPOCH - datetime.timedelta(minutes=off or 0)).total_seconds()      # collection, seconds since 1970 UTC
+    start = end - CONF_DAYS * 86400
+    mt = {}
+    for r, full in etc:
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue
+        mt[r] = (st.st_mtime, st.st_size)
+    if not mt:
+        return None
+    res = {"rows": [], "total": len(mt), "kept": True, "why": "", "start": start, "end": end, "off": off}
+    minutes = {}
+    for m, _ in mt.values():
+        minutes[int(m // 60)] = minutes.get(int(m // 60), 0) + 1
+    common, n_common = max(minutes.items(), key=lambda kv: kv[1])
+    after = sum(1 for m, _ in mt.values() if m > end + 86400)
+    if len(mt) >= 20 and n_common * 10 >= len(mt) * 9:
+        res.update(kept=False, why="%s files under etc/ have the same change time, %s: the copy of this report did not keep "
+                   "the times the files had on the host" % (("all %s" % fmt_n(len(mt))) if n_common == len(mt) else "%s of the %s" % (fmt_n(n_common), fmt_n(len(mt))),
+                                                            conf_when(common * 60, off)))
+    elif after * 10 >= len(mt):
+        res.update(kept=False, why="%s of the %s files under etc/ changed after the report was collected: the copy of this report did not keep "
+                   "the times the files had on the host" % (fmt_n(after), fmt_n(len(mt))))
+    if res["kept"]:
+        copies_of = {}                  # file -> the copies beside it, found from the copies' names in one pass
+        for r in mt:
+            for m_ in _CONF_COPY.finditer(r):
+                base = r[:m_.start()]
+                if base in mt and base != r:
+                    copies_of.setdefault(base, []).append(r)
+                    break
+        for r, (m, size) in mt.items():
+            n = r.rpartition("/")[2]
+            if _CONF_COPY.search(n) or r == "etc/mtab" or not (start <= m <= end + 7200):      # sos runs for a while after 'date';
+                continue                                                                          # etc/mtab is the kernel's mount table
+            copies = sorted(copies_of.get(r, []), key=lambda c: (-mt[c][0], c))
+            res["rows"].append((m, r, size, copies))
+        res["rows"].sort(key=lambda x: (-x[0], x[1]))
+    t._conf = res
+    return res
+
+
+def conf_when(epoch, off, fmt="%Y-%m-%d %H:%M"):
+    """A file's change time as the host's clock showed it (UTC when the report holds no offset)."""
+    return (_EPOCH + datetime.timedelta(seconds=epoch, minutes=off or 0)).strftime(fmt)
+
+
+def _conf_copy_text(copies):
+    if not copies:
+        return ""
+    c = copies[0].rsplit("/", 1)[-1]
+    return "earlier copy %s%s" % (c, (" (%d copies)" % len(copies)) if len(copies) > 1 else "")
+
+
+def config_changes(t, ctx):
+    """Configuration files changed in the days before collection: listed only when there are some, or one line
+    saying the report's copy did not keep the change times. With them, a closed block of their differences against
+    the earlier copies the report holds."""
+    c = conf_changes(t, ctx)
+    if c is None:
+        return []
+    title = "configuration files changed in the %d days before collection" % CONF_DAYS
+    excl = "! -name '*~' ! -name '*.bak*' ! -name '*.orig*' ! -name '*.rpmsave*' ! -name '*.old*'"
+    cmd = "find etc -type f -newermt @%d %s -printf '%%TY-%%Tm-%%Td %%TH:%%TM  %%s  %%p\\n' | sort -r" % (int(c["start"]), excl)
+    if not c["kept"]:
+        return [block(title, "find etc -type f -printf '%TY-%Tm-%Td %TH:%TM\\n' | sort | uniq -c | sort -rn | head -3", [], ["etc/"],
+                      approx=True, empty="(" + c["why"] + ")")]
+    rows = c["rows"]
+    if not rows:
+        return []
+    off = c["off"]
+    tz = ("host time, " + offset_text(off, ctx.get("tz", ""))) if off is not None else "UTC: the report holds no offset"
+    note = "%s of %s files under etc/ · change time as the archive kept it (%s)" % (fmt_n(len(rows)), fmt_n(c["total"]), tz)
+
+    if not hasattr(t, "_events"):
+        recent_changes(t, ctx)
+    events = getattr(t, "_events", [])
+    auto = [x for x in rows if _CONF_AUTO.match(x[1])]
+    rows = [x for x in rows if not _CONF_AUTO.match(x[1])]
+    if auto:
+        note += " · %s rewritten by programs on their own, on the last line" % fmt_n(len(auto))
+    if not rows and not auto:
+        return []
+
+    def file_line(m, r, size, copies):
+        cause = conf_cause(m, off, events)
+        tag = ("with " + cause) if cause else ("no installer run, satellite-maintain run or package transaction near" if events else "")
+        return ("%s  %9s  %-50s %s" % (conf_when(m, off), fmt_n(size), r, "  ".join(x for x in (tag, _conf_copy_text(copies)) if x))).rstrip()
+
+    def auto_line():
+        cnt = {}
+        for _, r, _, _ in auto:
+            nm = next((n for k, n in _CONF_AUTO_NAME if k in r), r)
+            cnt[nm] = cnt.get(nm, 0) + 1
+        return "+ %s rewritten by programs on their own: %s" % (fmt_n(len(auto)), ", ".join("%s%s" % (n, (" (%d)" % k) if k > 1 else "") for n, k in cnt.items()))
+
+    out = []
+    if len(rows) <= CONF_FILES:
+        out.append(block(title + " (newest first)", cmd, [file_line(*x) for x in rows] + ([auto_line()] if auto else []), ["etc/"], approx=True, note=note,
+                         refs=[{"rel": r, "line": 1, "q": ""} for _, r, _, _ in rows] + ([None] if auto else [])))
+        out[-1]["hours"] = True             # the timeline's row points at the lines of an hour
+    else:
+        dirs = {}
+        for m, r, size, copies in rows:
+            d = r.rpartition("/")[0]
+            e = dirs.setdefault(d, [0, m, m, [], r])
+            e[0] += 1
+            e[1], e[2] = min(e[1], m), max(e[2], m)
+            if copies:
+                e[3].append(r.rsplit("/", 1)[-1] + ((" (%d copies)" % len(copies)) if len(copies) > 1 else ""))
+        order = sorted(dirs.items(), key=lambda kv: (-kv[1][0], -kv[1][2], kv[0]))
+        lines, refs = [], []
+        for d, (n, a, b, withc, newest) in order:
+            span = conf_when(a, off, "%m-%d %H:%M") + ("" if conf_when(a, off) == conf_when(b, off) else
+                                                        " → " + conf_when(b, off, "%H:%M" if conf_when(a, off, "%Y-%m-%d") == conf_when(b, off, "%Y-%m-%d") else "%m-%d %H:%M"))
+            lines.append("%5s  %-40s %-23s %s" % (fmt_n(n), d, span, ("earlier copy: " + ", ".join(withc)) if withc else ""))
+            refs.append({"rel": newest, "line": 1, "q": ""})
+        dcmd = "find etc -type f -newermt @%d %s -printf '%%h\\n' | sort | uniq -c | sort -rn" % (int(c["start"]), excl)
+        out.append(block(title + ", by folder", dcmd,
+                         lines + ([auto_line()] if auto else []), ["etc/"], approx=True, note="%s · %s" % (plural(len(dirs), "folder"), note), refs=refs + ([None] if auto else [])))
+        shown, more = upto(rows)
+        out.append(fold(block(title + ": every file (newest first)", cmd, [file_line(*x) for x in shown], ["etc/"], approx=True,
+                              note=join_notes(more and plural(len(rows), "file"), more), refs=[{"rel": r, "line": 1, "q": ""} for _, r, _, _ in shown])))
+        out[-1]["hours"] = True
+    # what changed: each file against the newest earlier copy that differs from it
+    import difflib
+    import time as _time
+    diff, cmds, srcs, big = [], [], [], []
+    t0 = _time.time()
+    for m, r, size, copies in rows:
+        if not copies or _CONF_NO_DIFF.search(r) or size > CONF_DIFF_BYTES:
+            continue
+        cur = _conf_text(t, r)
+        if cur is None:
+            continue
+        for cp in copies[:5]:
+            old = _conf_text(t, cp)
+            if old is None or old == cur:
+                continue
+            a, b_ = old.splitlines(), cur.splitlines()
+            # difflib's time grows with the product of the two lengths: a long file, or the time used up, is left to diff -u
+            if len(a) * len(b_) > CONF_DIFF_CELLS or _time.time() - t0 > CONF_DIFF_SECONDS:
+                big.append("diff -u %s %s" % (cp, r))
+                break
+            d = list(difflib.unified_diff(a, b_, cp, r, lineterm=""))
+            if d:
+                diff.extend(d)
+                cmds.append("diff -u %s %s" % (cp, r))
+                srcs.append(r)
+                break
+    if diff or big:
+        shown, more = upto(diff)
+        out.append(fold(block("what changed: configuration files against their earlier copy in the report (newest first)", "; ".join(cmds + big), shown, srcs[:20],
+                              approx=True, note=join_notes(plural(len(cmds), "file"), more,
+                                                           big and ("not compared here, too long: %s (run the command)" % ", ".join(c.rsplit(" ", 1)[1] for c in big[:5]))),
+                              empty="(the files are too long to compare here: run the command)")))
+    return out
+
+
+def _conf_text(t, rel):
+    try:
+        with open(os.path.join(t.root, rel), "rb") as fh:
+            data = fh.read(CONF_DIFF_BYTES + 1)
+    except (OSError, IOError):
+        return None
+    if len(data) > CONF_DIFF_BYTES or b"\0" in data:
+        return None
+    return data.decode("utf-8", "replace")
+
+
+# systemd's own lines when a unit stops other than by a clean stop, or is restarted by it (RHEL 7, 8, 9 wording).
+# One pattern for both grep -E and Python.
+UNIT_EVENTS = (r"systemd(\[1\])?: .*([Mm]ain process exited|Failed with result|Scheduled restart job|scheduling restart|"
+               r"[Ss]tart request repeated too quickly|entered failed state|killed by the OOM killer|operation timed out|State '[^']*' timed out)"
+               r"|systemd(\[1\])?: [^ ]+\.(service|socket|mount|swap|timer|path|automount) failed\.$")
+_UNIT_LITS = ("ain process exited", "Failed with result", "Scheduled restart job", "scheduling restart", "tart request repeated too quickly",
+              "entered failed state", "OOM killer", "timed out", " failed.")
+_UNIT_NAME = re.compile(r"(?:Unit )?([^\s:]+\.(?:service|socket|mount|swap|timer|path|automount|scope|slice|target))(?::|\s|$)")
+_UNIT_MSG = re.compile(r"systemd(?:\[1\])?: (.*)$")
+
+
+def find_lines(text, lits, rx, numbered=False):
+    """The lines of text that hold one of the literal strings and match rx, in file order (str.find first: fast on big logs).
+    numbered=True: (line number within text, line) pairs, counted in one pass."""
+    starts = set()
+    for lit in lits:
+        pos = text.find(lit)
+        while pos >= 0:
+            ls = text.rfind("\n", 0, pos) + 1
+            starts.add(ls)
+            le = text.find("\n", pos)
+            pos = text.find(lit, le if le >= 0 else len(text))
+    out, n, at = [], 1, 0
+    for ls in sorted(starts):
+        le = text.find("\n", ls)
+        l = text[ls:le if le >= 0 else len(text)]
+        if rx.search(l):
+            if numbered:
+                n += text.count("\n", at, ls)
+                at = ls
+                out.append((n, l))
+            else:
+                out.append(l)
+    return out
+
+
+def unit_events(t, ctx):
+    """Units that failed or that systemd restarted, from its own lines in the system log: one row per unit, the
+    newest first, with how each run ended as systemd wrote it. The lines themselves follow in a closed block."""
+    title = "units that failed or were restarted by systemd (newest first)"
+    text, rel = t.read(LOGS, tail=True, limit=LOG_READ, largest=True)
+    pat = UNIT_EVENTS.replace("'", "'\\''")
+    if text is None:
+        return [block(title, "grep -E '%s' var/log/messages" % pat, missing=LOGS, learn="systemctl")]
+    rx = re.compile(UNIT_EVENTS)
+    base = t.line_base(rel, text)
+    numbered = [(base + n, l) for n, l in find_lines(text, _UNIT_LITS, rx, numbered=True)]
+    hits = [l for _, l in numbered]
+    cut = t.size(rel) > LOG_READ
+    span = span_of(text[:20000].splitlines()[:50] + text[-20000:].splitlines()[-50:], ctx)
+    ref = ref_time(ctx)
+    units, seen = {}, {}
+    for ln, l in numbered:
+        mm = _UNIT_MSG.search(l)
+        msg = mm.group(1) if mm else ""
+        m = _UNIT_NAME.match(msg)
+        name = m.group(1) if m else None
+        if name is None:
+            m = re.search(r"repeated too quickly for (\S+?)\.?$", msg)
+            name = m.group(1) if m else None
+        if name is None:
+            continue
+        u = units.setdefault(name, {"fail": {}, "restart": {}, "how": {}, "last": None, "raw": ln})
+        low = msg.lower()
+        how = None
+        me = re.search(r"main process exited, code=(\w+), status=(\S+?)\.?$", msg, re.I)
+        if me:
+            if me.group(1) == "exited" and me.group(2).startswith("0"):
+                continue                                   # a clean exit: not a failure, and not shown
+            how = ("status=" if me.group(1) == "exited" else me.group(1) + ", status=") + me.group(2)
+        elif "failed with result" in low:
+            u["fail"]["result"] = u["fail"].get("result", 0) + 1
+            r = re.search(r"result '([^']*)'", msg)
+            how = "result '%s'" % (r.group(1) if r else "?")
+        elif "entered failed state" in low:
+            u["fail"]["state"] = u["fail"].get("state", 0) + 1
+        elif low.endswith(" failed."):
+            u["fail"]["failed"] = u["fail"].get("failed", 0) + 1
+        elif "scheduled restart job" in low:
+            u["restart"]["job"] = u["restart"].get("job", 0) + 1
+        elif "scheduling restart" in low:
+            u["restart"]["hold"] = u["restart"].get("hold", 0) + 1
+        elif "repeated too quickly" in low:
+            how = "start request repeated too quickly"
+        elif "oom killer" in low:
+            how = "killed by the OOM killer"
+        elif "timed out" in low:
+            r = re.search(r"((?:start|stop|reload|start-pre|start-post|stop-post)\S* operation timed out|State '[^']*' timed out)", msg)
+            how = r.group(1) if r else "timed out"
+        if how:
+            u["how"][how] = u["how"].get(how, 0) + 1
+        key = l[:19]                       # lines logged in the same second share a time: parse it once
+        w = seen[key] if key in seen else seen.setdefault(key, parse_when(l[:100], ref))
+        if w and (u["last"] is None or w >= u["last"]):
+            u["last"], u["raw"] = w, ln
+    rows = []
+    for name, u in units.items():
+        fails = max(u["fail"].values()) if u["fail"] else 0      # RHEL 7 writes 'entered failed state' and 'X failed.' for one failure
+        restarts = u["restart"].get("job") or u["restart"].get("hold", 0)
+        if not (fails or restarts or u["how"]):
+            continue
+        how = " · ".join("%s ×%s" % (k, fmt_n(n)) for k, n in sorted(u["how"].items(), key=lambda kv: (-kv[1], kv[0])))
+        rows.append((u["last"], name, fails, restarts, how, u["raw"]))
+    rows.sort(key=lambda r: (r[0] or datetime.datetime.min, r[1]), reverse=True)
+    cmd = "grep -E '%s' %s | grep -oE '[^ ]+\\.(service|socket|mount|swap|timer|path|automount)' | sort | uniq -c" % (pat, rel)
+    note = join_notes(plural(len(rows), "unit"), span and ("%s: %s" % (rel.rsplit("/", 1)[-1], span)), "the end of the file was read" if cut else "")
+    if not rows:
+        return [block(title, cmd, [], [rel], approx=True, learn="systemctl",
+                      empty="(no unit failed or was restarted by systemd in %s)" % rel.rsplit("/", 1)[-1])]
+    lines = ["%-16s  %6s  %8s  %-40s %s" % ("LAST EVENT", "FAILED", "RESTARTS", "UNIT", "HOW IT ENDED")]
+    lines += ["%-16s  %6s  %8s  %-40s %s" % (w.strftime("%Y-%m-%d %H:%M") if w else "?", fmt_n(f), fmt_n(r), n, h) for w, n, f, r, h, _ in rows]
+    out = [block(title, cmd, lines, [rel], approx=True, learn="systemctl", note=note,
+                 refs=[None] + [{"rel": rel, "line": ln, "q": n} for _, n, _, _, _, ln in rows])]
+    shown, more = upto(numbered[::-1])
+    out.append(block("systemd lines on units that failed or were restarted (newest first)", "grep -E '%s' %s | tac%s" % (pat, rel, " | head -%d" % ALL_LINES if more else ""),
+                     [l for _, l in shown], [rel], approx=cut, note=join_notes(more and plural(len(hits), "line"), more),
+                     refs=[{"rel": rel, "line": n, "q": ""} for n, _ in shown]))
+    return out
+
+
+_SYSLOG_PROG = re.compile(r"^(?:[A-Z][a-z]{2} [ \d]\d \d\d:\d\d:\d\d|\d{4}-\d\d-\d\dT[\d:.]+(?:Z|[+-]\d\d:?\d\d)?)\s+\S+\s+([^\s\[:]+)(?:\[\d+\])?:")
+
+
+def syslog_programs(t, ctx):
+    """How many lines each program wrote to the system log: plain counts, busiest first."""
+    text, rel = t.read(LOGS, tail=True, limit=LOG_READ, largest=True)
+    if text is None:
+        return block("system log lines by program", "awk '{print $5}' var/log/messages | sort | uniq -c | sort -rn", missing=LOGS)
+    counts, ex = {}, {}
+    lines = text.splitlines()
+    for l in lines:
+        m = _SYSLOG_PROG.match(l)
+        if m:
+            p = m.group(1)
+            counts[p] = counts.get(p, 0) + 1
+            ex[p] = l
+    span = span_of(lines, ctx)
+    cmd = "awk '{print $5}' %s | sed 's/\\[.*//; s/:$//' | sort | uniq -c | sort -rn | head -15" % rel
+    note = " · ".join(x for x in (plural(sum(counts.values()), "line"), plural(len(counts), "program"), span) if x) if counts else ""
+    return block("system log lines by program (top 15)", cmd, counted(top(counts, 15), 9), [rel], approx=True, note=note,
+                 empty="(no lines in syslog format)", refs=raw_refs(rel, top(counts, 15), ex, q=lambda k: "re: " + re.escape(k) + r"(\[\d+\])?:"))
+
+
+def custom_hiera(t):
+    """custom-hiera.yaml: the lines that set something (comments, blank lines and the YAML start marker left out)."""
+    text, rel = t.read(["etc/foreman-installer/custom-hiera.yaml"])
+    if text is None:
+        return block("custom-hiera.yaml", "cat etc/foreman-installer/custom-hiera.yaml",
+                     missing="etc/foreman-installer/custom-hiera.yaml")
+    sets = [l for l in text.splitlines() if l.strip() and not re.match(r"^\s*#", l) and l.strip() != "---"]
+    return block("custom-hiera.yaml", "cat %s" % rel, text.splitlines()[:ALL_LINES], [rel],
+                 note=plural(len(sets), "line sets something", "lines set something") if sets else "nothing set: only comments", empty="(empty file)")
+
+
+SECTIONS = [
+    ("01", "system", "System & hardware", "any", s01_system),
+    ("02", "subscriptions", "Subscriptions & repos", "any", s04_subscriptions),
+    ("03", "network", "Naming & network", "any", s02_network),
+    ("04", "certs", "Certificates", "any", s03_certs),
+    ("05", "packages", "Packages", "any", s03_packages),
+    ("06", "installer", "Installer & upgrades", "satcap", s05_installer),
+    ("07", "disk", "Disk", "any", s06_disk),
+    ("08", "memory", "Memory & CPU", "any", s07_memory),
+    ("09", "services", "Services", "any", s08_services),
+    ("10", "tasks", "Foreman tasks", "satellite", s09_tasks),
+    ("11", "hammer", "Hammer ping", "satellite", s10_hammer),
+    ("12", "postgresql", "PostgreSQL", "satcap", s11_postgres),
+    ("13", "foreman", "Foreman & smart proxy logs", "satcap", s12_foreman_logs),
+    ("14", "httpd", "Httpd", "satcap", s13_httpd),
+    ("15", "pulp", "Pulp", "satcap", s14_pulp),
+    ("16", "candlepin", "Candlepin", "satellite", s15_candlepin),
+    ("17", "rhsm", "RHSM & virt-who", "any", s16_rhsm),
+    ("18", "tuning", "Tuning", "satcap", s17_tuning),
+    ("19", "cron", "Cron", "any", s18_cron),
+    ("20", "leapp", "Leapp", "any", s19_leapp),
+]
+
+
+def applies(scope, role):
+    if scope == "any":
+        return True
+    if scope == "satcap":
+        return role in ("satellite", "capsule")
+    return role == scope
+
+
+def raw_refs(rel, pairs, ex, q=None):
+    """refs for a counted block: per (key, count) row, the newest raw line it came from (ex[key] is the line, or
+    (file, line) when the rows come from several files), found in the file afterwards. q(key) gives the text a click
+    searches for; by default the key itself, with its ids and numbers as wildcards."""
+    out = []
+    for k, _ in pairs:
+        v = ex.get(k)
+        r, raw = v if isinstance(v, tuple) else (rel, v)
+        out.append({"rel": r, "raw": raw, "q": q(k) if q else k})
+    return out
+
+
+def day_refs(rel, days, dex, drel=None):
+    """refs for a per-day bar block (bars() shows the newest day first): the last line of each day, in the file it was
+    read from (drel: day -> file, when the days come from more than one copy of a log). None for a compressed copy."""
+    out = []
+    for d in sorted(days, reverse=True):
+        r = (drel or {}).get(d, rel)
+        out.append(None if COMPRESSED.search(r) else {"rel": r, "raw": dex.get(d), "q": ""})
+    return out
+
+
+REF_BUDGET = 6.0     # seconds spent finding where the report's lines are in their files
+REF_READ_BIG = 64 * 1024 * 1024     # the most of a log any block reads: a line not in the last LOG_READ is looked for there
+
+
+REF_SKIPPED = []      # [section, block title, lines] whose link was not looked up because REF_BUDGET ran out, in the last build
+
+
+_SPLITS = re.compile("[\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029]")     # what str.splitlines() also cuts a line at
+
+
+def _find_lines(text, wanted):
+    """{raw: index of the newest line of text that is raw}: a line may have bullets, spaces or brackets before raw and
+    spaces after it, as Tree.locate allows. One pass over the text, from its end, for any number of lines.
+    A block that split its text with splitlines() hands in only the first piece of a line that holds a form feed or
+    such (a request line quoting raw bytes): that piece finds the line too."""
+    found, left = {}, set(wanted)
+    lines = text.split("\n")
+    odd = _SPLITS.search(text) is not None
+    for idx in range(len(lines) - 1, -1, -1):
+        s = lines[idx].rstrip()
+        if not s:
+            continue
+        if odd and _SPLITS.search(s):
+            p0 = s.splitlines()[0].rstrip() if s.splitlines() else ""
+            if p0 in left:
+                found[p0] = idx
+                left.discard(p0)
+                if not left:
+                    break
+                continue
+        if s in left:
+            found[s] = idx
+            left.discard(s)
+        else:
+            k = 0
+            while k < len(s) and k < 12 and not (s[k].isalnum() or s[k] == "_"):     # what may come before raw: no word character
+                k += 1
+                if s[k:] in left:
+                    found[s[k:]] = idx
+                    left.discard(s[k:])
+                    break
+        if not left:
+            break
+    return found
+
+
+def resolve_refs(t, secs):
+    """Give every output line that came from a file the place it was found: blocks hand in the raw line (counted
+    blocks: the newest line of each group), and a line copied as is from its source file is looked up there.
+    The page turns these into links to the viewer; the text report does not show them.
+    The lines are looked up file by file, all of a file's lines in one pass over it."""
+    import time as _time
+    t0 = _time.time()
+    del REF_SKIPPED[:]
+    todo = []                  # (block, its output list, line index, [(rel, raw)], q, tip)
+    fallback = {}              # (block, line index) -> 'file:line' to link when the line is not found where pointed
+    by_rel = {}                # rel -> set of whole lines to find
+    slow = []                  # lookups that need Tree.locate: part of a line, or a line with a newline in it
+    for sec in secs:
+        for b in sec["blocks"]:
+            if b["state"] != "ok" or not b["lines"]:
+                continue
+            refs = b.get("refs") or []
+            out = []
+            for i, l in enumerate(b["lines"]):
+                r = refs[i] if i < len(refs) else None
+                if isinstance(r, dict) and r.get("line"):           # the block knew the line: no search, no time spent
+                    out.append(["%s:%d" % (r["rel"], r["line"]), r.get("q") or ""] + ([r["tip"]] if r.get("tip") else []))
+                    continue
+                if isinstance(r, dict):
+                    cands = [(r["rel"], r["raw"], r.get("part"))] if r.get("rel") and r.get("raw") else []
+                    q, tip = r.get("q") or "", r.get("tip")
+                    if r.get("else"):                # where the line was read, when it may not be found in the log
+                        fallback[(id(b), i)] = "%s:%d" % tuple(r["else"])
+                elif r is None and not refs and i < 60:
+                    cands = [(rel, l, False) for rel in b["src"]]
+                    q, tip = "", None
+                else:
+                    out.append(r)
+                    continue
+                out.append(None)
+                keep = []
+                for rel, raw, part in cands:
+                    if not raw or len(raw.strip()) < (2 if part else 4) or rel.endswith("/") or "*" in rel:
+                        continue
+                    if part or "\n" in raw:
+                        slow.append((rel, raw, part))
+                    else:
+                        by_rel.setdefault(rel, set()).add(raw.rstrip())
+                    keep.append((rel, raw, part))
+                if keep:
+                    todo.append((sec, b, out, len(out) - 1, keep, q, tip))
+            b["refs"] = out
+    where, done = {}, set()    # (rel, raw, part) -> line number; the lookups that were made
+    for rel in sorted(by_rel, key=lambda r: -len(by_rel[r])):
+        if _time.time() - t0 > REF_BUDGET:
+            break
+        done.add(rel)
+        text, r = t.read([rel], tail=True, limit=LOG_READ)
+        if text is None or r != rel:
+            continue
+        base = t.line_base(rel, text)
+        got = _find_lines(text, by_rel[rel])
+        for raw, idx in got.items():
+            where[(rel, raw, False)] = base + idx + 1
+        left = by_rel[rel] - set(got)
+        if left and t.size(rel) > LOG_READ and _time.time() - t0 <= REF_BUDGET:
+            # some blocks read the last 64 MB of their log: their lines may be before the part read above
+            text, r = t.read([rel], tail=True, limit=REF_READ_BIG)
+            if text is not None and r == rel:
+                base = t.line_base(rel, text)
+                for raw, idx in _find_lines(text, left).items():
+                    where[(rel, raw, False)] = base + idx + 1
+    for rel, raw, part in slow:
+        if _time.time() - t0 > REF_BUDGET:
+            break
+        done.add((rel, raw, part))
+        ln = t.locate(rel, raw, part)
+        if ln:
+            where[(rel, raw, part)] = ln
+    for sec, b, out, i, keep, q, tip in todo:
+        for rel, raw, part in keep:
+            ln = where.get((rel, raw, part) if part or "\n" in raw else (rel, raw.rstrip(), False))
+            if ln:
+                out[i] = ["%s:%d" % (rel, ln), q] + ([tip] if tip else [])
+                break
+        else:
+            if (id(b), i) in fallback:
+                out[i] = [fallback[(id(b), i)], q] + ([tip] if tip else [])
+                continue
+            if any(((rel, raw, part) if part or "\n" in raw else rel) not in done for rel, raw, part in keep):
+                if not REF_SKIPPED or REF_SKIPPED[-1][1] != b["title"]:
+                    REF_SKIPPED.append([sec.get("num"), b["title"], 0])
+                REF_SKIPPED[-1][2] += 1            # a line left without its link because the time ran out
+
+
+# rough cost on a large report, so the slowest sections start first when they run side by side
+SECTION_COST = {"pulp": 5, "network": 4, "tasks": 4, "foreman": 2, "memory": 2, "services": 1, "disk": 1}
+_BUILD = None
+
+
+def _note_facts(t, blocks):
+    """Add to each block's note what the reads of its files recorded: read from the end, cut, binary."""
+    for b in blocks:
+        if b["state"] in ("ok", "empty"):
+            facts = []
+            for r in b["src"]:
+                if r.endswith("/") or "*" in r:
+                    continue
+                ti = t.table_info.get(r) or {}
+                for f in (t.tailed(r), t.cut(r), "binary content, not shown" if r in t.binary else "",
+                          "no header line: columns are named by the order the database holds them" if ti.get("inferred") else "",
+                          "no header line, and the columns could not be recognised: no row was read" if ti.get("headless") else ""):
+                    if f and f not in b["note"] and f not in facts:
+                        facts.append(("%s: %s" % (r.split("/")[-1], f)) if len(b["src"]) > 1 else f)
+                got = t.read_max.get(r)
+                if got and got[0] < got[1]:      # sosview read part of this file: the command reads all of it, so its lines can differ
+                    b["approx"] = True
+            if facts:
+                b["note"] = " · ".join([x for x in (b["note"],) if x] + facts)
+
+
+def _run_section(t, ctx, i):
+    """Build one section. Returns its blocks and the context keys it set (one section records certificate trust there)."""
+    global BLOCK_TIMES
+    num, sid, title, scope, fn = SECTIONS[i]
+    before = dict(ctx)
+    t0 = _now()
+    BLOCK_TIMES = [t0, []]
+    try:
+        blocks = fn(t, ctx)
+    except Exception as e:  # one broken section must not take the report down
+        import traceback
+        blocks = [block("this section failed to build", None, traceback.format_exc().strip().splitlines()[-4:], note="sosview bug: %s: %s" % (type(e).__name__, e))]
+    took = (_now() - t0, sorted(BLOCK_TIMES[1], key=lambda x: -x[1])[:3])
+    BLOCK_TIMES = None
+    _note_facts(t, blocks)
+    delta = dict((k, v) for k, v in ctx.items() if k not in before or before[k] is not v)
+    return blocks, delta, took
+
+
+def _section_job(i):
+    t, ctx = _BUILD
+    blocks, delta, took = _run_section(t, ctx, i)
+    return i, blocks, delta, took
+
+
+def _init_build_worker():
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+
+SECTION_TIMES = []      # (number, title, seconds, [(block title, seconds)]) of the last build
+
+
+def build_report(t, ctx, progress=None, parallel=True):
+    """All sections, in order. Sections are built side by side in worker processes where the system can fork;
+    the result is the same as building them one after another. progress(done, total, title) is called as each finishes."""
+    global _BUILD
+    secs, todo = [None] * len(SECTIONS), []
+    for i, (num, sid, title, scope, fn) in enumerate(SECTIONS):
+        todo.append(i)          # every section is built: a file sos collected is shown whatever the host's role
+    done, deltas = {}, {}
+    del SECTION_TIMES[:]
+
+    def finish(i, blocks, delta, took):
+        done[i] = blocks
+        deltas[i] = delta
+        SECTION_TIMES.append((SECTIONS[i][0], SECTIONS[i][2], took[0], took[1]))
+        if progress:
+            progress(len(done), len(todo), SECTIONS[i][2])
+
+    order = sorted(todo, key=lambda i: -SECTION_COST.get(SECTIONS[i][1], 0))
+    if progress:
+        progress(0, len(todo), "reading the large logs")
+    if parallel and len(order) > 1 and hasattr(os, "fork"):
+        # files more than one section reads: read and parse them once here, so every worker starts with them
+        for i in todo:
+            if SECTIONS[i][1] in ("pulp", "tasks"):
+                t.table(STEPS, limit=64 * 1024 * 1024, tail=True, keep=STEP_COLS)
+                break
+        for i in todo:
+            if SECTIONS[i][1] in ("pulp", "network", "foreman"):
+                t.read(JOURNAL, tail=True, limit=64 * 1024 * 1024, largest=True)
+                t.read(PROD, tail=True, limit=64 * 1024 * 1024)
+                break
+        pool = None
+        try:
+            import multiprocessing
+            _BUILD = (t, ctx)
+            pool = multiprocessing.get_context("fork").Pool(min(len(order), max(2, min(8, os.cpu_count() or 2))), initializer=_init_build_worker)
+            for i, blocks, delta, took in pool.imap_unordered(_section_job, order, chunksize=1):
+                finish(i, blocks, delta, took)
+        except Exception:
+            pass                                   # anything odd: the rest is built in this process below
+        finally:
+            _BUILD = None
+            if pool is not None:
+                pool.terminate()
+                pool.join()
+    for i in order:
+        if i not in done:
+            blocks, delta, took = _run_section(t, ctx, i)
+            finish(i, blocks, delta, took)
+    for i in todo:                                 # context set by sections, in section order
+        ctx.update(deltas[i])
+        num, sid, title, scope, fn = SECTIONS[i]
+        if not applies(scope, ctx["role"]) and not any(b["state"] in ("ok", "error") for b in done[i]):
+            secs[i] = {"num": num, "id": sid, "title": title, "na": True,
+                       "blocks": na_section("only on a %s; this host is %s (%s)" % ({"satcap": "Satellite or Capsule", "satellite": "Satellite"}[scope], ctx["role"], ctx.get("role_why", "")))}
+            continue
+        secs[i] = {"num": num, "id": sid, "title": title, "blocks": done[i], "na": False}
+    resolve_refs(t, secs)
+    return secs
+
+
+# ---- --diff: two reports of the same host -------------------------------------------------
+
+_NVRA = re.compile(r"^(.+)-([^-]+)-([^-]+)\.([^.\s]+)$")
+
+
+def _rpms(t):
+    text, _ = t.read(["installed-rpms"], limit=16 * 1024 * 1024)
+    out = {}
+    for l in (text or "").splitlines():
+        tok = l.split()[0] if l.split() else ""
+        m = _NVRA.match(tok)
+        if m:
+            out["%s.%s" % (m.group(1), m.group(4))] = "%s-%s" % (m.group(2), m.group(3))
+    return out
+
+
+def _enabled_repos(t):
+    text, _ = t.read(["etc/yum.repos.d/redhat.repo"])
+    return set(b.split("]", 1)[0] for b in re.split(r"^\[", text or "", flags=re.M)[1:] if re.search(r"^enabled\s*=\s*1", b, re.M))
+
+
+def _settings(t):
+    text, _ = t.read(["sos_commands/foreman/foreman_settings_table"], limit=8 * 1024 * 1024)
+    rows, kind = parse_table(text or "")
+    return dict((r.get("name"), r.get("value")) for r in rows if kind in ("csv", "pipe") and r.get("name"))
+
+
+def _unit_states(t):
+    """{service: 'active running'} from systemctl list-units; None when the list was not collected."""
+    text, _ = t.read(UNITS, limit=8 * 1024 * 1024)
+    if text is None:
+        return None
+    out = {}
+    for l in text.splitlines():
+        c = re.sub(r"^\W+", "", l).split()
+        if len(c) >= 4 and c[0].endswith(".service") and not re.match(r"(user|session|systemd-fsck|getty|serial-getty|user-runtime-dir)[@-]", c[0]):
+            out[c[0]] = "%s %s" % (c[2], c[3])
+    return out
+
+
+def _df_use(t):
+    """{mount point: (used, use%)} for real filesystems from df; None when df was not collected."""
+    text, _ = t.read(["df", "sos_commands/filesys/df_-al_-x_autofs", "sos_commands/filesys/df_-al"])
+    if text is None:
+        return None
+    out = {}
+    for l in text.splitlines()[1:]:
+        c = l.split()
+        pc = [i for i, x in enumerate(c) if re.match(r"^\d+%$", x)]
+        if not pc or "/" not in c[0] or pc[0] < 3 or pc[0] + 1 >= len(c):
+            continue
+        used = c[pc[0] - 2]
+        out[c[pc[0] + 1]] = ((human(int(used) * 1024) if used.isdigit() else used), c[pc[0]])
+    return out
+
+
+def _conf_lines(t, cands, keep=None):
+    text, rel = t.read(cands, limit=4 * 1024 * 1024)
+    if text is None:
+        return None, None
+    lines = [l.rstrip() for l in text.splitlines() if l.strip() and not l.strip().startswith("#")]
+    if keep:
+        lines = [l for l in lines if re.search(keep, l)]
+    return lines, rel
+
+
+def diff_section(t, ctx, ot, octx, other_name):
+    """Section 21 with --diff: what differs between this report and another report of the same host. Facts both ways."""
+    import difflib
+    out = [block("the two reports", "head -1 */hostname */date */version.txt", [
+        "%-12s %-40s %s" % ("", "this report", "other report"),
+        "%-12s %-40s %s" % ("host", ctx["hostname"], octx["hostname"]),
+        "%-12s %-40s %s" % ("collected", ctx.get("collected", "?")[:40], octx.get("collected", "?")),
+        "%-12s %-40s %s" % ("role", "%s %s" % (ctx["role"], ctx.get("satellite") or ""), "%s %s" % (octx["role"], octx.get("satellite") or "")),
+        "%-12s %-40s %s" % ("OS", ctx["os"][:40], octx["os"]),
+        "%-12s %-40s %s" % ("kernel", ctx["kernel"], octx["kernel"]),
+        "%-12s %-40s %s" % ("sos", ctx["sos_version"], octx["sos_version"])], [], approx=True,
+        note="" if ctx["hostname"] == octx["hostname"] else "the host names differ: --diff is meant for two reports of the same host")]
+    ra, rb = _rpms(t), _rpms(ot)
+    if ra and rb:
+        rows = []
+        for k in sorted(set(ra) | set(rb)):
+            if k in ra and k not in rb:
+                rows.append("+ %-50s %s" % (k, ra[k]))
+            elif k in rb and k not in ra:
+                rows.append("- %-50s %s" % (k, rb[k]))
+            elif ra[k] != rb[k]:
+                rows.append("~ %-50s %s  (other: %s)" % (k, ra[k], rb[k]))
+        n_add, n_rm, n_ch = sum(1 for r in rows if r[0] == "+"), sum(1 for r in rows if r[0] == "-"), sum(1 for r in rows if r[0] == "~")
+        out.append(block("installed packages: + only here · - only in the other · ~ other version", "diff <(sort installed-rpms) <(sort OTHER/installed-rpms)",
+                         rows, ["installed-rpms"], approx=True, empty="(the same packages and versions)",
+                         note="%d only here · %d only in the other · %d at another version" % (n_add, n_rm, n_ch) if rows else ""))
+    else:
+        out.append(block("installed packages", "diff installed-rpms OTHER/installed-rpms", missing="installed-rpms"))
+    ea, eb = _enabled_repos(t), _enabled_repos(ot)
+    out.append(block("enabled repositories: + only here · - only in the other", "diff <(awk … redhat.repo) <(awk … OTHER/redhat.repo)",
+                     ["+ " + r for r in sorted(ea - eb)] + ["- " + r for r in sorted(eb - ea)], ["etc/yum.repos.d/redhat.repo"], approx=True,
+                     empty="(the same repositories are enabled)"))
+    for title, cands, keep in (("installer answers", ANSWERS, None), ("custom-hiera.yaml", ["etc/foreman-installer/custom-hiera.yaml"], None),
+                               ("postgresql.conf settings", PG_CONF, r"^\s*[a-z_.]+\s*="), ("/etc/hosts", ["etc/hosts"], None), ("/etc/resolv.conf", ["etc/resolv.conf"], None),
+                               ("sysctl.conf", ["etc/sysctl.conf"], None),
+                               ("rhsm.conf: where the host registers", ["etc/rhsm/rhsm.conf"], r"^\s*(hostname|prefix|port|baseurl|repo_ca_cert|proxy_\w+|insecure)\s*=")):
+        la, rel = _conf_lines(t, cands, keep)
+        lb, _ = _conf_lines(ot, cands, keep)
+        if la is None and lb is None:
+            continue
+        d = list(difflib.unified_diff(lb or [], la or [], "other report", "this report", n=1, lineterm=""))
+        out.append(block("%s: lines that differ (- other report, + this report)" % title, "diff -u OTHER/%s %s" % (cands[0], rel or cands[0]),
+                         d[2:400], [rel] if rel else [], approx=True, empty="(no difference)"))
+    ua, ub = _unit_states(t), _unit_states(ot)
+    if ua is not None and ub is not None:
+        rows = []
+        for u in sorted(set(ua) | set(ub)):
+            a, b = ua.get(u, "(not listed)"), ub.get(u, "(not listed)")
+            if a != b:
+                rows.append("%-44s %-22s %s" % (u[:44], a, b))
+        out.append(block("services whose state differs (this report · other report)", "diff <(awk '{print $1,$3,$4}' %s) <(awk '{print $1,$3,$4}' OTHER/%s)" % (UNITS[0], UNITS[0]),
+                         rows[:200], [t.first(UNITS)], approx=True, empty="(the same services in the same state)",
+                         note="%s differ; units that come and go with logins and mounts are left out" % plural(len(rows), "service") if rows else ""))
+    da, db = _df_use(t), _df_use(ot)
+    if da is not None and db is not None:
+        rows = []
+        for m in sorted(set(da) | set(db)):
+            a, b = da.get(m), db.get(m)
+            if a != b:
+                rows.append("%-34s %-22s %s" % (m[:34], ("%s used, %s" % a) if a else "(not mounted)", ("%s used, %s" % b) if b else "(not mounted)"))
+        out.append(block("filesystem use that differs (this report · other report)", "diff df OTHER/df", rows, ["df"], approx=True, empty="(the same use on every filesystem)"))
+    sa, sb = _settings(t), _settings(ot)
+    if sa or sb:
+        rows = ["%-44s %-30s %s" % (k[:44], (str(sa.get(k)) if k in sa else "(not set)")[:30], str(sb.get(k)) if k in sb else "(not set)")
+                for k in sorted(set(sa) | set(sb)) if sa.get(k) != sb.get(k)]
+        out.append(block("Foreman settings whose value differs (this report · other report)", "diff sos_commands/foreman/foreman_settings_table OTHER/…",
+                         ["%-44s %-30s %s" % ("setting", "this report", "other report")] + rows if rows else [], ["sos_commands/foreman/foreman_settings_table"],
+                         approx=True, empty="(no setting differs)"))
+    rows = []
+    for rel, what in CERT_FILES:
+        ca, cb = read_certs(t, rel), read_certs(ot, rel)
+        if not ca and not cb:
+            continue
+        def one(c):
+            if not c:
+                return "(not in this report)"
+            c = c[0]
+            if "error" in c:
+                return "(could not decode)"
+            return "%s · until %s" % (dn_cn(c.get("subject")), (c.get("notAfter") or "")[:20])
+        x, y = one(ca), one(cb)
+        if x != y:
+            rows.append("%s\n    this report:  %s\n    other report: %s" % (rel, x, y))
+    out.append(block("certificates that differ (subject and expiry of the first certificate in each file)", "openssl x509 -noout -subject -enddate -in FILE (both reports)",
+                     "\n".join(rows).splitlines(), [], approx=True, empty="(the same certificates)"))
+    ta, tb = task_rows(t), task_rows(ot)
+    if ta[0] is not None or tb[0] is not None:
+        def counts(tr):
+            c = {}
+            for r in (tr[0] or []) if tr[1] in ("csv", "pipe") else []:
+                k = "%s / %s" % (r.get("state", ""), r.get("result", ""))
+                c[k] = c.get(k, 0) + 1
+            return c
+        a, b = counts(ta), counts(tb)
+        out.append(block("tasks by state and result (this report · other report)", "awk … foreman_tasks_tasks (both reports)",
+                         ["%-28s %9s %9s" % ("", "this", "other")] + ["%-28s %9s %9s" % (k, fmt_n(a.get(k, 0)), fmt_n(b.get(k, 0))) for k in sorted(set(a) | set(b))],
+                         [], approx=True, note="each report holds the tasks of its own collection window"))
+    return {"num": "21", "id": "diff", "title": "Differences from %s" % other_name, "blocks": out, "na": False}
+
+
+TIMELINE_DAYS = 7
+
+
+def report_timeline(t, ctx, days=TIMELINE_DAYS):
+    """Per hour, for the days before collection: how many lines of each kind the report holds. Counts and recorded
+    events only (error lines, 5xx responses, tasks, OOM kills, installer runs, package transactions, reboots).
+    Log times are the host's local time; task times (UTC in the database) are shifted by the offset sos recorded."""
+    # whole calendar days, the collection day last (its hours after the collection stay empty)
+    end = ref_time(ctx).replace(hour=0, minute=0, second=0, microsecond=0) + datetime.timedelta(days=1)
+    start = end - datetime.timedelta(days=days)
+    nb = days * 24
+    ref = ref_time(ctx)
+    lanes = []
+
+    def lane(label, cands, lits, pat, q=None, largest=False, kind="count"):
+        """lits: literal strings one of which every matching line contains (found with str.find, fast);
+        pat: the regex the line must then match."""
+        text, rel = t.read(cands, tail=True, limit=LOG_READ, largest=largest)
+        if text is None:
+            return
+        starts = set()
+        for lit in lits:
+            pos = text.find(lit)
+            while pos >= 0:
+                ls = text.rfind("\n", 0, pos) + 1
+                starts.add(ls)
+                le = text.find("\n", pos)
+                pos = text.find(lit, le if le >= 0 else len(text))
+        rx = re.compile(pat)
+        bins, total, seen = {}, 0, {}
+        for ls in starts:
+            le = text.find("\n", ls)
+            l = text[ls:le if le >= 0 else len(text)]
+            if not rx.search(l):
+                continue
+            key = l[:19]                       # lines logged in the same second share a time: parse it once
+            if key in seen:
+                w = seen[key]
+            else:
+                w = seen[key] = parse_when(l[:100], ref)
+            if w is None or w < start or w >= end:
+                continue
+            k = int((w - start).total_seconds() // 3600)
+            bins[k] = bins.get(k, 0) + 1
+            total += 1
+        lanes.append({"label": label, "src": rel, "q": q if q is not None else pat, "kind": kind, "bins": bins, "total": total})
+
+    lane("production.log error lines", PROD, ["[E|", "ERROR", "FATAL"], r"\[E\||\bERROR\b|\bFATAL\b")
+    lane("proxy.log error lines", PROXY_LOG, ["[E]", "[F]", "ERROR", "FATAL"], r"\[[EF]\]|\bERROR\b|\bFATAL\b")
+    lane("candlepin.log ERROR lines", ["var/log/candlepin/candlepin.log"], [" ERROR "], r" ERROR ")
+    lane("pulpcore error lines", JOURNAL, ["pulpcore"], r"pulpcore.*(?:\bERROR\b|\w+Error\b|Exception\b)", largest=True)
+    lane("httpd 5xx responses", ACCESS, ['" 5'], r'" 5\d\d ', q=r'" 5[0-9]{2} ')
+    lane("out-of-memory kills", LOGS, ["Out of memory", "oom-kill:"], r"Out of memory|oom-kill:", largest=True, kind="event")
+    lane("units that failed", LOGS, ["Failed with result", "entered failed state"], r"Failed with result|entered failed state", largest=True, kind="event")
+    lane("installer runs", INSTALLER, ["Running installer with args"], r"Running installer with args", kind="event")
+    lane("package transactions", ["var/log/dnf.rpm.log", "var/log/yum.log"], ["Install", "Upgrade", "Erase", "Updated"],
+         r"\b(?:Install|Upgrade|Erase|Installed|Updated|Erased|Upgraded)\b", kind="event")
+    # configuration files: a row only on reports that kept the change times and have changes
+    cc = conf_changes(t, ctx)
+    if cc and cc["kept"] and cc["rows"]:
+        bins, total = {}, 0
+        for m, _, _, _ in cc["rows"]:
+            w = _EPOCH + datetime.timedelta(seconds=m, minutes=cc["off"] or 0)
+            if start <= w < end:
+                k = int((w - start).total_seconds() // 3600)
+                bins[k] = bins.get(k, 0) + 1
+                total += 1
+        lanes.append({"label": "configuration files changed", "src": "etc/", "q": None, "kind": "event", "bins": bins, "total": total,
+                      "blk": "configuration files changed in"})          # an hour of this row goes to that block in the Report
+    # tasks: started, and ended with error or warning (database times are UTC)
+    rows, kind, rel, _ = task_rows(t)
+    if rows is not None and kind in ("csv", "pipe"):
+        shift = datetime.timedelta(minutes=ctx.get("utc_offset") or 0)
+        for label, col, pick in (("tasks started", "started_at", lambda r: True),
+                                 ("tasks ended in error or warning", "ended_at", lambda r: (r.get("result") or "") in ("error", "warning"))):
+            bins, total = {}, 0
+            for r in rows:
+                if not pick(r):
+                    continue
+                w = parse_when((r.get(col) or "")[:19])
+                if w is None:
+                    continue
+                w += shift
+                if start <= w < end:
+                    k = int((w - start).total_seconds() // 3600)
+                    bins[k] = bins.get(k, 0) + 1
+                    total += 1
+            lanes.append({"label": label, "src": rel, "q": None, "kind": "count", "bins": bins, "total": total,
+                          "task": "started" if col == "started_at" else "ended"})
+    # reboots: the start of each boot in the journal's boot list
+    bt, brel = t.read(BOOTS)
+    if bt:
+        bins, total = {}, 0
+        for l in bt.splitlines():
+            m = re.search(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", l)
+            w = parse_when(m.group(1)) if m else None
+            if w and start <= w < end:
+                k = int((w - start).total_seconds() // 3600)
+                bins[k] = bins.get(k, 0) + 1
+                total += 1
+        lanes.append({"label": "boots", "src": brel, "q": None, "kind": "event", "bins": bins, "total": total})
+    return {"start": start.strftime("%Y-%m-%d %H:%M"), "end": end.strftime("%Y-%m-%d %H:%M"), "hours": nb, "lanes": lanes,
+            "collected": int((ref - start).total_seconds() // 3600) if start <= ref < end else None,
+            "last_day": (end - datetime.timedelta(days=1)).strftime("%Y-%m-%d"),
+            "tz": offset_text(ctx["utc_offset"], ctx.get("tz", "")) if ctx.get("utc_offset") is not None else "",
+            "off": ctx.get("utc_offset") or 0}
+
+
+def timeline_text(tl):
+    """The timeline as text: per lane, lines per day."""
+    if not tl or not tl["lanes"]:
+        return []
+    start = datetime.datetime.strptime(tl["start"], "%Y-%m-%d %H:%M")
+    days = tl["hours"] // 24
+    hdr = "%-34s" % "" + "".join(" %9s" % (start + datetime.timedelta(days=d)).strftime("%a %m-%d") for d in range(days))
+    out = [hdr]
+    for ln in tl["lanes"]:
+        if not ln["total"]:
+            continue
+        per = [sum(n for k, n in ln["bins"].items() if k // 24 == d) for d in range(days)]
+        out.append("%-34s" % ln["label"][:34] + "".join(" %9s" % (fmt_n(n) if n else "·") for n in per))
+    return out
+
+
+def detect(t):
+    ctx = {"hostname": "unknown", "os": "unknown", "rhel_major": None, "role": "rhel", "satellite": None, "kernel": "unknown",
+           "uptime": "unknown", "sos_version": "unknown", "collected": "unknown"}
+    for key, cands in (("hostname", ["hostname", "sos_commands/host/hostname", "etc/hostname"]), ("uptime", ["uptime", "sos_commands/host/uptime", "sos_commands/general/uptime"]),
+                       ("sos_version", ["version.txt"]), ("collected", ["sos_commands/date/date", "sos_commands/host/date", "date"])):
+        tx, _ = t.read(cands)
+        if tx and tx.strip():
+            ctx[key] = tx.strip().splitlines()[0]
+    # sos 4.x: top-level 'date' may be timedatectl ("Local time: Tue 2026-10-20 14:24:54 MDT"); version.txt says "sos report: 4.11.2"
+    ctx["collected"] = re.sub(r"^\s*Local time:\s*", "", ctx["collected"])
+    mv = re.search(r"(\d+\.\d+(?:\.\d+)*)", ctx["sos_version"])
+    if mv:
+        ctx["sos_version"] = mv.group(1)
+    tx, _ = t.read(["etc/redhat-release", "etc/os-release"])
+    if tx:
+        line = tx.strip().splitlines()[0] if tx.strip() else "unknown"
+        m = re.search(r'PRETTY_NAME="([^"]+)"', tx)
+        if m:
+            line = m.group(1)
+        ctx["os"] = line
+        m = re.search(r"release (\d+)", line) or re.search(r"\b(\d+)\.\d+", line)
+        if m:
+            ctx["rhel_major"] = int(m.group(1))
+    tx, _ = t.read(["uname", "sos_commands/kernel/uname_-a"])
+    if tx and len(tx.split()) >= 3:
+        ctx["kernel"] = tx.split()[2]
+    # a reference date for year-less log lines when the collection time is missing: the date in the report's name
+    mname = re.search(r"-(\d{4}-\d\d-\d\d)-", os.path.basename(t.root))
+    if mname:
+        ctx["ref"] = mname.group(1) + " 23:59:59"
+    elif t.exists("version.txt"):
+        ctx["ref"] = datetime.datetime.fromtimestamp(os.path.getmtime(os.path.join(t.root, "version.txt"))).strftime("%Y-%m-%d %H:%M:%S")
+    rpms = t.read(["installed-rpms"], limit=16 * 1024 * 1024)[0] or ""
+    m = re.search(r"^satellite-(\d+\.\d+(?:\.\d+)?)", rpms, re.M)
+    mc = re.search(r"^satellite-capsule-(\d+\.\d+(?:\.\d+)?)", rpms, re.M)
+    mf = re.search(r"^(foreman-\d[\w.-]*)", rpms, re.M)
+    mp = re.search(r"^(foreman-proxy-\d[\w.-]*)", rpms, re.M)
+    if m:
+        ctx.update(role="satellite", satellite=m.group(1), role_why="satellite-%s rpm" % m.group(1))
+    elif mc:
+        ctx.update(role="capsule", satellite=mc.group(1), role_why="satellite-capsule-%s rpm" % mc.group(1))
+    elif mf:
+        ctx.update(role="satellite", role_why="%s rpm" % mf.group(1))
+    elif mp:
+        ctx.update(role="capsule", role_why="%s rpm" % mp.group(1))
+    elif not rpms and (t.exists("etc/foreman-installer/scenarios.d/satellite.yaml") or t.listdir("sos_commands/foreman")):
+        ctx.update(role="satellite", role_why="no installed-rpms; etc/foreman-installer/scenarios.d/satellite.yaml or sos_commands/foreman/ is present")
+    elif not rpms and (t.exists("etc/foreman-installer/scenarios.d/capsule.yaml") or t.exists("etc/foreman-proxy/settings.yml")):
+        ctx.update(role="capsule", role_why="no installed-rpms; etc/foreman-installer/scenarios.d/capsule.yaml or etc/foreman-proxy/settings.yml is present")
+    else:
+        ctx["role_why"] = "no satellite, capsule, foreman or foreman-proxy rpm" if rpms else "installed-rpms is not in this sosreport"
+    # the window the main log covers
+    ref = ref_time(ctx)
+    head, hrel = t.read(LOGS, limit=64 * 1024, largest=True)
+    if head and ref:
+        first = next((x for x in (parse_when(l, ref) for l in head.splitlines()[:200]) if x), None)
+        tl, _ = t.read([hrel], tail=True, limit=64 * 1024)
+        last = next((x for x in (parse_when(l, ref) for l in reversed((tl or "").splitlines()[-200:])) if x), None)
+        whole, _ = t.read([hrel], tail=True, limit=LOG_READ)
+        js = _JOURNAL_SPAN.search(head) or _JOURNAL_SPAN.search(tl or "")     # older journalctl prints its own span, with years
+        ys = syslog_years(whole or "", ref)
+        if js and parse_when(js.group(1)) and parse_when(js.group(2)):
+            first, last = parse_when(js.group(1)), parse_when(js.group(2))
+        elif ys and t.size(hrel) <= LOG_READ:
+            first, last = ys[0], ys[1]
+        if first and last:
+            fmt = "%b %d %H:%M" if first.year == last.year else "%Y-%m-%d %H:%M"
+            ctx["log_window"] = "%s covers %s → %s" % (hrel.split("/")[-1], first.strftime(fmt), last.strftime(fmt))
+    t.ref = ref
+    t._cache.clear()
+    del t._cache_order[:]
+    ctx.update(utc_offset(t))
+    rc, _ = t.read(["etc/rhsm/rhsm.conf"])
+    if rc is not None:                      # where the host registers: the hosted service is the built-in default
+        ctx["rhsm_host"] = (_rhsm_conf(rc).get("server", {}).get("hostname") or "subscription.rhsm.redhat.com").strip()
+    ctx["files"] = len(t.files())
+    return ctx
+
+
+def utc_offset(t):
+    """The host's offset from UTC when the report was collected, from the two clocks sos records: timedatectl's
+    'Local time' and 'Universal time', or date and date --utc. Task times in the database are UTC; logs are local."""
+    loc = utc = None
+    tz = ""
+    for cands in (["date", "sos_commands/date/timedatectl", "sos_commands/systemd/timedatectl"],):
+        tx, _ = t.read(cands)
+        if tx:
+            ml = re.search(r"Local time:\s*(.+)", tx)
+            mu = re.search(r"Universal time:\s*(.+)", tx)
+            if ml and mu:
+                loc, utc = parse_when(re.sub(r"^\w{3}\s+", "", ml.group(1))), parse_when(re.sub(r"^\w{3}\s+", "", mu.group(1)))
+                mz = re.search(r"\d\d:\d\d:\d\d\s+([A-Z][A-Za-z0-9+-]{1,6})\b", ml.group(1))
+                tz = mz.group(1) if mz else ""
+    if not (loc and utc):
+        a, _ = t.read(["sos_commands/date/date", "sos_commands/host/date"])
+        b, _ = t.read(["sos_commands/date/date_--utc", "sos_commands/date/date_-u"])
+        if a and b:
+            loc, utc = parse_when(a.strip()), parse_when(b.strip())
+            mz = re.search(r"\d\d:\d\d:\d\d\s+([A-Z][A-Za-z0-9+-]{1,6})\s+\d{4}", a)
+            tz = mz.group(1) if mz else ""
+    if not (loc and utc):
+        return {}
+    mins = int(round((loc - utc).total_seconds() / 60.0 / 15.0)) * 15
+    if abs(mins) > 14 * 60:
+        return {}
+    return {"utc_offset": mins, "tz": tz}
+
+
+def offset_text(mins, tz=""):
+    sign = "+" if mins >= 0 else "-"
+    return "%sUTC%s%d%s" % ((tz + ", ") if tz and tz != "UTC" else "", sign, abs(mins) // 60, (":%02d" % (abs(mins) % 60)) if mins % 60 else "")
+
+
+# ---- packages: what the report records about each installed package, for the lines that name one ----
+PKG_DATA = ["sos_commands/rpm/package-data"]
+PKG_LIST = ["sos_commands/dnf/dnf_list_installed", "sos_commands/yum/yum_list_installed"]
+PKG_EXTRAS = ["sos_commands/dnf/dnf_list_extras", "sos_commands/yum/yum_list_extras"]
+_PKG_EL = re.compile(r"(?:^|[.+_])el(\d+)(?:[._](\d+))?([a-z]*)")
+_PKG_SUFFIX = {"sat": "Satellite", "pc": "Pulp", "sat6": "Satellite", "ost": "OpenStack", "ap": "Ansible Automation Platform"}
+_INSTALLONLY = re.compile(r"^(kernel|gpg-pubkey)(-|$)")
+
+
+def _pkg_key(name, arch, evr):
+    return "%s-%s.%s" % (name, evr.split(":", 1)[-1], arch)
+
+
+def package_index(t, ctx):
+    """{nvra: facts} for every installed package: install time, vendor, build host and signing key from package-data,
+    the repository it came from (dnf/yum list installed), whether it is in an enabled repository (list extras), the
+    RHEL release and architecture it was built for, and the facts that set it apart (tags). Cached on the tree."""
+    if getattr(t, "_pkgs", None) is not None:
+        return t._pkgs
+    idx, names = {}, {}
+    text, _ = t.read(PKG_DATA, limit=32 * 1024 * 1024)
+    for l in (text or "").splitlines():
+        f = l.split("\t")
+        if len(f) < 5 or not _NVRA.match(f[0]):
+            continue
+        key = re.search(r"Key ID ([0-9a-f]{8,16})", f[6]) if len(f) > 6 else None
+        idx[f[0]] = {"when": f[1].strip(), "vendor": f[3].strip(), "host": f[4].strip(), "key": key.group(1) if key else ""}
+    text, _ = t.read(["installed-rpms"], limit=16 * 1024 * 1024)
+    for l in (text or "").splitlines():
+        p = l.split(None, 1)
+        if p and _NVRA.match(p[0]):
+            e = idx.setdefault(p[0], {"when": p[1].strip() if len(p) > 1 else "", "vendor": None, "host": "", "key": ""})
+            e["when"] = e["when"] or (p[1].strip() if len(p) > 1 else "")
+    if not idx:
+        t._pkgs = {}
+        return t._pkgs
+    # where each one came from: 'name.arch  [epoch:]version-release  @repo' (dnf wraps a long name onto its own line)
+    text, _ = t.read(PKG_LIST, limit=16 * 1024 * 1024)
+    repo, pend = {}, None
+    for l in (text or "").splitlines():
+        p = l.split()
+        if pend and len(p) == 2 and l[:1].isspace():
+            p, pend = [pend] + p, None
+        if len(p) == 1 and "." in p[0] and not l[:1].isspace():
+            pend = p[0]
+            continue
+        pend = None
+        if len(p) >= 3 and p[2].startswith("@") and "." in p[0]:
+            n, _, a = p[0].rpartition(".")
+            repo[_pkg_key(n, a, p[1])] = p[2].lstrip("@")
+    text, _ = t.read(PKG_EXTRAS, limit=4 * 1024 * 1024)
+    extras = set()
+    if text and "Extra Packages" in text and not re.search(r"^Error:", text, re.M):
+        for l in text.split("Extra Packages", 1)[1].splitlines():
+            p = l.split()
+            if len(p) >= 2 and "." in p[0]:
+                n, _, a = p[0].rpartition(".")
+                extras.add(_pkg_key(n, a, p[1]))
+    # the package transactions, to name the last one that began before a package was installed
+    trans = []
+    text, _ = t.read(HISTORY)
+    for l in (text or "").splitlines():
+        m = _HIST_ROW.match(l)
+        w = parse_when(m.group(3)) if m else None
+        if w:
+            trans.append((w, m.group(1)))
+    trans.sort()
+    host_major = ctx.get("rhel_major")
+    host_arch = (ctx.get("kernel") or "").rsplit(".", 1)[-1] if "." in (ctx.get("kernel") or "") else ""
+    ref = ref_time(ctx)
+    for nvra, e in idx.items():
+        n, v, r, a = _NVRA.match(nvra).groups()
+        e.update(name=n, arch=a, release=r)
+        names.setdefault((n, a), []).append(nvra)
+    archs = {}
+    for (n, a) in names:
+        archs.setdefault(n, set()).add(a)
+    for nvra, e in idx.items():
+        n, a, r = e["name"], e["arch"], e["release"]
+        tags, row = [], []
+        w = parse_when(e["when"]) if e["when"] else None
+        if w:
+            age = (ref - w).days if ref else None
+            row.append(["installed", w.strftime("%Y-%m-%d %H:%M") + ((" · %s before the report" % (plural(age // 365, "year") if age >= 730 else plural(age, "day"))) if age and age > 0 else "")])
+            before = [x for x in trans if x[0].replace(second=0) <= w]
+            if before and (w - before[-1][0]).total_seconds() <= 3 * 3600:      # a transaction runs minutes, not days
+                row.append(["last transaction begun before it", "%s at %s" % (before[-1][1], before[-1][0].strftime("%Y-%m-%d %H:%M"))])
+        if nvra in repo:
+            src = repo[nvra]
+            row.append(["from", {"commandline": "a local file (installed from the command line)", "System": "not recorded (System)",
+                                 "anaconda": "the OS installation (anaconda)"}.get(src, "repository " + src)])
+        if nvra in extras:
+            row.append(["in an enabled repository", "no (dnf list extras)"])
+        vend = e["vendor"]
+        if vend is not None:
+            row.append(["vendor", vend if vend not in ("", "(none)", "None") else "(none)"])
+            if not n.startswith("gpg-pubkey"):
+                if vend in ("", "(none)", "None"):
+                    tags.append(["no vendor", "n"])
+                elif "Red Hat" not in vend:
+                    tags.append(["other vendor", "n"])
+        el = _PKG_EL.search(r)
+        if el:
+            major, minor, suf = el.groups()
+            row.append(["built for", "RHEL %s%s%s" % (major, ("." + minor) if minor else "", (" · " + _PKG_SUFFIX.get(suf, "el%s%s" % (major, suf))) if suf else "")])
+            if host_major and int(major) != int(host_major):
+                tags.append(["el%s on RHEL %s" % (major, host_major), "r"])
+        elif not n.startswith("gpg-pubkey"):
+            row.append(["built for", "no RHEL release in its name"])
+        row.append(["architecture", a])
+        if a == "i686" and "x86_64" in archs.get(n, ()) or a == "x86_64" and "i686" in archs.get(n, ()):
+            tags.append(["i686 + x86_64", "n"])
+        elif host_arch and a not in ("noarch", host_arch, "i686", "i386") and not n.startswith("gpg-pubkey"):
+            tags.append(["%s on %s" % (a, host_arch), "r"])
+        same = names.get((n, a), [])
+        if len(same) > 1 and not _INSTALLONLY.match(n):
+            tags.append(["%d versions" % len(same), "r"])
+            row.append(["also installed", ", ".join(x for x in same if x != nvra)])
+        if e["host"]:
+            row.append(["built on", e["host"]])
+        if e["key"]:
+            row.append(["signature", "key %s" % e["key"]])
+        e["tags"], e["row"] = tags, row
+    t._pkgs = idx
+    return idx
+
+
+def annotate_packages(t, ctx, secs):
+    """Mark the output lines that start with an installed package: b['pk'] = per line None or [nvra, tags];
+    ctx['pkinfo'] = {nvra: details} for those packages only. The lines themselves are not changed."""
+    idx = package_index(t, ctx)
+    info = {}
+    if not idx:
+        return
+    for s in secs:
+        for b in s.get("blocks", []):
+            if b.get("state") != "ok" or not b.get("lines"):
+                continue
+            vendors = b["title"].startswith("packages from other vendors")
+            pk, hit = [], False
+            for l in b["lines"]:
+                tok = l.split(None, 1)[0] if l.strip() else ""
+                e = idx.get(tok)
+                if e is None:
+                    pk.append(None)
+                    continue
+                hit = True
+                tags = [x for x in e["tags"] if not (vendors and x[0] in ("other vendor", "no vendor"))]
+                pk.append([tok, tags])
+                info[tok] = e["row"]
+            if hit:
+                b["pk"] = pk
+    ctx["pkinfo"] = info
+# ---- tasks: from the sosreport, or from a task export ----------------------------------
+
+def _nul(v):
+    v = (v or "").strip()
+    return "" if v in ("\\N", "NULL", "null") else v
+
+
+def task_steps(t, plans, per_plan=40):
+    """Dynflow steps, in order, for the given execution plans: [id, action class, state, started, error text]."""
+    rows, kind, rel, _ = t.table(STEPS, limit=64 * 1024 * 1024, tail=True, keep=STEP_COLS)
+    if rows is None or not plans:
+        return {}, rel
+    if kind not in ("csv", "pipe"):
+        return {}, rel
+    out = {}
+    for r in rows:
+        plan = r.get("execution_plan_uuid") or ""
+        if plan not in plans:
+            continue
+        lst = out.setdefault(plan, [])
+        if len(lst) >= per_plan:
+            continue
+        cls = (_nul(r.get("action_class")) or _nul(r.get("class"))).replace("Actions::", "")
+        err = _plain_error(_nul(r.get("error")))
+        lst.append([_nul(r.get("id")), cls, _nul(r.get("state")), _nul(r.get("started_at"))[:19], error_text(err, keep=True)[:240] if err else "", r["_ln"]])
+    for plan in out:
+        out[plan].sort(key=lambda x: int(x[0]) if x[0].isdigit() else 0)
+    return out, rel
+
+
+SUBTASK_FAILED = re.compile(r"A sub task failed|SubtaskFailedException")
+
+
+def _bad(r):
+    return (r.get("result") or "") in ("error", "warning")
+
+
+def sub_failures(rows, cap=5):
+    """For each task with failed sub-tasks: what those sub-tasks say, followed down through a sub-task that itself only
+    says that a sub-task failed. Sets r['subfail'] = [[first line of the error, failed sub-tasks with it, their ids (up to cap)], …],
+    most common first. Returns the number of tasks it was set on."""
+    kids = {}
+    for r in rows:
+        if r.get("parent"):
+            kids.setdefault(r["parent"], []).append(r)
+
+    def leaves(r, depth):
+        out = []
+        for c in kids.get(r["id"], []):
+            if not _bad(c):
+                continue
+            own = c.get("eraw") or c.get("error") or ""
+            if depth < 8 and kids.get(c["id"]) and (not own or SUBTASK_FAILED.search(own)):
+                sub = leaves(c, depth + 1)
+                if sub:
+                    out.extend(sub)
+                    continue
+            out.append(((c.get("error") or "").split("\n")[0][:240] or "(no error text recorded)", c["id"]))
+        return out
+    n = 0
+    for r in rows:
+        if r["id"] in kids:
+            ls = leaves(r, 0)
+            if ls:
+                agg = {}
+                for e, i in ls:
+                    agg.setdefault(e, []).append(i)
+                r["subfail"] = sorted([[e, len(ids), ids[:cap]] for e, ids in agg.items()], key=lambda x: -x[1])
+                n += 1
+    return n
+
+
+def tasks_from_sos(t, cap=20000, step_cap=3000):
+    rows, kind, rel, hdr = task_rows(t)
+    if rows is None or kind not in ("csv", "pipe"):
+        return None
+    by_plan, _, _ = step_errors(t)
+    by_plan = by_plan or {}
+    rows = sorted(rows, key=lambda r: r.get("started_at") or "", reverse=True)[:cap]
+    out = []
+    for r in rows:
+        out.append({"id": r.get("id", ""), "label": (r.get("label") or r.get("type") or "").replace("Actions::", ""),
+                    "state": r.get("state", ""), "result": r.get("result", ""), "started": _nul(r.get("started_at"))[:19],
+                    "ended": _nul(r.get("ended_at"))[:19], "error": by_plan.get(r.get("external_id") or "", ""), "src": rel, "ln": r["_ln"],
+                    "parent": _nul(r.get("parent_task_id")), "ext": _nul(r.get("external_id"))})
+        if _nul(r.get("action")):               # the task's own name: "Synchronize repository '…'; product '…'"
+            out[-1]["act"] = _nul(r.get("action"))[:300]
+        raw = getattr(t, "_raw_errors", {}).get(r.get("external_id") or "")
+        if raw:
+            out[-1]["eraw"] = raw
+    reqs = plan_request_ids(t)
+    for x in out:
+        if reqs.get(x["ext"]):
+            x["req"] = reqs[x["ext"]]
+    sub_failures(out)
+    want = set(x["ext"] for x in out if x["ext"] and x["result"] != "success")
+    want = set(list(want)[:step_cap])
+    steps, srel = task_steps(t, want)
+    return {"source": "sosreport", "name": rel, "rows": out, "steps": steps, "steps_src": srel,
+            "note": "from the sosreport (%s); error text joined from dynflow_steps where the execution plan matches" % rel}
+
+
+class _Text(object):
+    """HTML to text with a newline at every block element. Standard library only."""
+
+    def __init__(self):
+        from html.parser import HTMLParser
+        outer = self
+
+        class P(HTMLParser):
+            def handle_starttag(self, tag, attrs):
+                if tag in ("p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "dt", "dd", "pre", "table", "section"):
+                    outer.parts.append("\n")
+                if tag in ("td", "th"):
+                    outer.parts.append(" ")
+
+            def handle_endtag(self, tag):
+                if tag in ("p", "div", "tr", "li", "h1", "h2", "h3", "h4", "dd", "pre", "table"):
+                    outer.parts.append("\n")
+
+            def handle_data(self, data):
+                outer.parts.append(data)
+        self.parts = []
+        self.p = P(convert_charrefs=True)
+
+    def text(self, html_src):
+        self.parts = []
+        self.p.feed(html_src)
+        self.p.close()
+        return "".join(self.parts)
+
+
+# A task export (foreman-rake foreman_tasks:export_tasks) holds index.html, one row per task, and one page per task named
+# by the task id. Each page is Dynflow's own view of the execution plan: Id (of the plan), Label, Status, Result, Started
+# at, Ended at, then the plan, run and finalize phases with every step's times, input, output and error, and the history.
+_EXP_ROW = re.compile(r'<tr>\s*<td><a href="([^"]+)">([^<]*)</a></td>\s*<td>([^<]*)</td>\s*<td>([^<]*)</td>\s*<td>([^<]*)</td>\s*<td>([^<]*)</td>', re.S)
+_EXP_HEAD = re.compile(r"<b>(Id|Label|Status|Result|Started at|Ended at|Start at|Start before):</b>\s*([^<]*?)\s*<", re.S)
+_EXP_ERR = re.compile(r"<b>Error:</b>\s*</p>\s*<p>\s*(.*?)\s*</p>\s*<p>\s*(.*?)\s*</p>(?:\s*<p>\s*<pre[^>]*>(.*?)</pre>)?", re.S)
+_EXP_PANE = re.compile(r'<div class="tab-pane(?: active)?" id="(plan|run|finalize|execution-history)">')
+_EXP_STEP = re.compile(r'<span class="step-label">\s*(\d+):\s*([^\n<]+?)\s*\n\s*\(([^)]*)\)(?:\s*\[\s*([\d.]+)s\s*/\s*([\d.]+)s\s*\])?', re.S)
+_EXP_PSTEP = re.compile(r'<p class="step-label">\s*<span class="label label-(\w+)">([^<]*)</span>', re.S)
+
+
+def _exp_time(v):
+    """'2026-11-06 00:01:12 UTC' -> '2026-11-06 00:01:12' (the export writes UTC)."""
+    m = re.match(r"\s*(\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d)", v or "")
+    return m.group(1).replace("T", " ") if m else ""
+
+
+def _exp_field(block, name):
+    m = re.search(r"<b>%s:?</b>\s*([^<]*?)\s*<" % re.escape(name), block, re.S)
+    return m.group(1).strip() if m else ""
+
+
+def _exp_pre(block, name):
+    m = re.search(r"<b>%s:</b>\s*<pre[^>]*>(.*?)</pre>" % re.escape(name), block, re.S)
+    v = m.group(1).strip() if m else ""
+    return "" if v in ("---", "--- {}", "--- []", "--- \n...", "---\n...") else re.sub(r"^---\s*\n?", "", v)
+
+
+def _exp_error(block):
+    m = _EXP_ERR.search(block)
+    if not m:                                   # a plan-phase step prints its error as one block: message (Class), then the backtrace
+        p = re.search(r"<pre>(.*?)</pre>", block, re.S)
+        if not p:
+            return None
+        lines = p.group(1).strip().splitlines()
+        k = next((i for i, l in enumerate(lines) if re.match(r"^\s*(/|\S+\.rb:\d+)", l)), len(lines))
+        msg = "\n".join(lines[:k]).strip()
+        c = re.search(r"\s*\(([A-Z][\w:]*)\)\s*$", msg)
+        return {"cls": c.group(1) if c else "", "msg": (msg[:c.start()] if c else msg)[:4000], "bt": [l.strip() for l in lines[k:k + 200]]}
+    bt = [re.sub(r"\s*\n\s*", " ", x).strip().strip('"') for x in re.split(r"(?m)^- ", re.sub(r"^---\s*\n?", "", (m.group(3) or "").strip())) if x.strip()]
+    return {"cls": re.sub(r"\s+", " ", m.group(1)).strip(), "msg": m.group(2).strip()[:4000], "bt": bt[:200]}
+
+
+def _yaml_paths(text):
+    """(dotted path, scalar) for the 'key: value' lines of a YAML dump, parents taken from the indentation; list items
+    count as one level. Enough to find names and ids by their key; it does not rebuild the document."""
+    stack = []                                   # (indent, key)
+    for l in text.splitlines():
+        m = re.match(r"^(\s*)((?:- )*)(?::?([\"']?)([A-Za-z_][\w .\-/]*?)\3):(?:\s+(.*))?$", l)
+        if not m:
+            continue
+        ind = len(m.group(1)) + len(m.group(2))
+        while stack and stack[-1][0] >= ind:
+            stack.pop()
+        key, val = m.group(4), (m.group(5) or "").strip()
+        if val in ("", "|", "|-", ">", ">-"):
+            stack.append((ind, key))
+            if not m.group(2):
+                continue
+            val = ""
+        if val not in ("", "{}", "[]", "~", "null"):
+            yield ".".join([k for _, k in stack] + [key]), val.strip("\"'"), bool(m.group(2))
+
+
+def _exp_facts(actions):
+    """The same facts and Pulp tasks the sosreport view shows, from the YAML an export page prints for input and output."""
+    facts, pulp, cur, steps = [], {}, None, {}
+    for a in actions:
+        for part in ("input", "output"):
+            for path, v, first in _yaml_paths(a.get(part) or ""):
+                for lbl, rx in FACT_KEYS:
+                    if re.search(rx, path):
+                        if (lbl, v[:300]) not in facts:
+                            facts.append((lbl, v[:300]))
+                        break
+                if "/pulp/api/v3/tasks/" in v and UUID_RX.search(v):
+                    cur = UUID_RX.search(v).group(0) if path.endswith("pulp_href") else cur
+                    pulp.setdefault(UUID_RX.search(v).group(0), {"href": v})
+                elif cur and "pulp_tasks" in path:
+                    k = re.sub(r"^.*pulp_tasks\.", "", path)
+                    if k in ("state", "name", "started_at", "finished_at", "error.description", "error.traceback"):
+                        pulp[cur].setdefault(k, v[:2000])
+                    elif k.startswith("progress_reports.") and k[17:] in ("message", "code", "state", "total", "done") and part == "output":
+                        st = steps.setdefault(cur, [])
+                        if first or not st:                 # '- message: …' starts the next step
+                            st.append({})
+                        st[-1].setdefault(k[17:], v[:300])
+        for k, st in steps.items():                         # the first action that has a Pulp task's steps wins
+            if st and k in pulp:
+                pulp[k].setdefault("steps", st[:40])
+        steps.clear()
+    return facts, pulp
+
+
+_EXPORT_DIRS = {}
+
+
+def _export_dir(root):
+    """The folder that holds index.html (the archive wraps it in tmp/task-export…/)."""
+    if root not in _EXPORT_DIRS:
+        _EXPORT_DIRS[root] = next((os.path.dirname(rel) for rel, _, _ in list_tree(root, limit=200000) if os.path.basename(rel) == "index.html"), "")
+    return _EXPORT_DIRS[root]
+
+
+def load_task_export(path):
+    """(tasks, extracted root or None, temporary folder or None) for an export given as an archive, a folder or a CSV file."""
+    if path.lower().endswith(".csv") and os.path.isfile(path):
+        return tasks_from_csv(path), None, None
+    et, etmp = open_input(path)
+    if find_sos_root(et) and not _export_has_tasks(et):     # whatever its name: a sosreport is never read as a task export
+        if etmp:
+            shutil.rmtree(etmp, ignore_errors=True)
+        raise RuntimeError("%s is a sosreport, not a task export. To compare two reports use --pair (a Satellite and its Capsule) or --diff (one host, two dates)." % path)
+    return tasks_from_export(et, name=os.path.basename(path)), et, etmp
+
+
+def _export_has_tasks(root):
+    """True when the folder holds an export's task list (index.html with task pages beside it)."""
+    base = os.path.join(root, _export_dir(root))
+    return os.path.isfile(os.path.join(base, "index.html")) and bool(_EXP_ROW.search(open(os.path.join(base, "index.html"), "r", errors="replace").read(400000)))
+
+
+def export_page_head(text):
+    """{label: value} from the top of a task page, where each value sits on the line after its label."""
+    cut = text.find('<ul class="phases')
+    return dict((k, v.strip()) for k, v in _EXP_HEAD.findall(text[:cut] if cut > 0 else text[:6000]))
+
+
+_EXP_YAML = re.compile(r'<pre class="prettyprint lang-yaml">(.*?)</pre>', re.S)
+_ID_PAIR = re.compile(r"\b(\w+_id: \d+)")
+
+
+def _exp_sub_facts(page):
+    """What a page says that ties a sub-task to its parent, which an export does not record: the request, the Capsule or
+    host ids, the 'name_id: N' pairs; and for a parent, the sub-task type, targets and ids it started and how many failed."""
+    m = re.search(r"current_request_id: (\S+)", page)
+    f = {"req": m.group(1) if m else "",
+         "tid": set(re.findall(r"(?:smart_proxy_id|host_id): (\d+)", page)) | set(re.findall(r"\n(?:smart_proxy|host):\n\s+id: (\d+)", page)),
+         "kv": set(_ID_PAIR.findall(page))}
+    for pre in _EXP_YAML.findall(page):
+        if "bulk" not in f and "action_class:" in pre and "target_ids:" in pre:
+            am = re.search(r"action_class: (\S+)", pre)
+            if not am:                       # the key with no value
+                continue
+            ac = am.group(1).replace("Actions::", "")
+            tg = re.findall(r"^- (\d+)$", pre.split("target_ids:", 1)[1].split("target_class", 1)[0], re.M)
+            args = pre.split("\nargs:", 1)[1].split("\nkwargs:", 1)[0] if "\nargs:" in pre else ""
+            f["bulk"] = {"ac": ac, "tg": set(tg), "ids": set(_ID_PAIR.findall(args))}
+        if "failed" not in f and "failed_count:" in pre:
+            a, b = re.search(r"failed_count: (\d+)", pre), re.search(r"total_count: (\d+)", pre)
+            f["failed"], f["total"] = int(a.group(1)), (int(b.group(1)) if b else None)
+    return f
+
+
+def link_export_subtasks(rows, facts):
+    """An export page does not say which task started which. A parent's own page says what it started: the sub-task type,
+    the Capsules or hosts, the ids, and how many of them failed. A failed task is linked to that parent when it is of that
+    type, names one of those targets and every one of those ids, and started inside the parent's run; and only when the
+    number found is the number the parent itself counts as failed (when more are found, the same request id must match too).
+    A task that fits two parents is linked to neither. Returns the number of parents linked."""
+    when = lambda s: _parse_ts(s)
+    cand, why = {}, {}
+    lead = "An export does not record which task started which. "
+    for p in rows:
+        if not SUBTASK_FAILED.search(p.get("eraw") or p.get("error") or ""):
+            continue
+        fp = facts.get(p["id"])
+        lo, hi = when(p["started"]), when(p["ended"] or p["started"])
+        if not fp or "bulk" not in fp or not fp.get("failed") or lo is None:
+            why[p["id"]] = (lead + "This task's page does not name the sub-tasks it started%s, so there is nothing to match them by. "
+                            "Failed tasks that started during its run (%s to %s UTC) are in the task list."
+                            % ("" if not fp or "bulk" not in fp else " or how many failed", p["started"] or "?", p["ended"] or "?"), [])
+            continue
+        b = fp["bulk"]
+        lo, hi = lo - datetime.timedelta(seconds=5), (hi or lo) + datetime.timedelta(seconds=5)
+        inwin = [r for r in rows if r is not p and r["label"] == b["ac"] and when(r["started"]) is not None and lo <= when(r["started"]) <= hi]
+        badwin = [r for r in inwin if _bad(r)]
+        c = [r for r in badwin if r["id"] in facts and (not b["tg"] or facts[r["id"]]["tid"] & b["tg"]) and b["ids"] <= facts[r["id"]]["kv"]]
+        if len(c) > fp["failed"]:
+            c = [r for r in c if fp["req"] and facts[r["id"]]["req"] == fp["req"]]
+        if len(c) == fp["failed"]:
+            cand[p["id"]] = c
+        else:
+            head = lead + "This task counts %d failed sub-task%s of the type %s. " % (fp["failed"], "" if fp["failed"] == 1 else "s", b["ac"])
+            if not inwin:
+                txt = "No task of that type in this export started during its run."
+            elif not badwin:
+                txt = "%d of that type started during its run, and none of them failed." % len(inwin)
+            elif len(c) < fp["failed"]:
+                txt = ("%d failed task%s of that type started during its run; %d of them name%s the targets and ids in this task's input, "
+                       "which is not the number it counts, so none is shown as its own." % (len(badwin), "" if len(badwin) == 1 else "s", len(c), "s" if len(c) == 1 else ""))
+            else:
+                txt = "More failed tasks of that type fit than it counts, so none is shown as its own."
+            why[p["id"]] = (head + txt, [r["id"] for r in badwin[:12]])
+    owner = {}
+    for pid, c in cand.items():
+        for r in c:
+            owner.setdefault(r["id"], []).append(pid)
+    n = 0
+    for p in rows:
+        c = cand.get(p["id"])
+        if c and any(len(owner[r["id"]]) > 1 for r in c):
+            why[p["id"]] = (lead + "The failed tasks that fit this task also fit another task that ran at the same time, so they are shown under neither.",
+                            [r["id"] for r in c[:12]])
+        if p["id"] in why:
+            p["subnote"], p["subcand"] = why[p["id"]]
+        if not c or any(len(owner[r["id"]]) > 1 for r in c):
+            continue
+        for r in c:
+            r["parent"] = p["id"]
+        fp = facts[p["id"]]
+        p["subhow"] = ("an export does not record which task started which: these %d failed tasks are the %s type, name the %s and the ids (%s) "
+                       "in this task's input, started during its run, and their number is the number of failed sub-tasks this task counts%s"
+                       % (len(c), fp["bulk"]["ac"], "Capsules or hosts" if fp["bulk"]["tg"] else "targets", ", ".join(sorted(fp["bulk"]["ids"])) or "none",
+                          (" (%d of %d)" % (fp["failed"], fp["total"])) if fp.get("total") else ""))
+        n += 1
+    return n
+
+
+def _parse_ts(s):
+    try:
+        return datetime.datetime.strptime((s or "")[:19], "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return None
+
+
+def tasks_from_export(root, cap=200000, name=None):
+    """The task list of an export: one row per line of index.html (label, start, duration, state, result). The pages of
+    the tasks that did not end in success are opened for the plan id and the error; the others are read when opened."""
+    base = _export_dir(root)
+    out, read, facts = [], 0, {}
+    try:
+        with open(os.path.join(root, base, "index.html"), "rb") as fh:
+            index = fh.read(256 * 1024 * 1024).decode("utf-8", "replace")
+    except (OSError, IOError):
+        index = ""
+    rows = _EXP_ROW.findall(index)
+    if not rows:                                 # no index (html-dir cut short, or a few pages copied out): read each page's own header
+        for rel, _, _ in list_tree(root, limit=cap):
+            if rel.endswith(".html") and os.path.basename(rel) != "index.html":
+                rows.append((os.path.relpath(rel, base) if base else rel, None, "", "", "", ""))
+    for href, label, started, dur, state, result in rows[:cap]:
+        rel = os.path.join(base, href) if base else href
+        d = {"id": os.path.splitext(os.path.basename(href))[0], "label": (label or "").replace("Actions::", ""), "state": state.strip(), "result": result.strip(),
+             "started": _exp_time(started), "ended": "", "error": "", "src": "@export/" + rel, "ln": 1, "parent": "", "ext": ""}
+        try:
+            if d["started"] and dur.strip() and d["state"] == "stopped":
+                w = datetime.datetime.strptime(d["started"], "%Y-%m-%d %H:%M:%S") + datetime.timedelta(seconds=float(dur))
+                d["ended"] = w.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+        if label is None or d["result"] != "success" or d["state"] != "stopped":
+            try:
+                with open(os.path.join(root, rel), "rb") as fh:
+                    page = fh.read(32 * 1024 * 1024).decode("utf-8", "replace")
+            except (OSError, IOError):
+                page = ""
+            read += 1
+            hd = export_page_head(page)
+            d["ext"] = hd.get("Id", "")
+            if label is None:
+                d.update(label=hd.get("Label", "").replace("Actions::", ""), state=hd.get("Status", ""), result=hd.get("Result", ""),
+                         started=_exp_time(hd.get("Started at", "")), ended=_exp_time(hd.get("Ended at", "")))
+            elif _exp_time(hd.get("Ended at", "")):
+                d["ended"] = _exp_time(hd["Ended at"])
+            facts[d["id"]] = _exp_sub_facts(page)
+            e = _exp_error(page)
+            if e:
+                raw = ("%s: %s" % (e["cls"], e["msg"])) if e["cls"] and not e["msg"].startswith(e["cls"]) else e["msg"]
+                d["error"] = error_text(raw)
+                d["eraw"] = re.sub(r"\s+", " ", raw)[:600]
+        out.append(d)
+    link_export_subtasks(out, facts)
+    sub_failures(out)
+    return {"source": "export", "name": name or os.path.basename(root), "rows": out,
+            "note": "task export: %s; the pages of the %s that did not end in success were read for their error, the others are read when opened"
+                    % (plural(len(out), "task"), fmt_n(read))}
+
+
+def tasks_from_csv(path, cap=200000, name=None):
+    """The CSV form of an export: id, state, type, label, result, parent_task_id, started_at, ended_at, duration."""
+    import csv
+    out = []
+    with open(path, "r", errors="replace", newline="") as fh:
+        for i, r in enumerate(csv.DictReader(fh)):
+            if i >= cap:
+                break
+            out.append({"id": r.get("id", ""), "label": (r.get("label") or "").replace("Actions::", ""), "state": r.get("state", ""), "result": r.get("result", ""),
+                        "started": _exp_time(r.get("started_at", "")), "ended": _exp_time(r.get("ended_at", "")), "error": "", "src": "", "ln": i + 2,
+                        "parent": r.get("parent_task_id") or "", "ext": ""})
+    sub_failures(out)
+    return {"source": "export", "name": name or os.path.basename(path), "rows": out,
+            "note": "task export in CSV form: %s; a CSV export holds no steps, input, output or error text" % plural(len(out), "task")}
+
+
+def export_task_full(root, task_id, t=None, ctx=None, budget=20.0, io_cap=60000, logs=True):
+    """One task page of an export as the same record the sosreport view shows: the plan, every step with its times,
+    error, input and output, the history, the names and ids in the input and output, and (with a sosreport loaded)
+    the log lines that carry the task's request id."""
+    if not re.match(r"^[\w.-]+$", task_id or ""):
+        return {"error": "not a task id"}
+    base = _export_dir(root)
+    rel = os.path.join(base, task_id + ".html")
+    try:
+        with open(os.path.join(root, rel), "rb") as fh:
+            page = fh.read(64 * 1024 * 1024).decode("utf-8", "replace")
+    except (OSError, IOError):
+        return {"error": "the export has no page for task %s" % task_id}
+    hd = export_page_head(page)
+    src = "@export/" + rel
+    out = {"task": [("id", task_id)], "task_src": src, "task_ln": 1, "notes": [], "encoded": [], "parent": [], "children": [], "siblings": [],
+           "plan_id": hd.get("Id", ""), "steps_src": "", "actions_src": "", "logs": []}
+    info = [(k, hd[h]) for k, h in (("id", "Id"), ("label", "Label"), ("state", "Status"), ("result", "Result"), ("started_at", "Started at"), ("ended_at", "Ended at"),
+                                    ("start_at", "Start at"), ("start_before", "Start before")) if hd.get(h)]
+    panes = [(m.group(1), m.start()) for m in _EXP_PANE.finditer(page)] + [("", len(page))]
+    part = dict((nm, page[a:panes[k + 1][1]]) for k, (nm, a) in enumerate(panes[:-1]))
+    hist = [[re.sub(r"\s+", " ", c).strip()[:300] for c in row] for row in
+            re.findall(r"<tr>\s*<td>([^<]*)</td>\s*<td>([^<]*)</td>\s*<td>(.*?)</td>\s*</tr>", part.get("execution-history", ""), re.S)]
+    out["plan"] = {"info": info, "history": hist, "src": src, "ln": 1}
+    steps, actions = [], []
+
+    def add(sid, cls, state, kind, block, real="", exe=""):
+        e = _exp_error(block)
+        steps.append({"id": sid, "action": sid, "state": state, "cls": cls.replace("Actions::", ""), "kind": kind, "queue": _exp_field(block, "Queue"),
+                      "started": _exp_time(_exp_field(block, "Started at")), "ended": _exp_time(_exp_field(block, "Ended at")),
+                      "real": real or re.sub(r"s$", "", _exp_field(block, "Real time")), "exec": exe, "error": e, "ln": None})
+        actions.append({"id": sid, "cls": cls.replace("Actions::", ""), "input": _exp_pre(block, "Input")[:io_cap], "output": _exp_pre(block, "Output")[:io_cap], "ln": None})
+    ms = list(_EXP_PSTEP.finditer(part.get("plan", "")))
+    for k, m in enumerate(ms):
+        blk = part["plan"][m.end():ms[k + 1].start() if k + 1 < len(ms) else len(part["plan"])]
+        add("plan %d" % (k + 1), m.group(2).strip(), {"success": "success", "danger": "error", "important": "error", "warning": "skipped"}.get(m.group(1), m.group(1)), "PlanStep", blk)
+    for nm, kind in (("run", "RunStep"), ("finalize", "FinalizeStep")):
+        ms = list(_EXP_STEP.finditer(part.get(nm, "")))
+        for k, m in enumerate(ms):
+            blk = part[nm][m.end():ms[k + 1].start() if k + 1 < len(ms) else len(part[nm])]
+            css = re.findall(r'<div class="atom (\w+)"', part[nm][max(0, m.start() - 400):m.start()])
+            add(m.group(1), m.group(2), css[-1] if css else m.group(3).strip(), kind, blk, m.group(4) or "", m.group(5) or "")
+    out["steps"], out["actions"] = steps, actions
+    facts, pulp = _exp_facts(actions)
+    out["facts"], out["pulp"] = facts, [dict(v, id=k) for k, v in pulp.items()][:50]
+    if not steps:
+        out["notes"].append("this page lists no steps")
+    if t is not None and ctx is not None:
+        if logs == "only":
+            lo = {"logs": [], "notes": []}
+            _task_logs(t, lo, facts, pulp, out["plan_id"], budget)
+            return lo
+        if logs:
+            _task_logs(t, out, facts, pulp, out["plan_id"], budget)
+        else:
+            out["logs_pending"] = True
+    else:
+        out["notes"].append("open the export together with the sosreport (sosview-lite serve REPORT EXPORT) to also see the log lines that carry this task's request id")
+    return out
+
+
+def find_task_exports(near):
+    """task-export*.tar.gz next to the sosreport or in ~/Downloads. Offered, never loaded silently."""
+    found = []
+    for d in (os.path.dirname(os.path.abspath(near)), os.path.expanduser("~/Downloads")):
+        try:
+            for n in os.listdir(d):
+                if re.match(r"^task-export.*\.(tar\.gz|tgz|tar\.xz|tar|zip|csv)$", n, re.I):
+                    p = os.path.join(d, n)
+                    found.append((os.path.getmtime(p), p))
+        except OSError:
+            pass
+    return [p for _, p in sorted(set(found), reverse=True)[:5]]
+
+
+def export_offers(paths, near):
+    """For the page: each offered export with where it was found and the date of the file, so one from another
+    case is not taken for this report's."""
+    here = os.path.dirname(os.path.abspath(near))
+    out = []
+    for p in paths:
+        try:
+            when = datetime.datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d")
+        except OSError:
+            when = ""
+        out.append({"p": p, "where": "same folder as the report" if os.path.dirname(os.path.abspath(p)) == here else "Downloads", "when": when})
+    return out
+
+
+def export_fit(exp, sos, ctx):
+    """What ties a task export to the open report, as counts: how many of its tasks are in the report's own task
+    table, and when its newest task started against when the report was collected."""
+    rows = (exp or {}).get("rows") or []
+    if not rows:
+        return ""
+    parts = []
+    srows = (sos or {}).get("rows") or []
+    if srows and (sos or {}).get("source") == "sosreport":
+        ids = set(r["id"] for r in srows)
+        n = sum(1 for r in rows if r["id"] in ids)
+        parts.append("%s of this export's %s tasks are also in this report's task table (%s tasks)" % (fmt_n(n), fmt_n(len(rows)), fmt_n(len(srows))))
+    newest = max((r.get("started") or "" for r in rows), default="")
+    if newest and ctx.get("collected"):
+        parts.append("its newest task started %s UTC; the report was collected %s" % (newest[:16], ctx["collected"]))
+    return " · ".join(parts)
+
+
+# ---- text output ----------------------------------------------------------------------
+
+
+# ---- everything the sosreport holds on one task -------------------------------------------------------------------
+# foreman_tasks_tasks gives the task row; the three dynflow tables hold its execution plan, its steps (state, timings,
+# error with backtrace) and its actions (input and output). Newer dynflow stores these cells encoded (msgpack, shown by
+# psql as \x…); sos decodes them only when dynflow-utils is installed, so they are decoded here when they come encoded.
+
+PLANS = ["sos_commands/foreman/dynflow_execution_plans"]
+ACTIONS = ["sos_commands/foreman/dynflow_actions"]
+UUID_RX = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+class _Unpack(object):
+    """A small msgpack reader (the parts dynflow uses), standard library only."""
+
+    def __init__(self, b):
+        self.b, self.i = b, 0
+
+    def take(self, n):
+        if self.i + n > len(self.b):
+            raise ValueError("cut short")
+        v = self.b[self.i:self.i + n]
+        self.i += n
+        return v
+
+    def num(self, fmt, n):
+        import struct
+        return struct.unpack(">" + fmt, self.take(n))[0]
+
+    def ext(self, n):
+        typ = self.num("b", 1)
+        data = self.take(n)
+        if typ == -1:                                  # timestamp
+            import struct
+            if n == 4:
+                sec, ns = struct.unpack(">I", data)[0], 0
+            elif n == 8:
+                v = struct.unpack(">Q", data)[0]
+                sec, ns = v & 0x3ffffffff, v >> 34
+            else:
+                ns, sec = struct.unpack(">Iq", data)
+            try:
+                return (datetime.datetime(1970, 1, 1) + datetime.timedelta(seconds=sec)).strftime("%Y-%m-%d %H:%M:%S") + (".%03d" % (ns // 1000000) if ns else "") + " UTC"
+            except (ValueError, OverflowError, OSError):
+                return sec
+        return "<ext %d: %s>" % (typ, binascii.hexlify(data[:32]).decode())
+
+    def read(self):
+        c = self.num("B", 1)
+        if c <= 0x7f:
+            return c
+        if c >= 0xe0:
+            return c - 0x100
+        if 0x80 <= c <= 0x8f:
+            return self.map(c & 0x0f)
+        if 0x90 <= c <= 0x9f:
+            return [self.read() for _ in range(c & 0x0f)]
+        if 0xa0 <= c <= 0xbf:
+            return self.str(c & 0x1f)
+        if c == 0xc0:
+            return None
+        if c in (0xc2, 0xc3):
+            return c == 0xc3
+        if c in (0xc4, 0xc5, 0xc6):
+            n = self.num({0xc4: "B", 0xc5: "H", 0xc6: "I"}[c], {0xc4: 1, 0xc5: 2, 0xc6: 4}[c])
+            return self.str(n)
+        if c in (0xc7, 0xc8, 0xc9):
+            return self.ext(self.num({0xc7: "B", 0xc8: "H", 0xc9: "I"}[c], {0xc7: 1, 0xc8: 2, 0xc9: 4}[c]))
+        if c == 0xca:
+            return self.num("f", 4)
+        if c == 0xcb:
+            return self.num("d", 8)
+        if 0xcc <= c <= 0xd3:
+            fmt, n = {0xcc: ("B", 1), 0xcd: ("H", 2), 0xce: ("I", 4), 0xcf: ("Q", 8), 0xd0: ("b", 1), 0xd1: ("h", 2), 0xd2: ("i", 4), 0xd3: ("q", 8)}[c]
+            return self.num(fmt, n)
+        if 0xd4 <= c <= 0xd8:
+            return self.ext({0xd4: 1, 0xd5: 2, 0xd6: 4, 0xd7: 8, 0xd8: 16}[c])
+        if c in (0xd9, 0xda, 0xdb):
+            return self.str(self.num({0xd9: "B", 0xda: "H", 0xdb: "I"}[c], {0xd9: 1, 0xda: 2, 0xdb: 4}[c]))
+        if c in (0xdc, 0xdd):
+            return [self.read() for _ in range(self.num("H" if c == 0xdc else "I", 2 if c == 0xdc else 4))]
+        if c in (0xde, 0xdf):
+            return self.map(self.num("H" if c == 0xde else "I", 2 if c == 0xde else 4))
+        raise ValueError("unknown msgpack byte 0x%02x" % c)
+
+    def str(self, n):
+        return self.take(n).decode("utf-8", "replace")
+
+    def map(self, n):
+        out = {}
+        for _ in range(n):
+            k = self.read()
+            out[k if isinstance(k, str) else json.dumps(k) if isinstance(k, (list, dict)) else str(k)] = self.read()
+        return out
+
+
+def dyn_value(cell):
+    """A dynflow cell as data: (value, how) where how is 'json', 'msgpack', 'text' or '' (empty)."""
+    if cell is None:
+        return None, ""
+    s = cell.strip()
+    if not s or s in ("\\N", "NULL"):
+        return None, ""
+    if s.startswith("\\x") and re.match(r"^\\x[0-9a-fA-F]*$", s):
+        try:
+            u = _Unpack(binascii.unhexlify(s[2:]))
+            return u.read(), "msgpack"
+        except (ValueError, TypeError, binascii.Error):
+            return s[:200] + ("…" if len(s) > 200 else ""), "undecoded"
+    if s[:1] in "{[\"" or s in ("true", "false", "null") or re.match(r"^-?\d+(\.\d+)?$", s):
+        try:
+            return json.loads(s), "json"
+        except ValueError:
+            pass
+    return s, "text"
+
+
+def _records_multi(t, rel, keys, cap=400):
+    """{plan uuid: [records]} for the CSV records of a dynflow table whose plan column (execution_plan_uuid, or uuid)
+    is one of keys, with their line numbers, in one read of the file. Only those records are parsed: a record starts
+    on a line that begins with a uuid or a number and a comma, which a continuation line inside a quoted cell does not."""
+    import csv
+    out = dict((k, []) for k in keys)
+    full = os.path.join(t.root, rel)
+    try:
+        with open(full, "rb") as fh:
+            data = fh.read()
+    except (OSError, IOError):
+        return out, None
+    nl = data.find(b"\n")
+    if nl < 0 or not keys:
+        return out, None
+    try:
+        header = next(csv.reader([data[:nl].decode("utf-8", "replace")]))
+    except (csv.Error, StopIteration):
+        header = []
+    if not is_header(header) and table_name(rel) in TABLE_COLS:      # sos kept only the end of the table: no header line
+        sample = []
+        for m in re.finditer(rb"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12},[^\n]*", data[:4 * 1024 * 1024], re.M):
+            try:
+                sample.append(next(csv.reader([m.group(0).decode("utf-8", "replace")])))
+            except (csv.Error, StopIteration):
+                continue
+            if len(sample) >= 60:
+                break
+        header = known_header(table_name(rel), sample) and list(TABLE_COLS[table_name(rel)])
+        if not header:
+            return out, None
+    if len(header) < 2:
+        return out, header
+    kcol = header.index("execution_plan_uuid") if "execution_plan_uuid" in header else header.index("uuid") if "uuid" in header else 0
+    start_rx = re.compile(rb"^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d+),")
+    csv.field_size_limit(1 << 30)
+    seen, pos, lines_at, nlc = set(), nl, 0, 0
+    if len(keys) > 3:
+        # many plans: read each record's plan column where the record starts, and keep the ones asked for
+        kset = set(k.encode() for k in keys)
+        col = re.compile(rb"^" + rb"[^,\n]*," * kcol + rb"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}),", re.M)
+        hits = (x for x in col.finditer(data, nl + 1) if x.group(1) in kset)
+        nxt = lambda after: next(hits, None)
+    else:
+        find = re.compile(b"|".join(re.escape(k.encode()) for k in sorted(keys, key=len, reverse=True)))
+        nxt = lambda after: find.search(data, after)
+    m = nxt(nl)
+    while m:
+        p = m.start()
+        s = data.rfind(b"\n", 0, p) + 1
+        while s > nl + 1 and not start_rx.match(data[s:s + 40]):
+            s = data.rfind(b"\n", 0, s - 1) + 1
+        e = data.find(b"\n", p)
+        while e >= 0 and e + 1 < len(data) and not start_rx.match(data[e + 1:e + 41]):
+            e = data.find(b"\n", e + 1)
+        e = len(data) if e < 0 else e
+        if s not in seen:
+            seen.add(s)
+            try:
+                rec = next(csv.reader(io.StringIO(data[s:e].decode("utf-8", "replace"))))
+            except (StopIteration, csv.Error):
+                rec = None
+            k = rec[kcol] if rec and len(rec) > kcol else None
+            if k in out and len(out[k]) < cap:
+                nlc += data.count(b"\n", lines_at, s)
+                lines_at = s
+                row = dict(zip(header, rec))
+                row["_ln"] = nlc + 1
+                out[k].append(row)
+        m = nxt(e)
+    return out, header
+
+
+_REQ_LINE = re.compile(r"^(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)\S*\s+\[(\w)\|(\w+)\|[0-9a-f]+\]\s?(.*)$")
+
+
+REQ_LOGS = re.compile(r"(^|/)(production\.log|proxy\.log|candlepin\.log|error\.log|messages|journalctl[^/]*|[^/]*dynflow[^/]*|[^/]*pulp[^/]*)([.-][^/]*)?$")
+
+
+def request_story(t, ctx, rid, budget=60.0):
+    """One Foreman request, told from the lines that carry its id ([I|app|1a2b3c4d] and the backtrace lines
+    '1a2b3c4d | /path'): started, handled by, parameters, each error with its backtrace counted, completed.
+    Only what the log says, in the log's order. Also: the same id in other logs, and the plans that store it."""
+    rid = (rid or "").strip().lower()
+    uuid = bool(re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", rid))
+    if not uuid and not re.match(r"^[0-9a-f]{8}$", rid):
+        return {"error": "an id is 8 hex characters (a request) or a UUID"}
+    files = [r for r, _ in preset_files(t, "logs")]
+    if not uuid:        # a request id is only written by Foreman, its workers, the smart proxy, Candlepin and Pulp
+        files = [r for r in files if REQ_LOGS.search(r)] or files
+    # Foreman [I|app|1a2b3c4d] and its backtrace lines; the smart proxy '<time> 1a2b3c4d [I]'; Candlepin 'csid=1a2b3c4d-…'
+    # (Katello sends the id as X-Correlation-ID); Pulp 'pulp [1a2b3c4d-…]:' (Katello sends it as Correlation-ID).
+    # A UUID (a Pulp task, a host, a repository): every line that holds it, wherever it is.
+    # the id itself is what is searched (a plain string: the fastest search there is); for a request id the lines
+    # are then kept only where the id stands in one of the places above
+    d = search_files(t, rid, files, case=not uuid, context=0, budget=budget, per_file=20000, max_hits=60000)
+    if not uuid:
+        rx = re.compile(REQ_ANY % ((rid,) * 5))
+        for g in d.get("groups", []):
+            g["lines"] = [l for l in g.get("lines", []) if l[0] is None or not l[2] or rx.search(l[1])]
+            g["n"] = sum(1 for l in g["lines"] if l[0] is not None and l[2])
+        d["groups"] = [g for g in d.get("groups", []) if g["n"]]
+    groups = sorted(d.get("groups", []), key=lambda g: -g["n"])
+    out = {"id": rid, "rows": [], "others": [], "lines": 0, "bt": 0, "file": "", "first": "", "last": "", "ms": None, "stopped": d.get("stopped", ""), "plans": [],
+           "more": [], "pulp": request_pulp_tasks(t, ctx, rid)}
+    try:
+        out["plans"] = task_find(t, rid).get("plans", [])[:20]
+    except Exception:
+        out["plans"] = []
+    out["kind"] = "uuid" if uuid else "request"
+    out["searched"] = d.get("files_scanned", 0)
+    out["unscanned"] = len(d.get("unscanned") or [])
+    main = None if uuid else next((g for g in groups if "production.log" in g["file"]), None)
+    out["others"] = [{"file": g["file"], "n": g["n"]} for g in groups if g is not main]
+    out["more"] = [request_lines(t, ctx, g) for g in groups if g is not main]
+    out["more"].sort(key=lambda m: m["first"] or "~")
+    if main is None:
+        return out
+    out["file"], out["lines"] = main["file"], main["n"]
+    rows, cur, plans = [], None, {}
+    for l in main.get("lines", []):
+        if l[0] is None or not l[2]:
+            continue
+        rel, text = main["members"][l[3]], l[1]
+        ts = _TASK_STATE.search(text)
+        if ts:                                   # a task's state changes: one row per task, summed up by label and how it ended
+            lab, tid, plan, state, result = ts.groups()
+            m2 = _REQ_LINE.match(text)
+            p = plans.setdefault(plan, {"label": "", "id": "", "plan": plan, "state": "", "result": "", "t": m2.group(2) if m2 else "", "rel": rel, "n": l[0]})
+            p["label"] = p["label"] or (lab or "").strip()
+            p["id"] = p["id"] or (tid or "")
+            p["state"], p["result"] = state, result or p["result"]
+            continue
+        m = _REQ_LINE.match(text)
+        if not m:                                # a backtrace line of the error before it
+            out["bt"] += 1
+            if cur is not None:
+                cur["bt"] += 1
+                frame = re.sub(r"^\s*[0-9a-f]+ \| ", "", text).strip()
+                if not cur["frame"] and re.search(r"/(katello|foreman[\w-]*|smart_proxy[\w-]*)-[\d.]+/", frame):
+                    cur["frame"] = re.sub(r"^.*/gems/gems/", "", frame)[:200]
+            continue
+        day, tm, lvl, _, msg = m.groups()
+        out["first"] = out["first"] or (day + " " + tm)
+        out["last"] = day + " " + tm
+        kind, val, cur = "", msg.strip(), None
+        s = re.match(r'Started (\w+) "([^"]*)" for (\S+)', msg)
+        c = re.match(r"Completed (\d{3}[^(]*?) in (\d+)ms", msg)
+        if s:
+            kind, val = "started", "%s %s  from %s" % s.groups()
+        elif msg.startswith("Processing by "):
+            kind, val = "handled by", msg[len("Processing by "):]
+        elif msg.lstrip().startswith("Parameters:"):
+            kind, val = "parameters", msg.split(":", 1)[1].strip()
+        elif c:
+            kind, val = "completed", "%s in %s ms" % (c.group(1).strip(), fmt_n(int(c.group(2))))
+            out["ms"] = int(c.group(2))
+        elif lvl in ("E", "F"):
+            kind = "error"
+        elif lvl == "W":
+            kind = "warning"
+        elif msg.startswith(("Redirected to", "Current user", "Authorized user", "Rendering", "Filter chain halted")):
+            kind = "note"
+        else:
+            out.setdefault("plain", 0)
+            out["plain"] += 1
+            continue
+        row = {"t": tm, "day": day, "k": kind, "v": val[:900], "rel": rel, "n": l[0], "bt": 0, "frame": ""}
+        rows.append(row)
+        if kind in ("error", "warning"):
+            cur = row
+    out["rows"] = rows[:400]
+    by = {}
+    for p in plans.values():
+        k = (p["label"], p["state"], p["result"])
+        by[k] = by.get(k, 0) + 1
+    out["tasks"] = [{"label": k[0], "state": k[1], "result": k[2], "n": n} for k, n in sorted(by.items(), key=lambda kv: (kv[0][0], -kv[1]))][:20]
+    out["task_n"] = len(plans)
+    out["task_odd"] = [p for p in plans.values() if p["result"] in ("error", "warning") or p["state"] == "paused"][:20]
+    return out
+
+
+# Foreman's 'Task {label: X, id: …, execution_plan_id: …} state changed: running  result: error'
+_TASK_STATE = re.compile(r"Task \{label: ([^,}]*), (?:id: ([0-9a-f-]{36}), )?execution_plan_id: ([0-9a-f-]{36})\} state changed: (\w+)(?:\s+result: (\w+))?")
+
+
+REQ_ANY = r"\|%s\]|^\s*%s \| |^\S+\s+%s \[[A-Z]\] |csid=%s|pulp \[%s"
+_REQ_LVL = re.compile(r"\b(?:ERROR|FATAL|SEVERE|CRITICAL)\b|\[[EF]\] |:(?:ERROR|CRITICAL):")
+_REQ_WARN = re.compile(r"\bWARN(?:ING)?\b|\[W\] |:WARNING:")
+REQ_TEXTS = 30
+_REQ_KEY = [(re.compile(r"\[\d\d/\w{3}/\d{4}:\d\d:\d\d:\d\d [+-]\d{4}\]"), "[TIME]"),       # an access log line's own time
+            (re.compile(r'(" \d{3}) \d+( "|$)'), r"\1 N\2"),                                 # and its response size
+            (re.compile(r"\[\d+\]: "), "[N]: ")]                                                 # the process id of the program
+
+
+# what a request's lines say, by kind: API calls (an access line, or Candlepin's 'Request: verb=…, uri=…'),
+# Pulp tasks starting, completing, failing or canceled, and the rest
+_REQ_API = re.compile(r'"(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS) (\S+) HTTP/[\d.]+" (\d{3})|Request: verb=(\w+), uri=([^,\s]+)')
+_REQ_TASK = re.compile(r"Starting task(?: id:)? ([0-9a-f-]{36})|Task completed ([0-9a-f-]{36})|Task ([0-9a-f-]{36}) failed(?: \((.*)\))?|Task ([0-9a-f-]{36}) canceled")
+_REQ_TTYPE = re.compile(r"task_type: ([\w.]+)")
+_REQ_ETIME = re.compile(r"execution_time: (\d+) [μu]s")
+_UUID_ANY = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.I)
+
+
+def api_path(p):
+    """An API path with its ids set aside, so calls to the same endpoint are one row: /pulp/api/v3/tasks/{id}/."""
+    p, _, q = p.partition("?")
+    p = re.sub(r"(?<=/)\d+(?=/|$)", "{n}", _UUID_ANY.sub("{id}", p))
+    if q:
+        p += "?" + "&".join(x.split("=", 1)[0] + "=…" for x in q.split("&") if x)
+    return p
+
+
+def request_lines(t, ctx, g):
+    """The lines of one log (with its rotated copies) that carry the id, summed up by kind: every distinct error or
+    warning text; the API calls by endpoint (ids set aside) with their status codes; the Pulp tasks by type, started,
+    completed, failed and canceled; and the other distinct texts, in the order they first appear, each with how many
+    lines have it, until when, and a link to its first line."""
+    ref = ref_time(ctx)
+    texts, order, n, first, last = {}, {"err": [], "other": []}, 0, None, None
+    api, tasks, ttype, failed = {}, {}, {}, []
+    for l in g.get("lines", []):
+        if l[0] is None or not l[2]:
+            continue
+        n += 1
+        text = l[1]
+        w = parse_when(text[:100], ref)
+        if w:
+            first = first or w
+            last = w
+        lvl = "error" if _REQ_LVL.search(text) else "warning" if _REQ_WARN.search(text) else ""
+        a = _REQ_API.search(text)
+        if a:
+            verb, path, status = (a.group(1), a.group(2), a.group(3)) if a.group(1) else (a.group(4), a.group(5), "")
+            e = api.setdefault((verb, api_path(path)), {"verb": verb, "path": api_path(path), "n": 0, "status": {}, "rel": g["members"][l[3]], "ln": l[0]})
+            e["n"] += 1
+            if status:
+                e["status"][status] = e["status"].get(status, 0) + 1
+            lvl = lvl or ("error" if status[:1] == "5" else "warning" if status[:1] == "4" else "")
+            if not lvl:
+                continue
+        tk = None if a else _REQ_TASK.search(text)
+        if tk:
+            tid = next(x for x in (tk.group(1), tk.group(2), tk.group(3), tk.group(5)) if x)
+            ty = _REQ_TTYPE.search(text)
+            if ty:
+                ttype[tid] = ty.group(1)
+            kind = "started" if tk.group(1) else "completed" if tk.group(2) else "failed" if tk.group(3) else "canceled"
+            e = tasks.setdefault(ttype.get(tid, ""), {"type": ttype.get(tid, ""), "started": 0, "completed": 0, "failed": 0, "canceled": 0, "longest": 0})
+            e[kind] += 1
+            et = _REQ_ETIME.search(text)
+            if et:
+                e["longest"] = max(e["longest"], int(et.group(1)) // 1000)
+            if kind in ("failed", "canceled"):
+                failed.append({"id": tid, "kind": kind, "type": ttype.get(tid, ""), "why": (tk.group(4) or "")[:400],
+                               "t": w.strftime("%H:%M:%S") if w else "", "rel": g["members"][l[3]], "n": l[0]})
+            if not lvl:
+                continue
+        k = text
+        for rx, rep in _REQ_KEY:
+            k = rx.sub(rep, k)
+        k = msgkey(k)
+        cls = "err" if lvl else "other"
+        r = texts.get(k)
+        if r is None:
+            if len(order[cls]) >= REQ_TEXTS:
+                texts[k] = r = {"count": 0, "skip": True, "cls": cls}
+            else:
+                r = texts[k] = {"t": w.strftime("%H:%M:%S") if w else "", "day": w.strftime("%Y-%m-%d") if w else "", "k": lvl, "cls": cls,
+                                "v": text[:900], "rel": g["members"][l[3]], "n": l[0], "count": 0, "last": ""}
+                order[cls].append(r)
+        r["count"] += 1
+        if w and not r.get("skip"):
+            r["last"] = w.strftime("%H:%M:%S") if w.date() == (first or w).date() else w.strftime("%m-%d %H:%M:%S")
+    rows = [dict(r, last=r["last"] if r["count"] > 1 else "") for r in order["err"] + order["other"]]
+    other = [r for r in texts.values() if r["cls"] == "other"]
+    return {"file": g["file"], "n": g["n"], "rows": rows, "texts": len(texts), "errors": sum(r["count"] for r in rows if r["k"] == "error"),
+            "other_texts": len(other), "other_lines": sum(r["count"] for r in other),
+            "api": sorted(api.values(), key=lambda e: (-e["n"], e["path"]))[:15], "api_lines": sum(e["n"] for e in api.values()),
+            "tasks": sorted(tasks.values(), key=lambda e: (-e["started"], e["type"]))[:15], "failed": failed[:20],
+            "first": first.strftime("%Y-%m-%d %H:%M:%S") if first else "",
+            "span": (first.strftime("%Y-%m-%d %H:%M:%S") + ((" → " + last.strftime("%H:%M:%S" if last.date() == first.date() else "%Y-%m-%d %H:%M:%S")) if last and last != first else "")) if first else ""}
+
+
+PULP_TASKS = ["sos_commands/pulpcore/core_task"]
+
+
+def request_pulp_tasks(t, ctx, rid, cap=40):
+    """Pulp tasks whose logging_cid (the Correlation-ID Katello sent) starts with the request id, or whose own id is it, from the core_task
+    table sos exported (';' separated on current sos, ',' or psql's aligned table on older ones)."""
+    import csv
+    text, rel = t.read(PULP_TASKS, limit=256 * 1024 * 1024)
+    if not text or rid not in text:
+        return {"file": rel or PULP_TASKS[0], "rows": [], "n": 0}
+    head = text.split("\n", 1)[0]
+    if "logging_cid" not in head:
+        return {"file": rel, "rows": [], "n": 0}
+    if "|" in head:
+        recs, _ = parse_table(text)
+        recs = recs or []
+    else:
+        csv.field_size_limit(1 << 30)
+        delim = ";" if head.count(";") > head.count(",") else ","
+        recs, end = [], 1
+        try:
+            rd = csv.DictReader(io.StringIO(text), delimiter=delim)
+            for r in rd:
+                r["_ln"], end = end + 1, rd.line_num        # the record's first line (a quoted cell can hold newlines)
+                recs.append(r)
+        except csv.Error:
+            pass
+    shift = datetime.timedelta(minutes=ctx.get("utc_offset") or 0)
+    rows = []
+    for r in recs:
+        cid = (r.get("logging_cid") or "").strip().lower()
+        if not cid.startswith(rid) and (r.get("pulp_id") or "").strip().lower() != rid:
+            continue
+        err = (r.get("error") or "").strip()
+        if err and err[:1] == "{":
+            try:
+                e = json.loads(err)
+                err = e.get("description") or e.get("traceback", "")[-300:] or err
+            except ValueError:
+                pass
+
+        def hm(v):
+            w = parse_when((v or "")[:19])
+            return (w + shift).strftime("%Y-%m-%d %H:%M:%S") if w else ""
+        a, b = hm(r.get("started_at")), hm(r.get("finished_at"))
+        rows.append({"name": (r.get("name") or "").strip(), "state": (r.get("state") or "").strip(), "start": a, "end": b,
+                     "err": err[:600], "n": r.get("_ln") or 0, "cid": cid})
+    rows.sort(key=lambda x: x["start"] or "~")
+    by = {}
+    for r in rows:
+        e = by.setdefault(r["name"], {"name": r["name"], "n": 0, "states": {}})
+        e["n"] += 1
+        e["states"][r["state"]] = e["states"].get(r["state"], 0) + 1
+    odd = [r for r in rows if r["state"] not in ("completed", "running", "waiting")]
+    return {"file": rel, "rows": rows[:cap], "n": len(rows), "by": sorted(by.values(), key=lambda e: (-e["n"], e["name"]))[:15], "odd": odd[:20],
+            "tz": ("host time, " + offset_text(ctx["utc_offset"], ctx.get("tz", ""))) if ctx.get("utc_offset") is not None else "UTC"}
+
+
+_REQ_JSON = re.compile(rb'current_request_id"+\s*:\s*"+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')
+_REQ_HEX = re.compile(rb"63757272656e745f726571756573745f6964d924((?:[0-9a-f]{2}){36})")       # msgpack: 'current_request_id', a 36-byte string
+
+
+def plan_request_ids(t, limit=1024 * 1024 * 1024):
+    """{execution plan id: request id} from the input of each plan's actions in dynflow_actions: the id of the web or API
+    call that started the task (current_request_id), which the task's own log lines carry as [E|bac|1a2b3c4d]. Stored as
+    JSON, or on newer versions as msgpack written out in hex. The first id found in a plan wins. Read line by line, so a
+    large table is not held in memory."""
+    rel = t.first(ACTIONS)
+    out = {}
+    if rel is None:
+        return out
+    import csv
+    try:
+        fh = open(os.path.join(t.root, rel), "rb")
+    except (OSError, IOError):
+        return out
+    with fh:
+        head = fh.readline()
+        try:
+            header = next(csv.reader([head.decode("utf-8", "replace")]), [])
+        except csv.Error:
+            header = []
+        kcol = header.index("execution_plan_uuid") if "execution_plan_uuid" in header else 0
+        start_rx = re.compile(rb"^(?:[^,\n]*,){%d}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})," % kcol)
+        plan, read = None, len(head)
+        for line in fh:
+            read += len(line)
+            if read > limit:
+                break
+            k = start_rx.match(line)
+            if k:                                   # a record starts; other lines continue a quoted cell of the record before
+                plan = k.group(1).decode()
+            if plan is None or plan in out:
+                continue
+            if b"current_request_id" in line:
+                m = _REQ_JSON.search(line)
+                if m:
+                    out[plan] = m.group(1).decode()
+            elif b"63757272656e745f726571756573745f6964d924" in line:
+                m = _REQ_HEX.search(line)
+                try:
+                    rid = binascii.unhexlify(m.group(1)).decode("ascii") if m else ""
+                except (ValueError, UnicodeDecodeError):
+                    rid = ""
+                if UUID_RX.match(rid):
+                    out[plan] = rid
+    return out
+
+
+def task_find(t, q, cap=20000):
+    """Execution plan ids of the tasks whose dynflow_actions rows hold the text q (letter case ignored). This is where a
+    task's repository, Capsule and host names are: in the input and output cells, stored as JSON or, on newer versions,
+    as msgpack written out in hex, which is searched by the hex form of q."""
+    q = (q or "").strip()
+    rel = t.first(ACTIONS)
+    out = {"plans": [], "file": rel or ACTIONS[0]}
+    if len(q) < 3 or rel is None:
+        return out
+    try:
+        with open(os.path.join(t.root, rel), "rb") as fh:
+            data = fh.read(1024 * 1024 * 1024)
+    except (OSError, IOError):
+        return out
+    nl = data.find(b"\n")
+    if nl < 0:
+        return out
+    import csv
+    try:
+        header = next(csv.reader([data[:nl].decode("utf-8", "replace")]), [])
+    except csv.Error:          # the end of a cut table starts inside a record
+        header = []
+    kcol = header.index("execution_plan_uuid") if "execution_plan_uuid" in header else 0
+    start_rx = re.compile(rb"^(?:[^,\n]*,){%d}([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})," % kcol)
+    forms = set(v.encode("utf-8") for v in (q, q.lower(), q.upper(), q.title(), q.capitalize()))
+    needle = re.compile(b"|".join([b"(?i:" + re.escape(q.encode("utf-8")) + b")"] + [re.escape(binascii.hexlify(f)) for f in sorted(forms)]))
+    seen, plans, pos = set(), [], nl + 1
+    while len(plans) < cap:
+        m = needle.search(data, pos)
+        if not m:
+            break
+        s = data.rfind(b"\n", 0, m.start()) + 1
+        k = start_rx.match(data[s:s + 400])
+        while k is None and s > nl + 1:         # a continuation line inside a quoted cell: walk back to the record start
+            s = data.rfind(b"\n", 0, s - 1) + 1
+            k = start_rx.match(data[s:s + 400])
+        if k and k.group(1) not in seen:
+            seen.add(k.group(1))
+            plans.append(k.group(1).decode())
+        e = data.find(b"\n", m.end())
+        pos = len(data) if e < 0 else e + 1
+    out["plans"] = plans
+    return out
+
+
+def _records_with(t, rel, key, cap=400):
+    got, header = _records_multi(t, rel, [key], cap)
+    return got.get(key, []), header
+
+
+def _cap_json(v, limit=60000):
+    s = json.dumps(v, indent=2, ensure_ascii=False, sort_keys=False, default=str) if not isinstance(v, str) else v
+    return s if len(s) <= limit else s[:limit] + "\n… (cut: %d more characters)" % (len(s) - limit)
+
+
+def _walk(v, path=""):
+    if isinstance(v, dict):
+        for k, x in v.items():
+            for r in _walk(x, path + "." + str(k) if path else str(k)):
+                yield r
+    elif isinstance(v, list):
+        for i, x in enumerate(v):
+            for r in _walk(x, "%s[%d]" % (path, i)):
+                yield r
+    else:
+        yield path, v
+
+
+FACT_KEYS = [("request id", r"(^|\.)current_request_id$"), ("user id", r"(^|\.)current_user_id$"), ("organization id", r"(^|\.)current_organization_id$"),
+             ("location id", r"(^|\.)current_location_id$"), ("Capsule id", r"(^|\.)(smart_proxy_id|capsule_id|proxy_id)$"), ("Capsule", r"(^|\.)(smart_proxy|capsule)\.(name|url)$"),
+             ("repository id", r"(^|\.)(repository_id|repo_id)$"), ("repository", r"(^|\.)repository\.(name|label)$"), ("content view", r"(^|\.)content_view\.(name|label)$"),
+             ("content view version", r"(^|\.)content_view_version_id$"), ("environment", r"(^|\.)(environment|lifecycle_environment)\.(name|label)$"),
+             ("environment id", r"(^|\.)(environment_id|lifecycle_environment_id)$"), ("content view id", r"(^|\.)content_view_id$"), ("host", r"(^|\.)host\.(name|id)$"), ("job invocation", r"(^|\.)job_invocation_id$"),
+             ("remote URL", r"(^|\.)(url|feed|remote_url|upstream_url)$"), ("proxy task id", r"(^|\.)proxy_task_id$")]
+
+
+def _facts(actions):
+    """Names and ids the actions' input and output mention, and the Pulp tasks with their state and error."""
+    facts, pulp = [], {}
+    for a in actions:
+        for part in ("input", "output"):
+            for path, v in _walk(a.get(part)):
+                if v in (None, "", [], {}):
+                    continue
+                for lbl, rx in FACT_KEYS:
+                    if re.search(rx, path):
+                        item = (lbl, str(v)[:300])
+                        if item not in facts:
+                            facts.append(item)
+                        break
+                if isinstance(v, str) and "/pulp/api/v3/tasks/" in v:
+                    m = UUID_RX.search(v)
+                    if m:
+                        pulp.setdefault(m.group(0), {"href": v})
+        for part in ("output",):
+            walked = list(_walk(a.get(part)))
+            hrefs = dict((p2[:-len(".pulp_href")], v2) for p2, v2 in walked if p2.endswith(".pulp_href") and isinstance(v2, str))
+            steps = {}
+            for path, v in walked:
+                if v in (None, ""):
+                    continue
+                m = re.search(r"^(.*?pulp_tasks\[\d+\])\.(state|error\..*|started_at|finished_at|name)$", path)
+                s = None if m else re.search(r"^(.*?pulp_tasks\[\d+\])\.progress_reports\[(\d+)\]\.(message|code|state|total|done)$", path)
+                base = (m or s).group(1) if (m or s) else None
+                u = UUID_RX.search(hrefs.get(base) or "") if base else None
+                if not u:
+                    continue
+                if m:
+                    pulp.setdefault(u.group(0), {"href": hrefs[base]})[m.group(2)] = str(v)[:2000]
+                else:
+                    steps.setdefault(u.group(0), {}).setdefault(int(s.group(2)), {})[s.group(3)] = str(v)[:300]
+            for k, st in steps.items():               # the steps Pulp recorded, as Katello kept them; the first action that has them wins
+                pulp.setdefault(k, {"href": next((h for h in hrefs.values() if k in h), "")}).setdefault("steps", [st[i] for i in sorted(st)][:40])
+    return facts, pulp
+
+
+def task_full(t, ctx, task_id, logs=True, budget=20.0, pre=None, rows=None, io_cap=60000):
+    """Everything the sosreport holds on one task, for the task details panel. pre: {table rel: {plan: records}}
+    read beforehand for many tasks at once."""
+    pre = pre or {}
+    get = lambda r, k: pre[r].get(k, []) if r in pre else _records_with(t, r, k)[0]
+    if rows is None:
+        rows, kind, rel, hdr = task_rows(t)
+    else:
+        rel = t.first(TASKS)
+    if rows is None:
+        return {"error": "the task table is not in this sosreport"}
+    row = next((r for r in rows if r.get("id") == task_id or r.get("external_id") == task_id), None)
+    if row is None:
+        return {"error": "task %s is not in the task table" % task_id}
+    out = {"task": [(k, _nul(v)) for k, v in row.items() if not k.startswith("_")], "task_src": rel, "task_ln": row.get("_ln"),
+           "notes": [], "encoded": []}
+    tid, plan = row.get("id", ""), _nul(row.get("external_id"))
+    # related tasks
+    par = _nul(row.get("parent_task_id"))
+    rel_rows = lambda f: [{"id": r.get("id"), "label": (r.get("label") or "").replace("Actions::", ""), "state": r.get("state"), "result": r.get("result"),
+                           "started": _nul(r.get("started_at"))[:19]} for r in rows if f(r)]
+    out["parent"] = rel_rows(lambda r: par and r.get("id") == par)
+    out["children"] = rel_rows(lambda r: tid and _nul(r.get("parent_task_id")) == tid)[:500]
+    out["siblings"] = rel_rows(lambda r: par and _nul(r.get("parent_task_id")) == par and r.get("id") != tid)[:500]
+    if not plan:
+        out["notes"].append("this task has no execution plan id, so its Dynflow rows cannot be found")
+        return out
+    out["plan_id"] = plan
+    # execution plan
+    prel = t.first(PLANS)
+    if prel:
+        recs = get(prel, plan)[:2]
+        if recs:
+            p = recs[0]
+            info = [(k, _nul(p.get(k))) for k in ("state", "result", "label", "class", "started_at", "ended_at", "real_time", "execution_time") if _nul(p.get(k))]
+            hist, how = dyn_value(p.get("execution_history"))
+            if how in ("msgpack", "undecoded"):
+                out["encoded"].append("dynflow_execution_plans")
+            data, how2 = dyn_value(p.get("data"))
+            if hist is None and isinstance(data, dict):
+                hist = data.get("execution_history")
+            ev = []
+            for x in (hist if isinstance(hist, list) else []):
+                if isinstance(x, dict):
+                    tm = x.get("time")
+                    if isinstance(tm, (int, float)):
+                        tm = (datetime.datetime(1970, 1, 1) + datetime.timedelta(seconds=tm)).strftime("%Y-%m-%d %H:%M:%S UTC")
+                    ev.append([str(x.get("name") or ""), str(tm or ""), str(x.get("world_id") or "")])
+                elif isinstance(x, list) and x:
+                    ev.append([str(y) for y in x[:3]])
+            out["plan"] = {"info": info, "history": ev, "src": prel, "ln": p["_ln"]}
+        else:
+            out["notes"].append("the execution plan is not in %s (sos keeps tasks from its last days, and cuts these files at 100 MB)" % prel)
+    else:
+        out["notes"].append("dynflow_execution_plans is not in this sosreport")
+    # steps
+    srel = t.first(STEPS)
+    steps = []
+    if srel:
+        recs = get(srel, plan)
+        for r in recs:
+            err, how = dyn_value(r.get("error"))
+            if how in ("msgpack", "undecoded") and "dynflow_steps" not in out["encoded"]:
+                out["encoded"].append("dynflow_steps")
+            if isinstance(err, dict):
+                e = {"cls": str(err.get("exception_class") or err.get("class") or ""), "msg": str(err.get("message") or ""),
+                     "bt": [str(x) for x in (err.get("backtrace") or [])][:200]}
+            elif err:
+                txt = str(err)
+                m = re.search(r"exception_class:\s*(\S+)", txt)
+                mm = re.search(r"message:\s*(.*?)(?:\n\S|\Z)", txt, re.S)
+                e = {"cls": m.group(1) if m else "", "msg": mm.group(1).strip() if mm else txt[:4000], "bt": re.findall(r"^\s*-\s*(/.*)$", txt, re.M)[:200]}
+            else:
+                e = None
+            steps.append({"id": _nul(r.get("id")), "action": _nul(r.get("action_id")), "state": _nul(r.get("state")),
+                          "cls": (_nul(r.get("action_class")) or "").replace("Actions::", ""), "kind": _nul(r.get("class")).replace("Dynflow::Action::", ""),
+                          "queue": _nul(r.get("queue")), "started": _nul(r.get("started_at"))[:19], "ended": _nul(r.get("ended_at"))[:19],
+                          "real": _nul(r.get("real_time")), "exec": _nul(r.get("execution_time")), "error": e, "ln": r["_ln"]})
+        steps.sort(key=lambda s: int(s["id"]) if s["id"].isdigit() else 0)
+        if not recs:
+            out["notes"].append("no rows for this task in %s" % srel)
+    out["steps"], out["steps_src"] = steps, srel
+    # actions
+    arel = t.first(ACTIONS)
+    actions = []
+    if arel:
+        recs = get(arel, plan)
+        for r in recs:
+            inp, h1 = dyn_value(r.get("input"))
+            outp, h2 = dyn_value(r.get("output"))
+            if inp is None and outp is None:
+                data, h3 = dyn_value(r.get("data"))
+                if isinstance(data, dict):
+                    inp, outp = data.get("input"), data.get("output")
+                h1 = h1 or h3
+            if "undecoded" in (h1, h2) or "msgpack" in (h1, h2):
+                if "dynflow_actions" not in out["encoded"]:
+                    out["encoded"].append("dynflow_actions")
+            actions.append({"id": _nul(r.get("id")), "cls": (_nul(r.get("class")) or "").replace("Actions::", ""), "input": inp, "output": outp, "ln": r["_ln"]})
+        actions.sort(key=lambda a: int(a["id"]) if a["id"].isdigit() else 0)
+        if not recs:
+            out["notes"].append("no rows for this task in %s" % arel)
+    else:
+        out["notes"].append("dynflow_actions is not in this sosreport (step input and output)")
+    facts, pulp = _facts(actions)
+    out["facts"], out["pulp"] = facts, [dict(v, id=k) for k, v in pulp.items()][:50]
+    out["actions"] = [{"id": a["id"], "cls": a["cls"], "input": _cap_json(a["input"], io_cap) if a["input"] not in (None, {}, []) else "",
+                       "output": _cap_json(a["output"], io_cap) if a["output"] not in (None, {}, []) else "", "ln": a["ln"]} for a in actions]
+    out["actions_src"] = arel
+    # log lines that carry the task's request id or its Pulp task ids
+    out["logs"] = []
+    if logs == "only":
+        lo = {"logs": [], "notes": []}
+        _task_logs(t, lo, facts, pulp, plan, budget)
+        return lo
+    if logs:
+        _task_logs(t, out, facts, pulp, plan, budget)
+    else:
+        out["logs_pending"] = True
+    return out
+
+
+def _task_logs(t, out, facts, pulp, plan, budget=20.0):
+    """Log lines that carry the task's request id, its Pulp task ids or its plan id, into out["logs"]."""
+    rid = next((v for k, v in facts if k == "request id"), "")
+    pats = []
+    if rid:
+        pats.append(re.escape("|" + rid[:8] + "]"))
+        pats.append(re.escape(rid))
+        pats.append(re.escape(rid.replace("-", "")))
+    pats += [re.escape(k) for k in list(pulp)[:20]]
+    if plan:
+        pats.append(re.escape(plan))
+    if not pats:
+        return
+    files = [r for r, _ in preset_files(t, "logs")]
+    files = [r for r in files if REQ_LOGS.search(r)] or files      # the logs that name requests, tasks and plans
+    try:
+        d = search_files(t, "|".join(pats), files, case=True, context=0, budget=budget, per_file=400, max_hits=4000)
+    except Exception as e:
+        d = {"error": "%s: %s" % (type(e).__name__, e)}
+    for g in d.get("groups", []) if isinstance(d, dict) else []:
+        for l in g.get("lines", []):
+            if l[0] is not None and l[2]:
+                out["logs"].append({"rel": g["members"][l[3]], "n": l[0], "text": l[1][:1200]})
+    out["logs_by"] = (["request id " + rid[:8]] if rid else []) + (["%d Pulp task id%s" % (len(pulp), "" if len(pulp) == 1 else "s")] if pulp else []) + ["execution plan id"]
+    if isinstance(d, dict) and d.get("stopped"):
+        out["notes"].append("the log search stopped early: %s" % d["stopped"])
+
+
+def tasks_full_static(t, ctx, tasks, limit=150, io_cap=6000, total=4 * 1024 * 1024):
+    """For the page written to a file (no server to ask): the full record of the newest tasks that did not succeed,
+    read in one pass per table; no log search. Stops at limit tasks or about total bytes."""
+    rows, kind, rel, hdr = task_rows(t)
+    if rows is None or not tasks:
+        return {}
+    want = [r for r in tasks.get("rows", []) if r.get("result") not in ("success", "") and r.get("ext")][:limit]
+    plans = [r["ext"] for r in want]
+    pre = {}
+    for cands in (PLANS, STEPS, ACTIONS):
+        r = t.first(cands)
+        if r:
+            pre[r] = _records_multi(t, r, plans)[0]
+    out, size = {}, 0
+    for r in want:
+        d = task_full(t, ctx, r["id"], logs=False, pre=pre, rows=rows, io_cap=io_cap)
+        n = len(json.dumps(d, default=str))
+        if size + n > total:
+            break
+        out[r["id"]], size = d, size + n
+    return out
+
+
+# ---- Potential issues: each check compares one value in the report with a fixed limit --------------------------------
+# A check ends one of four ways: FOUND (the limit is crossed; the value and the lines it came from are shown), CLEAR (the
+# data is there and the limit is not crossed), CANNOT (the data it needs is not in the report, or cut: the file is named) or
+# NA (the check does not apply to this host's role, or to what is on it). Nothing here guesses at a cause.
+
+ROOT_FREE_GB = 4                # the free space on / that satellite-maintain's own check asks for
+STUCK_HOURS = 1                 # a task plans in seconds: one still pending or planning after this long is not moving
+PULP_WAIT_HOURS = 1             # a Pulp task still waiting for a worker after this long
+OOM_DAYS = 7
+# the tuning profiles of the installer: the memory (GiB) and CPUs each is made for
+TUNING_MIN = {"default": (20, 4), "development": (0, 0), "medium": (32, 8), "large": (64, 16), "extra-large": (128, 32), "extra-extra-large": (256, 48)}
+TUNING_SLACK = 0.92             # MemTotal is a little under the installed memory (the kernel keeps some): 30 GiB counts as 32
+SAT_USERS = ("apache", "foreman", "foreman-proxy", "postgres", "pulp", "redis", "tomcat")
+CAP_USERS = ("apache", "foreman-proxy", "postgres", "pulp", "redis")
+CLOCK_LIMIT = 300               # seconds: the clock skew Kerberos and most token checks allow
+PAUSED_DAYS = 30                # the age satellite-maintain's own check uses for old paused tasks
+_FS_DEV = re.compile(r"^/dev/(?!loop|sr\d|zram|fd\d)")
+
+
+def _issue(cid, title, state, value, detail=None, limit="", see="", src=None):
+    return {"id": cid, "title": title, "state": state, "value": value, "detail": list(detail or []), "limit": limit, "see": see, "src": [s for s in (src or []) if s]}
+
+
+def _ago_text(td):
+    s = int(abs(td.total_seconds()))
+    if s < 3600:
+        return "%dm" % max(1, s // 60)
+    if s < 86400:
+        return "%dh %02dm" % (s // 3600, s % 3600 // 60)
+    return plural(s // 86400, "day")
+
+
+# -- certificates
+def check_certs(t, ctx):
+    title = "certificate expired or not yet valid"
+    limit = "the end date is before the collection time, or the start date after it"
+    inv, ref = cert_inventory(t, ctx)
+    if not inv:
+        return _issue("certs", title, "CANNOT", "none of the certificate files sosview reads is in this report", limit=limit, see="s04")
+    if ref is None:
+        return _issue("certs", title, "CANNOT", "the collection time is not in this report, so there is nothing to count from", limit=limit, see="s04")
+    rows, seen, bad = [], set(), []
+    for rel, label, certs in inv:
+        good = [c for c in (certs or []) if "error" not in c]
+        if rel == VENDOR_ROOT and len(good) >= BUNDLE_MIN:      # the vendor's bundle: one row, its earliest expiry
+            ends = sorted(w for w in (cert_when(c.get("notAfter")) for c in good) if w)
+            rows.append(("", ends[0] if ends else None, "%d certificates" % len(good), rel, "valid" if ends and ends[0] >= ref else "expired"))
+            if ends and ends[0] < ref:
+                bad.append((rel, "%d certificates" % len(good), "ended %s" % ends[0].strftime("%Y-%m-%d")))
+            continue
+        for c in good:
+            fp = c.get("_fp")
+            if fp and fp in seen:
+                continue
+            seen.add(fp)
+            nb, na = cert_when(c.get("notBefore")), cert_when(c.get("notAfter"))
+            subj = dn_cn(c.get("subject"))[:30] + (" (CA)" if c.get("_ca") else "")
+            if na and na < ref:
+                st = "expired %s ago" % _ago_text(ref - na)
+                bad.append((rel, subj, "ended %s, %s before collection" % (na.strftime("%Y-%m-%d"), _ago_text(ref - na))))
+            elif nb and nb > ref:
+                st = "not valid for %s more" % _ago_text(nb - ref)
+                bad.append((rel, subj, "not valid until %s, %s after collection" % (nb.strftime("%Y-%m-%d"), _ago_text(nb - ref))))
+            else:
+                st = "valid"
+            rows.append((nb.strftime("%Y-%m-%d") if nb else "", na, subj, rel, st))
+    w = max([len(r[2]) for r in rows] + [7])
+    detail = ["%-10s  %-10s  %6s  %-*s  %-48s %s" % ("STARTS", "EXPIRES", "DAYS", w, "SUBJECT", "FILE", "STATE")]
+    for nb, na, subj, rel, st in sorted(rows, key=lambda r: (r[4] == "valid", r[1] or datetime.datetime.max)):
+        detail.append(("%-10s  %-10s  %6s  %-*s  %-48s %s" % (nb, na.strftime("%Y-%m-%d") if na else "?", ((na - ref).days if na else ""), w, subj, rel, st)).rstrip())
+    detail.append("%s read · days counted from the collection time%s" % (plural(len(inv), "file"),
+                  " · sos does not collect etc/pki/katello, so the Satellite's 443 certificate is not among them" if ctx.get("role") == "satellite" and not any(r.startswith("etc/pki/katello/") for r, _, _ in inv) else ""))
+    extra = [l for l in cert_facts(t, ctx, inv, ref) if l.startswith(("server certificates", "chain:"))] + sig_lines(inv)
+    detail += extra
+    srcs = [r for r, _, _ in inv]
+    if bad:
+        first = bad[0]
+        value = ("%s: %s" % (first[0], first[2])) if len(bad) == 1 else "%d certificates: %s %s%s" % (len(bad), first[0], first[2], " · and %d more" % (len(bad) - 1))
+        return _issue("certs", title, "FOUND", value, detail, limit, "s04", srcs)
+    soon = min((r[1] for r in rows if r[1]), default=None)
+    return _issue("certs", title, "CLEAR", "%s valid at collection%s" % (plural(len(rows), "certificate"), (" · the earliest ends %s" % soon.strftime("%Y-%m-%d")) if soon else ""),
+                  detail, limit, "s04", srcs)
+
+
+# -- services
+MAIN_SERVICES = {
+    "satellite": [("foreman", ["foreman.service"]), ("httpd", ["httpd.service"]), ("postgresql", ["postgresql.service", "rh-postgresql12-postgresql.service"]),
+                  ("tomcat (Candlepin)", ["tomcat.service"]), ("pulpcore-api", ["pulpcore-api.service"]), ("pulpcore-content", ["pulpcore-content.service"]),
+                  ("pulpcore-worker", ["pulpcore-worker@"]), ("dynflow-sidekiq", ["dynflow-sidekiq@"]), ("foreman-proxy", ["foreman-proxy.service"]),
+                  ("redis", ["redis.service"]), ("puppetserver", ["puppetserver.service"])],
+    "capsule": [("foreman-proxy", ["foreman-proxy.service"]), ("httpd", ["httpd.service"]), ("postgresql", ["postgresql.service", "rh-postgresql12-postgresql.service"]),
+                ("pulpcore-api", ["pulpcore-api.service"]), ("pulpcore-content", ["pulpcore-content.service"]), ("pulpcore-worker", ["pulpcore-worker@"]),
+                ("redis", ["redis.service"]), ("puppetserver", ["puppetserver.service"])],
+}
+MAINT_STATUS = ["sos_commands/foreman/foreman-maintain_service_status", "sos_commands/foreman_installer/foreman-maintain_service_status",
+                "sos_commands/foreman/satellite-maintain_service_status"]
+UNIT_FILES = ["sos_commands/systemd/systemctl_list-unit-files"]
+
+
+def _status_like(text):
+    """{unit: {active, since}} from text laid out like systemctl status (satellite-maintain prints the same)."""
+    out, cur = {}, None
+    for l in (text or "").splitlines():
+        m = re.match(r"^\s*[^\w\s]{1,3}\s*(\S+\.service)(?:\s+-\s+.*)?$", l)
+        if m:
+            cur = out.setdefault(m.group(1), {"active": "", "since": ""})
+            continue
+        a = re.match(r"^\s*Active:\s*(.*?)(?:\s+since\s+(.*?))?(?:;\s*.*)?$", l)
+        if a and cur is not None and not cur["active"]:
+            cur["active"], cur["since"] = a.group(1), a.group(2) or ""
+    return out
+
+
+UNIT_SHOW = ["sos_commands/systemd/systemctl_show_service_--all"]
+_SHOW_KEYS = ("NRestarts", "MemoryCurrent", "MemoryPeak", "LimitNOFILE", "LimitNOFILESoft", "TasksCurrent")
+
+
+def unit_show(t):
+    """({unit: {property: value, '_ln': the line its Id= is on}}, file) from systemctl show: what systemd itself counts for
+    each service (restarts since boot, memory now and at its highest, the open-file limits in force). ({}, None) when
+    the file is not in the report."""
+    text, rel = t.read(UNIT_SHOW, limit=32 * 1024 * 1024)
+    if text is None:
+        return {}, None
+    out, cur, uid, ln = {}, {}, None, 0
+    for n, l in enumerate(text.split("\n"), 1):
+        if not l.strip():                      # a blank line ends a unit
+            if uid:
+                out[uid] = dict(cur, _ln=ln)
+            cur, uid = {}, None
+            continue
+        k, eq, v = l.partition("=")
+        if k == "Id":
+            uid, ln = v.strip(), n
+        elif eq and k in _SHOW_KEYS:
+            cur[k] = v.strip()
+    if uid:
+        out[uid] = dict(cur, _ln=ln)
+    return out, rel
+
+
+def _show_int(d, key):
+    """A property as a number; None when it is not set ('[not set]', 'infinity', the largest 64-bit number)."""
+    v = (d or {}).get(key, "")
+    return int(v) if v.isdigit() and int(v) < 2 ** 62 else None
+
+
+def show_cells(show, units):
+    """(restarts, 'memory now / peak', 'soft / hard' open files) for a service's units, from systemctl show; '-' where
+    systemd gives no figure. Several instances: restarts and memory now are summed, the peak is the largest one's."""
+    ds = [show[u] for u in units if u in show]
+    if not ds:
+        return "-", "-", "-"
+    rs = [x for x in (_show_int(d, "NRestarts") for d in ds) if x is not None]
+    now = [x for x in (_show_int(d, "MemoryCurrent") for d in ds) if x is not None]
+    peak = [x for x in (_show_int(d, "MemoryPeak") for d in ds) if x is not None]
+    soft, hard = _show_int(ds[0], "LimitNOFILESoft"), _show_int(ds[0], "LimitNOFILE")
+    mem = (human(sum(now)) if now else "-") + ((" / " + human(max(peak))) if peak else "")
+    return (str(sum(rs)) if rs else "-"), mem, ("%s / %s" % (soft, hard) if soft is not None and hard is not None else str(hard) if hard is not None else "-")
+
+
+def main_services(t, ctx, role=None):
+    """[(name, state, since, up_for, bad, the units not running, every unit)] for the services the host's role runs, and the files read. A service that no
+    file names is left out: it is not on this host (an external database, Puppet not enabled)."""
+    role = role or ctx.get("role")
+    if role not in MAIN_SERVICES:
+        return None, []
+    st, srel = unit_status(t)
+    states, lrel = unit_states(t)
+    mt, mrel = t.read(MAINT_STATUS)
+    ms = _status_like(mt)
+    uf, ufrel = t.read(UNIT_FILES)
+    enabled = {}
+    for l in (uf or "").splitlines():
+        m = re.match(r"^(\S+\.service)\s+(\S+)", l)
+        if m:
+            enabled[m.group(1)] = m.group(2)
+    if st is None and states is None and not ms:
+        return None, []
+    st, states = st or {}, states or {}
+    ref = parse_when(ctx.get("collected", ""))
+    rows = []
+    for name, keys in MAIN_SERVICES[role]:
+        units = sorted(set(u for u in list(st) + list(states) + list(ms) if any((u.startswith(k) if k.endswith("@") else u == k) for k in keys)))
+        if not units:
+            continue
+        info = []
+        for u in units:
+            a = (st.get(u) or {}).get("active") or (ms.get(u) or {}).get("active") or states.get(u, "")
+            since = (st.get(u) or {}).get("since") or (ms.get(u) or {}).get("since") or ""
+            word = a.split()[0] if a else "?"
+            if word == "inactive" and name == "puppetserver" and enabled.get(u) != "enabled":
+                continue                                                 # Puppet installed but not in use
+            if word == "inactive" and "@" not in u and enabled.get(u) in ("disabled", "masked", "static"):
+                continue                                                 # not meant to run
+            bad = word in ("failed", "activating", "deactivating") or (word == "inactive" and (enabled.get(u) == "enabled" or "@" in u or not enabled))
+            info.append((u, a or "?", since, bad))
+        if not info:
+            continue
+        if len(info) == 1:
+            u, a, since, bad = info[0]
+            res = re.search(r"\(Result: ([^)]*)\)", a)
+            state = (re.sub(r"\s*\(Result: [^)]*\)", "", a) + (" · " + res.group(1) if res else ""))[:40]
+        else:
+            n_ok = sum(1 for x in info if not x[3])
+            state = "%d of %d running" % (n_ok, len(info))
+            bad = n_ok < len(info)
+            since = max((x[2] for x in info if x[2]), key=lambda s: parse_when(s) or datetime.datetime.min, default="")
+        w = parse_when(since) if since else None
+        upfor = ""
+        if w and ref:
+            upfor = ("down " if bad else "") + _ago_text(ref - w)
+        rows.append((name + ("" if len(info) == 1 else " (%d)" % len(info)), state, w.strftime("%Y-%m-%d %H:%M") if w else "", upfor, bad,
+                     [x[0] for x in info if x[3]], [x[0] for x in info]))
+    return rows, [r for r in (srel, lrel, mrel, ufrel) if r]
+
+
+def services_lines(rows, show=None):
+    """The table of main services. With systemctl show: what systemd counts for each (restarts since boot, memory now
+    and at its highest where systemd keeps it, the open-file limits in force)."""
+    if not show:
+        lines = ["%-22s %-38s %-17s %s" % ("SERVICE", "STATE", "SINCE", "UP FOR")]
+        for r in rows:
+            lines.append(("%-22s %-38s %-17s %s" % (r[0], r[1], r[2] or "—", r[3] or "—")).rstrip())
+        return lines
+    fmt = "%-22s %-38s %-17s %-12s %8s   %-22s %s"
+    lines = [fmt % ("SERVICE", "STATE", "SINCE", "UP FOR", "RESTARTS", "MEMORY NOW / PEAK" if any("MemoryPeak" in d for d in show.values()) else "MEMORY NOW", "OPEN FILES (SOFT / HARD)")]
+    for r in rows:
+        rs, mem, nof = show_cells(show, r[6])
+        lines.append((fmt % (r[0], r[1], r[2] or "—", r[3] or "—", rs, mem, nof)).rstrip())
+    return lines
+
+
+def hammer_ping(t):
+    """[(service, status, response)] from hammer ping, and its path; [] when the file holds no answer, None when missing."""
+    text, rel = t.read(["sos_commands/foreman/hammer_ping"])
+    if text is None:
+        return None, None
+    out, cur = [], None
+    for l in text.splitlines():
+        m = re.match(r"^([\w-]+):\s*$", l)
+        if m:
+            cur = [m.group(1), "", ""]
+            out.append(cur)
+            continue
+        if cur is None:
+            continue
+        s = re.match(r"^\s+Status:\s*(.*)$", l)
+        r = re.match(r"^\s+(?:Server Response|message):\s*(.*)$", l)
+        if s:
+            cur[1] = s.group(1).strip()
+        elif r and not cur[2]:
+            cur[2] = r.group(1).strip()
+    return [tuple(x) for x in out if x[1]], rel
+
+
+def check_services(t, ctx):
+    title = "required service not running"
+    limit = "a service this role runs is failed, restarting or stopped while enabled, or hammer ping says FAIL"
+    if ctx.get("role") not in MAIN_SERVICES:
+        return _issue("services", title, "NA", "applies to a Satellite or Capsule")
+    rows, srcs = main_services(t, ctx)
+    ping, prel = hammer_ping(t) if ctx.get("role") == "satellite" else (None, None)
+    if rows is None and not ping:
+        return _issue("services", title, "CANNOT", "systemctl status, systemctl list-units and satellite-maintain service status are not in this report", limit=limit, see="main services")
+    detail = services_lines(rows or [])
+    fails = [p for p in (ping or []) if p[1].upper() != "OK"]
+    if ping:
+        detail += ["", "hammer ping   " + " · ".join("%s %s" % (p[0], p[1]) + (" (%s)" % p[2][:50] if p[1].upper() != "OK" and p[2] else "") for p in ping)]
+    down = [r for r in (rows or []) if r[4]]
+    if down or fails:
+        bits = []
+        if down:
+            bits.append(", ".join(r[0] for r in down[:5]) + (" and %d more" % (len(down) - 5) if len(down) > 5 else "") + " not running")
+        if fails:
+            bits.append("hammer ping: " + ", ".join("%s %s" % (p[0], p[1]) for p in fails))
+        return _issue("services", title, "FOUND", " · ".join(bits), detail, limit, "main services", srcs + ([prel] if prel else []))
+    return _issue("services", title, "CLEAR", "%s running%s" % (plural(len(rows or []), "main service"), " · hammer ping all ok" if ping else ""), detail, limit,
+                  "main services", srcs + ([prel] if prel else []))
+
+
+# -- file systems
+DF = ["df", "sos_commands/filesys/df_-al_-x_autofs", "sos_commands/filesys/df_-al", "sos_commands/filesys/df_-alP"]
+MOUNT = ["mount", "sos_commands/filesys/mount_-l", "sos_commands/filesys/mount"]
+
+
+def df_rows(t):
+    """[(device, use %, mount point, line)] for the file systems on a disk, and the file read."""
+    text, rel = t.read(DF)
+    if text is None:
+        return None, None
+    rows, carry = [], ""
+    for l in text.splitlines()[1:]:
+        if carry:
+            l, carry = carry + " " + l.strip(), ""
+        p = l.split()
+        if len(p) == 1:
+            carry = l.strip()
+            continue
+        m = re.search(r"\s(\d+)%\s+(/\S*)\s*$", l)
+        if m and p and _FS_DEV.match(p[0]):
+            rows.append((p[0], int(m.group(1)), m.group(2), l.rstrip()))
+    return rows, rel
+
+
+def check_filesystems(t, ctx):
+    title = "file system full or read-only"
+    limit = "a file system on a disk is at 100%, or mounted read-only"
+    rows, rel = df_rows(t)
+    if rows is None:
+        return _issue("filesystems", title, "CANNOT", "the output of df is not in this report", limit=limit, see="filesystems (df")
+    mt, mrel = t.read(MOUNT)
+    ro = []
+    for l in (mt or "").splitlines():
+        m = re.match(r"^(\S+) on (\S+) type (\S+) \(([^)]*)\)", l)
+        if m and _FS_DEV.match(m.group(1)) and m.group(4).split(",")[0] == "ro" and m.group(3) not in ("iso9660", "squashfs", "udf"):
+            ro.append((m.group(2), l.strip()))
+    full = [r for r in rows if r[1] >= 100]
+    detail = ["%-40s %5s  %s" % ("FILE SYSTEM", "USE%", "MOUNTED ON")] + ["%-40s %4d%%  %s" % (d[:40], u, mp) for d, u, mp, _ in sorted(rows, key=lambda r: -r[1])]
+    if mt is None:
+        detail.append("read-only not checked: the output of mount is not in this report")
+    for mp, l in ro:
+        detail.append("read-only: " + l)
+    if full or ro:
+        bits = ["%s at %d%%" % (mp, u) for _, u, mp, _ in full] + ["%s mounted read-only" % mp for mp, _ in ro]
+        return _issue("filesystems", title, "FOUND", " · ".join(bits), detail, limit, "filesystems (df", [rel] + ([mrel] if mrel else []))
+    top_ = max(rows, key=lambda r: r[1]) if rows else None
+    return _issue("filesystems", title, "CLEAR", ("fullest: %s at %d%%" % (top_[2], top_[1]) if top_ else "no file system on a disk in df") +
+                  (" · none read-only" if mt is not None else " · read-only not checked (no mount output)"), detail, limit, "filesystems (df", [rel] + ([mrel] if mrel else []))
+
+
+def check_rootfree(t, ctx):
+    title = "less than %d GB free on /" % ROOT_FREE_GB
+    limit = "the file system that holds / has less than %d GB available (the installer and upgrades need it)" % ROOT_FREE_GB
+    if ctx.get("role") not in ("satellite", "capsule"):
+        return _issue("rootfree", title, "NA", "applies to a Satellite or Capsule")
+    text, rel = t.read(DF)
+    if text is None:
+        return _issue("rootfree", title, "CANNOT", "the output of df is not in this report", limit=limit, see="filesystems (df")
+    head = (text.splitlines() or [""])[0]
+    row = next((l for l in text.splitlines()[1:] if re.search(r"\s\d+%\s+/\s*$", l) and not l.startswith("rootfs")), None)
+    m = re.search(r"(\S+)\s+\d+%\s+/\s*$", row or "")
+    av = re.match(r"^([\d.]+)([KMGTP]?)i?$", m.group(1)) if m else None
+    if not av or ("1K-blocks" in head or "1024-blocks" in head) and av.group(2):
+        return _issue("rootfree", title, "CANNOT", "%s has no line for / with its available space" % rel, [head] + ([row] if row else []), limit, "filesystems (df", [rel])
+    # df prints 1K blocks, or with -h a size with its unit
+    free = float(av.group(1)) * {"": 1.0 if "1K-blocks" in head or "1024-blocks" in head else 1 / 1024.0, "K": 1.0, "M": 1024.0, "G": 1048576.0, "T": 1073741824.0,
+                                 "P": 1099511627776.0}[av.group(2)] / 1048576.0
+    val = "%.1f GB available on /" % free
+    return _issue("rootfree", title, "FOUND" if free < ROOT_FREE_GB else "CLEAR", val, [head, row.rstrip()], limit, "filesystems (df", [rel])
+
+
+def check_noexec(t, ctx):
+    sat = ctx.get("role") in ("satellite", "capsule")
+    title = "/tmp or /var/tmp mounted noexec" if sat else "/var/tmp mounted noexec"
+    limit = ("/tmp or /var/tmp is mounted with noexec: the Puppet server and the installer run files from /tmp, remote execution runs its scripts from /var/tmp" if sat else
+             "/var/tmp is mounted with noexec: remote execution from a Satellite runs its scripts from /var/tmp")
+    mt, mrel = t.read(MOUNT)
+    if mt is None:
+        return _issue("noexec", title, "CANNOT", "the output of mount is not in this report", limit=limit)
+    rows = {}
+    for l in mt.splitlines():
+        m = re.match(r"^(\S+) on (/tmp|/var/tmp|/var) type (\S+) \(([^)]*)\)", l)
+        if m:
+            rows[m.group(2)] = (m.group(4).split(","), l.strip())           # a later mount on the same place is the one in force
+    # /var/tmp without a mount of its own is on /var (or /); /tmp on /
+    bad = [(mp, l) for mp, (opts, l) in rows.items() if "noexec" in opts and (mp != "/var" or "/var/tmp" not in rows) and (sat or mp != "/tmp")]
+    detail = [l for _, (o, l) in sorted(rows.items())] or ["no separate mount for /tmp, /var/tmp or /var: they are on /"]
+    if bad:
+        return _issue("noexec", title, "FOUND", " · ".join("%s is noexec%s" % (mp, " (it holds /var/tmp)" if mp == "/var" else "") for mp, _ in sorted(bad)), detail, limit, "", [mrel])
+    return _issue("noexec", title, "CLEAR", "neither is mounted noexec" if sat else "not mounted noexec", detail, limit, "", [mrel])
+
+
+# -- clock
+def check_clock(t, ctx):
+    title = "clock not synchronised"
+    limit = "the host says it is not synchronised, no time source is selected, or it is more than %d s off" % CLOCK_LIMIT
+    td, tdrel = t.read(["sos_commands/systemd/timedatectl", "sos_commands/date/timedatectl"])
+    tr, trrel = t.read(["sos_commands/chrony/chronyc_tracking", "sos_commands/chrony/chronyc_-n_tracking"])
+    so, sorel = t.read(["sos_commands/chrony/chronyc_-n_sources", "sos_commands/chrony/chronyc_sources"])
+    nq, nqrel = t.read(["sos_commands/ntp/ntpq_-p", "sos_commands/ntp/ntpq_-pn"])
+    if td is None and tr is None and so is None and nq is None:
+        return _issue("clock", title, "CANNOT", "neither timedatectl nor chronyc nor ntpq output is in this report", limit=limit)
+    detail, why = [], []
+    for text, pat in ((td, r"Time zone|synchronized|NTP service|RTC in local"), (tr, r"Reference ID|Stratum|System time|Leap status"),
+                      (so, r"^[\^=#][-*+?x~] "), (nq, r"^[ *+#x.-o]\S")):
+        detail += [l.rstrip() for l in (text or "").splitlines() if re.search(pat, l)]
+    m = re.search(r"(?:System clock|NTP) synchronized:\s*(\w+)", td or "")
+    if m and m.group(1).lower() == "no":
+        why.append("timedatectl: not synchronised")
+    if re.search(r"Leap status\s*:\s*Not synchronised", tr or ""):
+        why.append("chrony: Not synchronised")
+    off = re.search(r"System time\s*:\s*([\d.]+) seconds (fast|slow)", tr or "")
+    if off and float(off.group(1)) > CLOCK_LIMIT:
+        why.append("%s s %s" % (off.group(1), off.group(2)))
+    sel = None
+    if so is not None:
+        sel = next((l.split()[1] for l in so.splitlines() if l.startswith("^*") and len(l.split()) > 1), None)
+        if sel is None:
+            why.append("chrony: no time source selected")
+    elif nq is not None:
+        sel = next((l[1:].split()[0] for l in nq.splitlines() if l.startswith("*") and len(l) > 1), None)
+        if sel is None:
+            why.append("ntpd: no peer selected")
+    srcs = [r for r in (tdrel, trrel, sorel, nqrel) if r]
+    if why:
+        return _issue("clock", title, "FOUND", " · ".join(why), detail, limit, "", srcs)
+    return _issue("clock", title, "CLEAR", "synchronised" + (" to %s" % sel if sel else "") + (", %s s %s" % (off.group(1), off.group(2)) if off else ""), detail, limit, "", srcs)
+
+
+# -- memory
+def check_oom(t, ctx):
+    title = "out-of-memory kills in the last %d days" % OOM_DAYS
+    limit = "the kernel killed a process for lack of memory in the %d days before collection" % OOM_DAYS
+    text, rel = t.read(LOGS, tail=True, limit=LOG_READ)
+    if text is None:
+        return _issue("oom", title, "CANNOT", "neither var/log/messages nor the journal is in this report", limit=limit, see="out-of-memory kills")
+    ref = ref_time(ctx)
+    hits = [l for l in text.split("\n") if "Out of memory" in l or "oom-kill:" in l or "Killed process" in l]
+    kills = [l for l in hits if re.search(r"Out of memory: Killed process|Killed process \d+ \(", l)]
+    if ref is None:
+        return _issue("oom", title, "CANNOT", "the collection time is not in this report", limit=limit, see="out-of-memory kills", src=[rel])
+    cut = ref - datetime.timedelta(days=OOM_DAYS)
+    recent = []
+    for l in kills:
+        w = parse_when(l[:40], ref)
+        if w is not None and w >= cut:
+            recent.append(l.rstrip())
+    names = {}
+    for l in recent:
+        m = re.search(r"Killed process \d+ \(([^)]+)\)", l)
+        if m:
+            names[m.group(1)] = names.get(m.group(1), 0) + 1
+    if recent:
+        return _issue("oom", title, "FOUND", "%s: %s" % (plural(len(recent), "kill"), ", ".join("%s ×%d" % kv for kv in sorted(names.items(), key=lambda kv: -kv[1])[:5])),
+                      recent[::-1][:15], limit, "out-of-memory kills", [rel])
+    return _issue("oom", title, "CLEAR", "none in %s%s" % (rel, (" · %d older" % len(kills)) if kills else ""), [], limit, "out-of-memory kills", [rel])
+
+
+# -- tasks
+def _task_table(t, cid, title, limit):
+    """(rows, rel, ref) of the Foreman task table, or the issue that says why it cannot be read."""
+    rows, kind, rel, hdr = task_rows(t)
+    if rows is None:
+        return _issue(cid, title, "CANNOT", "%s is not in this report" % TASKS[0], limit=limit, see="tasks at a glance"), None, None
+    if kind not in ("csv", "pipe") or "state" not in hdr or "started_at" not in hdr:
+        return _issue(cid, title, "CANNOT", "%s could not be read as a table" % rel, limit=limit, see="tasks at a glance", src=[rel]), None, None
+    return rows, rel, None
+
+
+def _utc_ref(ctx):
+    ref = parse_when(ctx.get("collected", ""))
+    if ref is not None and ctx.get("utc_offset"):
+        ref = ref - datetime.timedelta(minutes=ctx["utc_offset"])        # the tables' times are UTC
+    return ref
+
+
+def check_stuck(t, ctx):
+    title = "tasks stuck in pending or planning"
+    limit = "a task is in state pending or planning more than %d hour after it started (or has no start time)" % STUCK_HOURS
+    if ctx.get("role") != "satellite":
+        return _issue("stuck", title, "NA", "applies to a Satellite")
+    rows, rel, _ = _task_table(t, "stuck", title, limit)
+    if rel is None:
+        return rows
+    ref = _utc_ref(ctx)
+    if ref is None:
+        return _issue("stuck", title, "CANNOT", "the collection time is not in this report", limit=limit, see="tasks at a glance", src=[rel])
+    cut = ref - datetime.timedelta(hours=STUCK_HOURS)
+    st = []
+    for r in rows:
+        if (r.get("state") or "") in ("pending", "planning"):
+            w = parse_when((r.get("started_at") or "")[:19].replace("T", " "))
+            if w is None or w < cut:
+                st.append((w, r))
+    st.sort(key=lambda x: x[0] or datetime.datetime.min)
+    detail = ["%-17s  %-9s %-38s %s" % ("STARTED (UTC)", "STATE", "ID", "LABEL")] + [
+        "%-17s  %-9s %-38s %s" % (w.strftime("%Y-%m-%d %H:%M") if w else "(none)", r.get("state"), r.get("id", "")[:38], (r.get("label") or "")[:60]) for w, r in st[:10]]
+    if len(st) > 10:
+        detail.append("… %d more · the Tasks tab lists them all" % (len(st) - 10))
+    if st:
+        n = dict((k, sum(1 for _, r in st if r.get("state") == k)) for k in ("pending", "planning"))
+        return _issue("stuck", title, "FOUND", " · ".join("%s %s" % (fmt_n(v), k) for k, v in n.items() if v), detail, limit, "tasks at a glance", [rel])
+    return _issue("stuck", title, "CLEAR", "none among the %s tasks in the table" % fmt_n(len(rows)), [], limit, "tasks at a glance", [rel])
+
+
+def check_pulpwait(t, ctx):
+    title = "Pulp tasks waiting over %d hour" % PULP_WAIT_HOURS
+    limit = "a Pulp task is in state waiting more than %d hour after it was created: no worker has taken it" % PULP_WAIT_HOURS
+    if ctx.get("role") not in ("satellite", "capsule"):
+        return _issue("pulpwait", title, "NA", "applies to a Satellite or Capsule")
+    rows, rel = read_pulp_table(t, PULP_TASK_TABLE)
+    if rows is None:
+        return _issue("pulpwait", title, "CANNOT", "%s is not in this report" % PULP_TASK_TABLE[0], limit=limit, see="failed Pulp tasks")
+    if not rows or "state" not in rows[0] or "pulp_created" not in rows[0]:
+        return _issue("pulpwait", title, "CANNOT", "%s has no state or pulp_created column (or no rows)" % rel, limit=limit, see="failed Pulp tasks", src=[rel])
+    ref = _utc_ref(ctx)
+    if ref is None:
+        return _issue("pulpwait", title, "CANNOT", "the collection time is not in this report", limit=limit, src=[rel])
+    cut = ref - datetime.timedelta(hours=PULP_WAIT_HOURS)
+    wait, run = [], 0
+    for r in rows:
+        stt = (r.get("state") or "").strip()
+        run += stt == "running"
+        if stt == "waiting":
+            w = parse_when((r.get("pulp_created") or "").strip()[:19].replace("T", " "))
+            if w is not None and w < cut:
+                wait.append((w, r))
+    wait.sort(key=lambda x: x[0])
+    detail = ["%-17s  %-38s %s" % ("CREATED (UTC)", "PULP TASK", "NAME")] + ["%-17s  %-38s %s" % (w.strftime("%Y-%m-%d %H:%M"), (r.get("pulp_id") or "").strip()[:38],
+                                                                                         (r.get("name") or "").strip()[:60]) for w, r in wait[:10]]
+    if wait:
+        return _issue("pulpwait", title, "FOUND", "%s waiting · the oldest since %s, %s before collection · %s running" % (
+            fmt_n(len(wait)), wait[0][0].strftime("%Y-%m-%d %H:%M"), _ago_text(ref - wait[0][0]), fmt_n(run)), detail, limit, "failed Pulp tasks", [rel])
+    return _issue("pulpwait", title, "CLEAR", "none · %s running at collection" % fmt_n(run), [], limit, "failed Pulp tasks", [rel])
+
+
+def check_paused(t, ctx):
+    title = "paused tasks over %d days" % PAUSED_DAYS
+    limit = "a task is paused and started more than %d days before collection" % PAUSED_DAYS
+    if ctx.get("role") != "satellite":
+        return _issue("paused", title, "NA", "applies to a Satellite")
+    rows, kind, rel, hdr = task_rows(t)
+    if rows is None:
+        return _issue("paused", title, "CANNOT", "%s is not in this report" % TASKS[0], limit=limit, see="tasks at a glance")
+    if kind == "error":
+        first = ((t.read([rel], limit=4096)[0] or "").strip().splitlines() or [""])[0][:160]
+        return _issue("paused", title, "CANNOT", "%s holds an error message instead of the tasks: the database query failed when sos ran%s" % (rel, (": " + first) if first else ""),
+                      limit=limit, see="tasks at a glance", src=[rel])
+    if kind not in ("csv", "pipe") or "state" not in hdr or "started_at" not in hdr:
+        return _issue("paused", title, "CANNOT", "%s could not be read as a table" % rel, limit=limit, see="tasks at a glance", src=[rel])
+    ref = parse_when(ctx.get("collected", ""))
+    if ref is None:
+        return _issue("paused", title, "CANNOT", "the collection time is not in this report", limit=limit, see="tasks at a glance", src=[rel])
+    if ctx.get("utc_offset"):
+        ref = ref - datetime.timedelta(minutes=ctx["utc_offset"])        # the table's times are UTC
+    cut = ref - datetime.timedelta(days=PAUSED_DAYS)
+    paused = []
+    for r in rows:
+        if (r.get("state") or "") != "paused":
+            continue
+        w = parse_when((r.get("started_at") or "")[:19].replace("T", " "))
+        if w:
+            paused.append((w, r))
+    paused.sort(key=lambda x: x[0])
+    old = [x for x in paused if x[0] < cut]
+    detail = ["%-17s  %-38s %s" % ("STARTED (UTC)", "ID", "LABEL")] + ["%-17s  %-38s %s" % (w.strftime("%Y-%m-%d %H:%M"), r.get("id", "")[:38], (r.get("label") or "")[:60])
+                                                                      for w, r in (old or paused)[:10]]
+    if len(old or paused) > 10:
+        detail.append("… %d more · the Tasks tab lists them all" % (len(old or paused) - 10))
+    if old:
+        return _issue("paused", title, "FOUND", "%s paused for more than %d days · the oldest started %s, %s before collection" % (
+            fmt_n(len(old)), PAUSED_DAYS, old[0][0].strftime("%Y-%m-%d"), _ago_text(ref - old[0][0])), detail, limit, "tasks at a glance", [rel])
+    if t.tailed(rel):
+        return _issue("paused", title, "CANNOT", "sos kept only the end of %s, so older tasks may be missing from it" % rel, detail, limit, "tasks at a glance", [rel])
+    # sos exports the tasks of a time window (a month by default): say so when the table starts inside the limit
+    first = min([w for w in (parse_when((r.get("started_at") or "")[:19].replace("T", " ")) for r in rows) if w] or [None], key=lambda w: w) if rows else None
+    short = (" · the table starts %s, %s before collection: older tasks are not in it" % (first.strftime("%Y-%m-%d"), _ago_text(ref - first))) if first and first > cut else ""
+    if not paused:
+        return _issue("paused", title, "CLEAR", "no paused tasks" + short, [], limit, "tasks at a glance", [rel])
+    return _issue("paused", title, "CLEAR", "%s paused · the oldest started %s, %s before collection" % (fmt_n(len(paused)), paused[0][0].strftime("%Y-%m-%d"),
+                  _ago_text(ref - paused[0][0])) + short, detail, limit, "tasks at a glance", [rel])
+
+
+# -- installer
+_INST_END = re.compile(r"Exit with status code:\s*(\d+)|exit status (\d+)|Puppet has (finished)|(Success!)|(Upgrade completed)|Puppet has (failed)")
+
+
+def check_installer(t, ctx):
+    title = "last installer run failed"
+    limit = ("the last run ended with a failure (Puppet's status 4 or 6, or an exit code other than 0 or 2) · runs that change nothing are left out: "
+             "--help, --noop, --list-scenarios, or only words the installer does not take, such as 'version'")
+    if ctx.get("role") not in ("satellite", "capsule"):
+        return _issue("installer", title, "NA", "applies to a Satellite or Capsule")
+    found = []
+    for cand in INSTALLER:                     # every installer log: a Capsule can hold a satellite.log with no run in it
+        text, rel = t.read([cand], tail=True, limit=LOG_READ)
+        if text is not None:
+            found.append(_installer_one(t, ctx, title, limit, rel, text))
+    if not found:
+        return _issue("installer", title, "CANNOT", "no installer log (%s) is in this report" % ", ".join(x.rsplit("/", 1)[-1] for x in INSTALLER), limit=limit, see="how the runs ended")
+    with_runs = [x for x in found if x["_real"]]
+    if with_runs:      # the log whose last run that changes something started last
+        pick = max(with_runs, key=lambda x: (x["_when"] is not None, x["_when"] or datetime.datetime.min))
+    else:              # none has a run: the log of this role says why
+        own = "capsule.log" if ctx.get("role") == "capsule" else "satellite.log"
+        pick = next((x for x in found if any(r.endswith(own) for r in x.get("src") or [])), found[0])
+    if len(found) > 1:
+        pick["value"] += " · from %s, the log of %d whose last run started last" % ((pick.get("src") or ["?"])[0].rsplit("/", 1)[-1], len(found)) if with_runs else ""
+    for x in found:
+        x.pop("_real", None)
+        x.pop("_when", None)
+    return pick
+
+
+def _installer_one(t, ctx, title, limit, rel, text):
+    """The installer check on one installer log. The result carries _real (the log holds a run that changes something)
+    and _when (when that last run started)."""
+    state = {"real": False, "when": None}
+
+    def _one(*a, **k):
+        r = _issue(*a, **k)
+        r["_real"], r["_when"] = state["real"], state["when"]
+        return r
+    lines = text.splitlines()
+    starts = [i for i, l in enumerate(lines) if re.search(r"Running installer with (args|log based terminal output)", l)]
+    if not starts:
+        return _one("installer", title, "CANNOT", "%s holds no line where a run starts%s" % (rel, ": sos kept only its end" if t.tailed(rel) else ""), limit=limit,
+                      see="how the runs ended", src=[rel])
+    # one run logs 'with args' and 'log based terminal output' on lines next to each other: group them
+    runs, cur, last = [], None, -9
+    for i, l in enumerate(lines):
+        if re.search(r"Running installer with (args|log based terminal output)", l):
+            if cur is None or cur["end"] is not None or i - last > 3:        # the two start lines of one run sit next to each other
+                cur = {"i": i, "args": None, "end": None}
+                runs.append(cur)
+            last = i
+            if installer_args(l) is not None:
+                cur["args"] = installer_args(l)
+        elif cur is not None and cur["end"] is None and _INST_END.search(l):
+            cur["end"] = i
+    skipped = [r for r in runs if installer_looks(r["args"])]
+    real = [r for r in runs if not installer_looks(r["args"])]
+    state["real"] = bool(real)
+    later = [r for r in skipped if real and r["i"] > real[-1]["i"]]
+    skip_note = (" · %s after it changed nothing and %s left out: %s" % (plural(len(later), "run"), "is" if len(later) == 1 else "are", ", ".join(sorted(set(" ".join(r["args"]) for r in later)))[:50])
+                 if later else "")
+    if not real:
+        return _one("installer", title, "CANNOT", "the log holds no run that changes anything, only %s that %s nothing (%s)" % (
+            plural(len(skipped), "run"), "changes" if len(skipped) == 1 else "change", ", ".join(sorted(set(" ".join(r["args"]) for r in skipped)))[:50]), limit=limit, see="how the runs ended", src=[rel])
+    i0 = real[-1]["i"]
+    i1 = next((r["i"] for r in runs if r["i"] > i0), len(lines))       # this run's lines end where the next run starts
+    code, endl = None, None
+    for l in lines[i0:i1]:
+        m = _INST_END.search(l)
+        if not m:
+            continue
+        endl = l
+        if m.group(1) or m.group(2):
+            code = int(m.group(1) or m.group(2))
+        elif m.group(6):
+            code = code if code is not None else 6
+        elif code is None:
+            code = 0
+    when = parse_when(lines[i0][:60]) or parse_when(lines[i0][:100], ref_time(ctx))
+    state["when"] = when
+    detail = [lines[i0].rstrip()] + [l.rstrip() for l in lines[i0 + 1:i1] if re.search(r"^\[\s*ERROR|\[ERROR", l)][:3] + ([endl.rstrip()] if endl else [])
+    started = when.strftime("%Y-%m-%d %H:%M") if when else "time not on the line"
+    if endl is None:
+        return _one("installer", title, "CANNOT", "the last run (started %s) has no end line: it was interrupted, was still running, or the log was cut" % started,
+                      detail, limit, "how the runs ended", [rel])
+    if code not in (0, 2):
+        return _one("installer", title, "FOUND", "the run started %s ended with %s%s" % (started, ("status %d" % code) if code is not None else "a failure", skip_note),
+                      detail, limit, "how the runs ended", [rel])
+    return _one("installer", title, "CLEAR", "the run started %s ended without a failure%s%s" % (started, (" (status %d)" % code) if code else "", skip_note), detail, limit, "how the runs ended", [rel])
+
+
+# -- leapp
+def check_leapp(t, ctx):
+    title = "Leapp inhibitors"
+    limit = "the Leapp report holds an inhibitor: the upgrade will not start until it is dealt with"
+    js, jrel = t.read(["var/log/leapp/leapp-report.json"])
+    tx, trel = t.read(["var/log/leapp/leapp-report.txt"])
+    if js is None and tx is None:
+        return _issue("leapp", title, "NA", "no Leapp report on this host")
+    titles = []
+    if js is not None:
+        try:
+            for e in json.loads(js).get("entries", []):
+                if "inhibitor" in (e.get("flags") or []) + (e.get("groups") or []):
+                    titles.append(e.get("title", "(no title)"))
+            rel = jrel
+        except (ValueError, AttributeError):
+            js = None
+    if js is None:
+        rel = trel
+        ls = tx.splitlines()
+        for i, l in enumerate(ls):
+            if l.startswith("Risk Factor:") and "inhibitor" in l.lower():
+                titles.append(next((x[6:].strip() for x in ls[i + 1:i + 4] if x.startswith("Title:")), "(no title)"))
+    detail = ["inhibitor: " + x for x in titles[:10]]
+    if titles:
+        return _issue("leapp", title, "FOUND", "%s: %s%s" % (plural(len(titles), "inhibitor"), titles[0][:80], " · and %d more" % (len(titles) - 1) if len(titles) > 1 else ""),
+                      detail, limit, "Leapp report", [rel])
+    return _issue("leapp", title, "CLEAR", "the Leapp report holds no inhibitor", [], limit, "Leapp report", [rel])
+
+
+# -- packages
+_SAT_PKG = re.compile(r"^(satellite(?:-capsule|-cli|-common|-installer)?)-(\d+)\.(\d+)\.[\w.]+-\S+\.noarch\b")
+
+
+def _issue_rpms(t):
+    text, rel = t.read(["installed-rpms", "sos_commands/rpm/package-data"], limit=16 * 1024 * 1024)
+    return text, rel
+
+
+def check_versions(t, ctx):
+    title = "Satellite packages from two releases"
+    limit = "packages of two Satellite releases (x.y) are installed together, as a half-finished upgrade leaves them"
+    if ctx.get("role") not in ("satellite", "capsule"):
+        return _issue("versions", title, "NA", "applies to a Satellite or Capsule")
+    text, rel = _issue_rpms(t)
+    if text is None:
+        return _issue("versions", title, "CANNOT", "installed-rpms is not in this report", limit=limit, see="installed packages which contain satellite")
+    found = {}
+    for l in text.splitlines():
+        m = _SAT_PKG.match(l.split()[0] if l.split() else "")
+        if m:
+            found.setdefault("%s.%s" % (m.group(2), m.group(3)), []).append(l.split()[0])
+    detail = ["%-6s %s" % (v, ", ".join(sorted(p))) for v, p in sorted(found.items())]
+    pair = ctx.get("pair")
+    if pair and pair.get("ctx", {}).get("satellite"):
+        detail.append("paired report (%s): %s" % (pair["ctx"].get("hostname", ""), pair["ctx"]["satellite"]))
+    if not found:
+        return _issue("versions", title, "CANNOT", "no satellite or satellite-capsule package in installed-rpms", detail, limit, "installed packages which contain satellite", [rel])
+    if len(found) > 1:
+        return _issue("versions", title, "FOUND", " and ".join("%s (%s)" % (v, ", ".join(sorted(p))[:60]) for v, p in sorted(found.items())), detail, limit,
+                      "installed packages which contain satellite", [rel])
+    v = list(found)[0]
+    return _issue("versions", title, "CLEAR", "%s: all from %s" % (", ".join(sorted(found[v]))[:90], v), detail, limit, "installed packages which contain satellite", [rel])
+
+
+def check_hotfix(t, ctx):
+    title = "hotfix packages installed"
+    limit = "a package's release contains HOTFIX"
+    if ctx.get("role") not in ("satellite", "capsule"):
+        return _issue("hotfix", title, "NA", "applies to a Satellite or Capsule")
+    text, rel = _issue_rpms(t)
+    if text is None:
+        return _issue("hotfix", title, "CANNOT", "installed-rpms is not in this report", limit=limit, see="installed packages")
+    hf = [l.split()[0] for l in text.splitlines() if l.split() and "HOTFIX" in l.split()[0]]
+    if hf:
+        return _issue("hotfix", title, "FOUND", "%s: %s%s" % (plural(len(hf), "package"), hf[0], " · and %d more" % (len(hf) - 1) if len(hf) > 1 else ""),
+                      hf[:20], limit, "installed packages", [rel])
+    return _issue("hotfix", title, "CLEAR", "no package release contains HOTFIX", [], limit, "installed packages", [rel])
+
+
+# -- host name against the server certificate
+def check_hostname(t, ctx):
+    title = "host name not in its certificate"
+    limit = "the host's name is in neither the subject (CN) nor the alternative names (SAN) of the certificate it presents"
+    if ctx.get("role") not in ("satellite", "capsule"):
+        return _issue("hostname", title, "NA", "applies to a Satellite or Capsule")
+    host = (ctx.get("hostname") or "").strip()
+    rel = next((r for r in SERVER_CERT_FILES if read_certs(t, r)), None)
+    if rel is None:
+        return _issue("hostname", title, "CANNOT", "neither %s is in this report" % " nor ".join(SERVER_CERT_FILES), limit=limit, see="s04")
+    if not host or host in ("unknown", "?"):
+        return _issue("hostname", title, "CANNOT", "the host's name is not in this report", limit=limit, see="s04", src=[rel])
+    c = next((x for x in read_certs(t, rel) if "error" not in x), None)
+    if c is None:
+        return _issue("hostname", title, "CANNOT", "%s holds no readable certificate" % rel, limit=limit, see="s04", src=[rel])
+    cn = dn_cn(c.get("subject"))
+    san = [v for k, v in c.get("subjectAltName", ()) if k == "DNS"]
+    detail = ["host name   %s" % host, "certificate %s" % rel, "subject CN  %s" % cn, "SAN         %s" % (", ".join(san) or "(none)")]
+    ok = _name_fits(host, [cn] + san)              # a short host name is compared with the first part of each name
+    if "." not in host:
+        detail.append("the host's name is a short name: compared with the first part of each name")
+    if not ok:
+        return _issue("hostname", title, "FOUND", "%s is not in %s (CN %s%s)" % (host, rel, cn, (", SAN " + ", ".join(san[:3])) if san else ""), detail, limit, "s04", [rel])
+    return _issue("hostname", title, "CLEAR", "%s is in %s" % (host, rel), detail, limit, "s04", [rel])
+
+
+# -- the host against what a Satellite needs
+def check_sizing(t, ctx):
+    title = "memory or CPUs below the tuning profile"
+    limit = "the host has less memory or fewer CPUs than the installer's tuning profile is made for (default 20 GiB / 4, medium 32 / 8, large 64 / 16, " \
+            "extra-large 128 / 32, extra-extra-large 256 / 48; memory counts from %d%% of the figure)" % round(TUNING_SLACK * 100)
+    if ctx.get("role") != "satellite":
+        return _issue("sizing", title, "NA", "applies to a Satellite")
+    sc, srel = t.read(SCENARIO)
+    mi, mrel = t.read(["proc/meminfo"])
+    ci, crel = t.read(["proc/cpuinfo"])
+    if sc is None or mi is None or ci is None:
+        miss = [n for n, x in ((SCENARIO[0], sc), ("proc/meminfo", mi), ("proc/cpuinfo", ci)) if x is None]
+        return _issue("sizing", title, "CANNOT", "%s not in this report" % " and ".join(miss), limit=limit, see="installer tuning profile")
+    m = re.search(r"^\s*:?tuning:\s*['\"]?([\w-]+)", sc, re.M)
+    prof = m.group(1) if m else "default"
+    mt = re.search(r"^MemTotal:\s+(\d+) kB", mi, re.M)
+    cpus = len(re.findall(r"^processor\s*:", ci, re.M))
+    if prof not in TUNING_MIN or not mt or not cpus:
+        return _issue("sizing", title, "CANNOT", "tuning profile '%s', MemTotal or the processor count could not be read" % prof, limit=limit, see="installer tuning profile", src=[srel, mrel, crel])
+    gib = int(mt.group(1)) / 1048576.0
+    need_m, need_c = TUNING_MIN[prof]
+    detail = ["tuning profile  %s%s" % (prof, "" if m else " (no tuning: line: the default)"), "made for        %d GiB, %d CPUs" % (need_m, need_c), "this host       %.1f GiB (MemTotal), %d CPUs" % (gib, cpus)]
+    low = (["%.1f GiB of memory" % gib] if gib < need_m * TUNING_SLACK else []) + (["%d CPUs" % cpus] if cpus < need_c else [])
+    if low:
+        return _issue("sizing", title, "FOUND", "%s for the '%s' profile, made for %d GiB and %d CPUs" % (" and ".join(low), prof, need_m, need_c), detail, limit,
+                      "installer tuning profile", [srel, mrel, crel])
+    return _issue("sizing", title, "CLEAR", "%.1f GiB and %d CPUs for the '%s' profile (%d GiB, %d CPUs)" % (gib, cpus, prof, need_m, need_c), detail, limit,
+                  "installer tuning profile", [srel, mrel, crel])
+
+
+TMOUT_FILES = ["etc/profile", "etc/bashrc", "etc/environment", "etc/profile.d/*.sh", "root/.bash_profile", "root/.bashrc"]
+
+
+def check_tmout(t, ctx):
+    title = "shell timeout (TMOUT) set"
+    limit = "TMOUT is set in a shell profile: an idle shell is closed after that many seconds, which ends an installer or upgrade run in it"
+    if ctx.get("role") not in ("satellite", "capsule"):
+        return _issue("tmout", title, "NA", "applies to a Satellite or Capsule")
+    files = [r for pat in TMOUT_FILES for r in (t.glob(pat) if "*" in pat else ([pat] if t.exists(pat) else []))]
+    if not files:
+        return _issue("tmout", title, "CANNOT", "no shell profile (etc/profile, etc/profile.d, etc/bashrc) is in this report", limit=limit)
+    hits = []
+    for r in files:
+        for l in (t.read([r])[0] or "").splitlines():
+            m = re.match(r"^\s*(?:export\s+|readonly\s+|declare\s+-\w+\s+|typeset\s+-\w+\s+)*TMOUT=[\"']?(\d+)", l)
+            if m and int(m.group(1)) > 0:
+                hits.append((r, l.strip(), int(m.group(1))))
+    if hits:
+        return _issue("tmout", title, "FOUND", "TMOUT=%d in %s%s" % (hits[0][2], hits[0][0], " · and %d more" % (len(hits) - 1) if len(hits) > 1 else ""),
+                      ["%s: %s" % (r, l) for r, l, _ in hits], limit, "", [h[0] for h in hits])
+    return _issue("tmout", title, "CLEAR", "not set in %s" % plural(len(files), "profile file"), [], limit, "", files[:6])
+
+
+def check_ipv6(t, ctx):
+    title = "IPv6 disabled on the kernel command line"
+    limit = "the kernel was started with ipv6.disable=1: services that listen on ::1 or [::] cannot start (disabling it with sysctl leaves the module loaded)"
+    if ctx.get("role") not in ("satellite", "capsule"):
+        return _issue("ipv6", title, "NA", "applies to a Satellite or Capsule")
+    text, rel = t.read(["proc/cmdline"])
+    if text is None:
+        return _issue("ipv6", title, "CANNOT", "proc/cmdline is not in this report", limit=limit)
+    line = text.strip().splitlines()[0] if text.strip() else ""
+    if re.search(r"(^|\s)ipv6\.disable=1(\s|$)", line):
+        return _issue("ipv6", title, "FOUND", "ipv6.disable=1 is on the kernel command line", [line], limit, "", [rel])
+    return _issue("ipv6", title, "CLEAR", "ipv6.disable=1 is not on the kernel command line", [line], limit, "", [rel])
+
+
+def check_users(t, ctx):
+    title = "service user not in /etc/passwd"
+    limit = "a user a Satellite service runs as is not a local user in /etc/passwd (it must not come from LDAP, IdM or another identity provider)"
+    role = ctx.get("role")
+    if role not in ("satellite", "capsule"):
+        return _issue("users", title, "NA", "applies to a Satellite or Capsule")
+    text, rel = t.read(["etc/passwd"])
+    if text is None:
+        return _issue("users", title, "CANNOT", "etc/passwd is not in this report", limit=limit)
+    have = dict((l.split(":")[0], l.strip()) for l in text.splitlines() if ":" in l)
+    want = SAT_USERS if role == "satellite" else CAP_USERS
+    miss = [u for u in want if u not in have]
+    detail = [have[u] if u in have else "%s: (no line)" % u for u in want]
+    if miss:
+        return _issue("users", title, "FOUND", "%s not in etc/passwd" % ", ".join(miss), detail, limit, "", [rel])
+    return _issue("users", title, "CLEAR", "%s are local users" % ", ".join(want), detail, limit, "", [rel])
+
+
+ISSUE_CHECKS = (check_certs, check_services, check_filesystems, check_rootfree, check_noexec, check_clock, check_oom, check_paused, check_stuck, check_pulpwait,
+                check_installer, check_leapp, check_versions, check_hotfix, check_hostname, check_sizing, check_tmout, check_ipv6, check_users)
+
+
+def potential_issues(t, ctx):
+    """Every check, in order. A check that fails to run says so as CANNOT TELL instead of stopping the report."""
+    out = []
+    for fn in ISSUE_CHECKS:
+        try:
+            out.append(fn(t, ctx))
+        except Exception as e:
+            out.append(_issue(fn.__name__[6:], fn.__name__[6:], "CANNOT", "the check could not read its data (%s: %s)" % (type(e).__name__, str(e)[:80])))
+    return out
+
+
+ISSUE_WORD = {"FOUND": "FOUND", "CANNOT": "CANNOT TELL", "CLEAR": "clear", "NA": "not applicable"}
+
+
+def issues_text(issues):
+    """The section as text lines, for the text report."""
+    if not issues:
+        return []
+    o = ["== POTENTIAL ISSUES: each check compares one value in this report with a fixed limit ".ljust(96, "=")]
+    for x in issues:
+        if x["state"] == "FOUND":
+            o.append("FOUND        %s: %s" % (x["title"], x["value"]))
+            o += ["               " + l for l in x["detail"] if l]
+        elif x["state"] == "CANNOT":
+            o.append("CANNOT TELL  %s: %s" % (x["title"], x["value"]))
+    clear = [x["title"] for x in issues if x["state"] == "CLEAR"]
+    na = [x["title"] for x in issues if x["state"] == "NA"]
+    if clear:
+        o.append("clear        " + ", ".join(clear))
+    if na:
+        o.append("n/a          " + ", ".join(na))
+    return o
+
+
+def _issue_target(see, secs):
+    """'s04' stays a section; a block title prefix becomes that block's id; '' when the report has neither."""
+    if not see:
+        return ""
+    if re.match(r"^s\d\d$", see):
+        return see if any("s" + x["num"] == see for x in secs) else ""
+    for x in secs:
+        for i, b in enumerate(x["blocks"]):
+            if b["title"].startswith(see):
+                return "b%s-%d" % (x["num"], i)
+    return ""
+
+
+ISSUE_CLS = {"FOUND": "isf", "CANNOT": "isc", "CLEAR": "isk"}
+
+
+def issues_html(ctx, secs):
+    issues = ctx.get("issues") or []
+    if not issues:
+        return ""
+    name_of = {}
+    for x in secs:
+        name_of["s" + x["num"]] = x["title"]
+        for i, b in enumerate(x["blocks"]):
+            name_of["b%s-%d" % (x["num"], i)] = x["title"]
+
+    def link(x):
+        tg = _issue_target(x["see"], secs)
+        return ("<a class='ijl' href='#%s' title='the block this comes from'>%s ›</a>" % (tg, esc(name_of.get(tg, "")))) if tg else ""
+
+    def row(x, open_=False):
+        det = "\n".join(x["detail"])
+        body = ("<pre class='out'>%s</pre>" % esc(det) if det else "") + ("<div class='ijlim'>limit: %s%s</div>" % (esc(x["limit"]), (" · read from " + esc(", ".join(x["src"][:4]))) if x["src"] else "") if x["limit"] else "")
+        return ("<details class='ijr'%s><summary><span class='ijs %s'>%s</span><span class='ijt'>%s</span><span class='ijv'>%s</span>%s</summary><div class='ijd'>%s</div></details>"
+                % (" open" if open_ else "", ISSUE_CLS[x["state"]], ISSUE_WORD[x["state"]], esc(x["title"]), esc(x["value"]), link(x), body))
+    found = [x for x in issues if x["state"] == "FOUND"]
+    cannot = [x for x in issues if x["state"] == "CANNOT"]
+    clear = [x for x in issues if x["state"] == "CLEAR"]
+    na = [x for x in issues if x["state"] == "NA"]
+    head = " · ".join(p for p in ("<b class='isf'>%d found</b>" % len(found) if found else "", "<b class='isc'>%d cannot tell</b>" % len(cannot) if cannot else "",
+                                  "<b class='isk'>%d clear</b>" % len(clear) if clear else "", ("%d not applicable" % len(na)) if na else "") if p)
+    h = ["<section class='sec iss' id='s00'><div class='sh'><span class='t'>Potential issues</span><span class='s'>each check compares one value in this report with a fixed "
+         "limit · it says what crossed the limit, not why</span></div><div class='ijbox'><div class='ijhead'><span>%s</span><span class='r'>a line opens to its evidence · › goes to the block it comes from</span></div>" % head]
+    h += [row(x) for x in found + cannot]
+    if clear:
+        h.append("<details class='ijr ijclear'><summary><span class='ijs isk'>%s</span><span class='ijv'>%s</span>%s</summary><div class='ijd'>%s</div></details>" % (
+            "ALL CLEAR" if not found and not cannot else "%d CLEAR" % len(clear), esc(" · ".join(x["title"] for x in clear)),
+            ("<span class='ijna'>not applicable: %s</span>" % esc(", ".join(x["title"] for x in na))) if na else "",
+            "".join(row(x) for x in clear)))
+    elif na:
+        h.append("<div class='ijhead'><span class='ijna'>not applicable: %s</span></div>" % esc(", ".join(x["title"] for x in na)))
+    h.append("</div></section>")
+    return "".join(h)
+
+
+# the analysis script, byte for byte (original/analysis-script.sh, sha256 f1a4ee1c335eff77adfe5cc3fd557222d90d7e8131fb5f73b29bb62e64c6a83d)
+ORIG_SH = r'''#!/bin/bash
+
+#
+# Created ....: 03/04/2019
+# Developer ..: Waldirio M Pinheiro <waldirio@gmail.com / waldirio@redhat.com>
+# Purpose ....: Analyze sosreport and summarize the information (focus on Satellite info)
+#
+
+FOREMAN_REPORT="/tmp/$$.log"
+
+
+# the following while block captures three flags from the command line
+# -c copies the output file from the /tmp directory to the current directory
+# -l opens the output file from the current directory
+# -t opens the output file from the /tmp directory
+
+while getopts "clt" opt "${NULL[@]}"; do
+ case $opt in
+    c )
+    COPY_TO_CURRENT_DIR=true
+    ;;
+   l )   # open copy from local directory.  Requires option 'c' above.
+   OPEN_IN_VIM_RO_LOCAL_DIR=true
+#   echo "This is l"
+   ;;
+   t )   # open copy from /tmp/directory
+   OPEN_IN_EDITOR_TMP_DIR=true
+#   echo "This is t"
+   ;;
+    \? )
+    ;;
+ esac
+done
+shift "$(($OPTIND -1))"
+
+MYPWD=`pwd`
+
+
+main()
+{
+  > $FOREMAN_REPORT
+
+  sos_path=$1
+  base_dir=$sos_path
+  final_name=$(echo $base_dir | sed -e 's#/$##g' | grep -o sos.* | awk -F"/" '{print $NF}')
+
+  if [ ! -f $base_dir/version.txt ]; then
+    echo "This is not a sosreport dir, please inform the path to the correct one."
+    exit 1
+  fi
+
+  sos_version="new"
+  base_foreman="/"
+
+  if which rg &>/dev/null; then
+    # ripgrep is installed.
+    RGOPTS=" -N -a "
+    GREP="$(which rg) $RGOPTS"
+    EGREP="$GREP"
+  else
+    # ripgrep is not installed; use good old GNU grep instead.
+    GREP="$(which grep) -a"
+    EGREP="$GREP -E"
+  fi
+
+  echo "The sosreport is: $base_dir"												| tee -a $FOREMAN_REPORT
+
+  #report $base_dir $sub_dir $base_foreman $sos_version
+  report $base_dir $base_foreman $sos_version
+}
+
+log_tee()
+{
+  echo $1 | tee -a $FOREMAN_REPORT
+}
+
+log()
+{
+  echo "$1" >> $FOREMAN_REPORT
+}
+
+log_cmd()
+{
+  # errors for files the report does not have are left out
+  { echo "$@" | bash 2>&1 1>&3 | grep -a -v -E 'No such file or directory( \(os error 2\))?$' >&3; } 3>> $FOREMAN_REPORT
+}
+
+# ref: https://unix.stackexchange.com/questions/44040/a-standard-tool-to-convert-a-byte-count-into-human-kib-mib-etc-like-du-ls1
+# Converts bytes value to human-readable string [$1: bytes value]
+bytesToHumanReadable() {
+    local i=${1:-0} d="" s=0 S=("Bytes" "KiB" "MiB" "GiB" "TiB" "PiB" "EiB" "YiB" "ZiB")
+    while ((i > 1024 && s < ${#S[@]}-1)); do
+        printf -v d ".%02d" $((i % 1024 * 100 / 1024))
+        i=$((i / 1024))
+        s=$((s + 1))
+    done
+    echo "$i$d ${S[$s]}"
+}
+
+report()
+{
+
+  base_dir=$1
+  # sub_dir=$2
+  # base_foreman=$base_dir/$3
+  # sos_version=$4
+  base_foreman=$base_dir/$2
+  sos_version=$3
+
+  #base_foreman="$1/sos_commands/foreman/foreman-debug/"
+
+  log_tee "### Welcome to Report ###"
+  log_tee "### CEE/SysMGMT ###"
+  log
+  log
+
+  log_tee "## Naming Resolution"
+  log
+
+  log "// hosts entries"
+  log "cat $base_dir/etc/hosts"
+  log "---"
+  log_cmd "cat $base_dir/etc/hosts"
+  log "---"
+  log
+
+  log "// resolv.conf"
+  log "cat $base_dir/etc/resolv.conf"
+  log "---"
+  log_cmd "cat $base_dir/etc/resolv.conf"
+  log "---"
+  log
+  
+  log "// hostname"
+  log "cat $base_dir/etc/hostname"
+  log "---"
+  log_cmd "cat $base_dir/etc/hostname"
+  log "---"
+  log
+
+  log_tee "## Hardware"
+  log
+
+  log "// baremetal or vm?"
+  log "cat $base_dir/dmidecode | $EGREP '(Vendor|Manufacture)' | head -n3"
+  log "---"
+  log_cmd "cat $base_dir/dmidecode | $EGREP '(Vendor|Manufacture)' | head -n3"
+  log "---"
+  log
+
+
+
+  log_tee "## Network Information"
+  log
+
+  log "// ip address"
+  log "cat $base_dir/ip_addr"
+  log "---"
+  log_cmd "cat $base_dir/ip_addr"
+  log "---"
+  log
+
+  log "// current route"
+  log "cat $base_dir/ip_route"
+  log "---"
+  log_cmd "cat $base_dir/ip_route"
+  log "---"
+  log
+
+  log_tee "## Selinux"
+  log
+
+  log "// selinux conf"
+  log "cat $base_dir/etc/selinux/config"
+  log "---"
+  log_cmd "cat $base_dir/etc/selinux/config"
+  log "---"
+  log
+
+  log "// setroubleshoot package"
+  log "$GREP setroubleshoot $base_dir/installed-rpms"
+  log "---"
+  log_cmd "$GREP setroubleshoot $base_dir/installed-rpms"
+  log "---"
+  log
+
+  log "// sealert information"
+  log "$GREP -o sealert.* $base_dir/var/log/messages | sort -u"
+  log "---"
+  log_cmd "$GREP -o sealert.* $base_dir/var/log/messages | sort -u"
+  log "---"
+  log
+
+
+
+
+  log_tee "## Installed Packages (satellite)"
+  log
+
+  log "// all installed packages which contain satellite"
+  log "$GREP satellite $base_dir/installed-rpms"
+  log "---"
+  log_cmd "$GREP satellite $base_dir/installed-rpms"
+  log "---"
+  log
+
+  log "// packages provided by 3rd party vendors"
+  log "cat $base_dir/sos_commands/rpm/package-data | cut -f1,4 | $GREP -v -e \"Red Hat\" -e katello-ca-consumer- | sort -k2"
+  log "---"
+  log_cmd "cat $base_dir/sos_commands/rpm/package-data | cut -f1,4 | $GREP -v -e \"Red Hat\" -e katello-ca-consumer- | sort -k2"
+  log "---"
+  log
+
+
+  log_tee "## Subscriptions"
+  log
+
+  log "// subscription identity"
+  log "cat $base_dir/sos_commands/subscription_manager/subscription-manager_identity"
+  log "---"
+  log_cmd "cat $base_dir/sos_commands/subscription_manager/subscription-manager_identity"
+  log "---"
+  log
+
+  log "// subsman list installed"
+  log "cat $base_dir/sos_commands/subscription_manager/subscription-manager_list_--installed"
+  log "---"
+  log_cmd "cat $base_dir/sos_commands/subscription_manager/subscription-manager_list_--installed"
+  log "---"
+  log
+
+  log "// subsman list consumed"
+  log "cat $base_dir/sos_commands/subscription_manager/subscription-manager_list_--consumed"
+  log "---"
+  log_cmd "cat $base_dir/sos_commands/subscription_manager/subscription-manager_list_--consumed"
+  log "---"
+  log
+
+
+  log_tee "## Repos"
+  log
+
+
+  log "// enabled repos"
+  log "cat $base_dir/sos_commands/dnf/dnf_-C_repolist_--verbose"
+  log "---"
+  log_cmd "cat $base_dir/sos_commands/dnf/dnf_-C_repolist_--verbose"
+  log "---"
+  log
+
+  log "// yum history"
+  log "cat $base_dir/sos_commands/dnf/dnf_history"
+  log "---"
+  log_cmd "cat $base_dir/sos_commands/dnf/dnf_history"
+  log "---"
+  log
+
+#  TODO
+#  improve this one, once the dnf.log has too much info
+#
+#  log "// yum.log info"
+#  log "cat $base_dir/var/log/dnf.log"
+#  log "---"
+#  log_cmd "cat $base_dir/var/log/dnf.log"
+#  log "---"
+#  log
+
+
+  log_tee "## Upgrade"
+  log
+
+
+# grep "Running installer with args" /var/log/foreman-installer/satellite.log
+  log "// Last flag used with satellite-installer"
+
+  cmd="$EGREP \"(Running installer with args|signal was)\" $base_dir/var/log/foreman-installer/satellite.log"
+
+  log "$cmd"
+  log "---"
+  log_cmd "$cmd"
+  log "---"
+  log
+
+
+  log "// All the flags used with satellite-installer"
+
+  cmd="$GREP \"Running installer with args\" $base_dir/var/log/foreman-installer/satellite.* | sort -rk3 | cut -d: -f2-"
+
+  log "$cmd"
+  log "---"
+  log_cmd "$cmd"
+  log "---"
+  log
+
+
+
+
+  log "// # of error on the upgrade file"
+
+  cmd="$GREP '^\[ERROR' $base_dir/var/log/foreman-installer/satellite.log -c"
+
+  log "$cmd"
+  log "---"
+  log_cmd "$cmd"
+  log "---"
+  log
+
+
+  log "// Error on the upgrade file (full info)"
+
+  cmd="$GREP '^\[ERROR' $base_dir/var/log/foreman-installer/satellite.log"
+
+  log "$cmd"
+  log "---"
+  log_cmd "$cmd"
+  log "---"
+  log
+
+  log "// Upgrade Completed? (6.4 or greater)"
+
+ #cmd="grep \"Upgrade completed\" $base_dir/var/log/foreman-installer/satellite.log | wc -l"
+  cmd="$GREP \"Upgrade completed\" $base_dir/var/log/foreman-installer/satellite.log -c"
+
+  log "$cmd"
+  log "---"
+  log_cmd "$cmd"
+  log "---"
+  log
+
+
+  log "// last 20 lines from upgrade log"
+
+  cmd="tail -20 $base_dir/var/log/foreman-installer/satellite.log"
+
+  log "$cmd"
+  log "---"
+  log_cmd "$cmd"
+  log "---"
+  log
+
+
+  log_tee "## Disk"
+  log
+
+  log "// full disk info"
+  log "cat $base_dir/df"
+  log "---"
+  log_cmd "cat $base_dir/df"
+  log "---"
+  log
+
+#  log "// disk space output"
+#  log "cat $base_dir/sos_commands/foreman/foreman-debug/disk_space_output"
+#  log "---"
+#  log_cmd "cat $base_dir/sos_commands/foreman/foreman-debug/disk_space_output"
+#  log "---"
+#  log
+
+  log "// no space left on device"
+  log "$GREP \"No space left on device\" $base_dir/* 2>/dev/null"
+  log "---"
+  log_cmd "$GREP \"No space left on device\" $base_dir/* 2>/dev/null"
+  log "---"
+  log
+
+
+
+  log_tee "## Memory"
+  log
+
+  log "// memory usage"
+  log "cat $base_dir/free"
+  log "---"
+  log_cmd "cat $base_dir/free"
+  log "---"
+  log
+
+  log "// TOP 5 memory consumers"
+  log "cat $base_dir/ps | sort -nrk6 | head -n5"
+  log "---"
+  log_cmd "cat $base_dir/ps | sort -nrk6 | head -n5"
+  log "---"
+  log
+
+  log "// users memory consumers"
+  log "cat $base_dir/ps | sort -nr | awk '{print \$1, \$6}' | $GREP -v ^USER | $GREP -v ^COMMAND | $GREP -v \"^ $\" | awk  '{a[\$1] += \$2} END{for (i in a) print i, a[i]}' | sort -nrk2"
+  log "and"
+  log "memory_usage=\$(cat $base_dir/ps | sort -nr | awk '{print \$6}' | grep -v ^-$ | $GREP -v ^RSS | $GREP -v ^$ | paste -s -d+ | bc)"
+  log "and"
+  log "memory_usage_gb=\$(echo \"scale=2;\$memory_usage/1024/1024\" | bc)"
+  log "---"
+  log_cmd "cat $base_dir/ps | sort -nr | awk '{print \$1, \$6}' | $GREP -v ^USER | $GREP -v ^COMMAND | $GREP -v \"^ $\" | awk  '{a[\$1] += \$2} END{for (i in a) print i, a[i]}' | sort -nrk2"
+  log
+  memory_usage=$(cat $base_dir/ps 2>/dev/null | sort -nr | awk '{print $6}' | grep -v ^-$ | $GREP -v ^RSS | $GREP -v ^$ | paste -s -d+ | bc)
+  memory_usage=${memory_usage:-0}
+  memory_usage_gb=$(echo "scale=2;$memory_usage/1024/1024" | bc)
+  log "Total Memory Consumed in KiB: $memory_usage"
+  log "Total Memory Consumed in GiB: $memory_usage_gb"
+  log "---"
+  log
+
+  log "// Postgres idle process (candlepin)"
+  log "cat $base_dir/ps | $GREP ^postgres | $GREP idle$ | $GREP \"candlepin candlepin\" | wc -l"
+  log "---"
+  log_cmd "cat $base_dir/ps | $GREP ^postgres | $GREP idle$ | $GREP \"candlepin candlepin\" | wc -l"
+  log "---"
+  log
+
+  log "// Postgres idle process (foreman)"
+  log "cat $base_dir/ps | $GREP ^postgres | $GREP idle$ | $GREP \"foreman foreman\" | wc -l"
+  log "---"
+  log_cmd "cat $base_dir/ps | $GREP ^postgres | $GREP idle$ | $GREP \"foreman foreman\" | wc -l"
+  log "---"
+  log
+
+  log "// Postgres idle process (everything)"
+  log "cat $base_dir/ps | $GREP ^postgres | $GREP idle$ | wc -l"
+  log "---"
+  log_cmd "cat $base_dir/ps | $GREP ^postgres | $GREP idle$ | wc -l"
+  log "---"
+  log
+
+  log "// Processes running for a while (TOP 5 per time)"
+  log "cat $base_dir/ps | sort -nr -k10 | head -n5"
+  log "---"
+  log_cmd "cat $base_dir/ps | sort -nr -k10 | head -n5"
+  log "---"
+  log
+
+
+
+  log_tee "## CPU"
+  log
+
+  log "// cpu's number"
+  log "cat $base_dir/proc/cpuinfo | $GREP processor | wc -l"
+  log "---"
+  log_cmd "cat $base_dir/proc/cpuinfo | $GREP processor | wc -l"
+  log "---"
+  log
+
+
+  log_tee "## Messages"
+  log
+
+  log "// error on message file"
+  log "$GREP ERROR $base_dir/var/log/messages"
+  log "---"
+  log_cmd "$GREP ERROR $base_dir/var/log/messages"
+  log "---"
+  log
+
+
+  log_tee "## Out of Memory"
+  log
+
+  log "// out of memory"
+  log "$GREP \"Out of memory\" $base_dir/var/log/messages"
+  log "---"
+  log_cmd "$GREP \"Out of memory\" $base_dir/var/log/messages"
+  log "---"
+  log
+
+  log "Pavel Moravec Script to check the memory usage during the oom killer"
+  log " - https://gitlab.cee.redhat.com/mna-emea/oom-process-stats"
+  log ""
+  log "// Memory Consumption"
+  log "/usr/bin/python3 /tmp/script/oom-process-stats.py $base_dir/var/log/messages"
+  log "---"
+  log_cmd "/usr/bin/python3 /tmp/script/oom-process-stats.py $base_dir/var/log/messages"
+  log "---"
+  log
+
+
+  log_tee "## Performance"
+  log
+
+  log "// Analyzing '/var/log/sa/sa' files and checking for values with low time"
+  log "which sar >/dev/null 2>&1 || { echo 'sar is not installed on this computer (package sysstat): the sa files were not read'; exit; }; for b in \$(ls $base_dir/var/log/sa/sa[0-9]*); do echo - \$b;sar -f \$b | grep -E '(CPU|all)' | grep -E '( [0-9][.,][0-9][0-9]\$)'; done"
+  log "---"
+  log_cmd "which sar >/dev/null 2>&1 || { echo 'sar is not installed on this computer (package sysstat): the sa files were not read'; exit; }; for b in \$(ls $base_dir/var/log/sa/sa[0-9]*); do echo - \$b;sar -f \$b | grep -E '(CPU|all)' | grep -E '( [0-9][.,][0-9][0-9]\$)'; done"
+  log "---"
+  log
+
+
+
+
+  log_tee "## Foreman Tasks"
+  log
+
+  
+  cmd="sed '1d' $base_dir/sos_commands/foreman/foreman_tasks_tasks | wc -l"
+
+  log "// total # of foreman tasks"
+  log "$cmd"
+  log "---"
+  log_cmd "$cmd"
+  log "---"
+  log
+
+
+  cmd="cat $base_dir/sos_commands/foreman/foreman_tasks_tasks | sed '1d' | cut -d, -f3 | $GREP Actions | sort | uniq -c | sort -nr"
+
+
+  log "// Tasks TOP"
+  log "$cmd"
+  log "---"
+  log_cmd "$cmd"
+  log "---"
+  log
+
+
+  cmd="cat $base_dir/etc/cron.d/foreman-tasks"
+
+  log "// foreman tasks cleanup script"
+  log "$cmd"
+  log "---"
+  log_cmd "$cmd"
+  log "---"
+  log
+
+
+
+  log "// paused foreman tasks"
+  log "$EGREP '(^id,|paused)' $base_dir/sos_commands/foreman/foreman_tasks_tasks | sed 's/  //g' | sed -e 's/ |/|/g' | sed -e 's/| /|/g' | sed -e 's/^ //g' | sed -e 's/|/,/g'"
+  log "---"
+  log_cmd "$EGREP '(^id,|paused)' $base_dir/sos_commands/foreman/foreman_tasks_tasks | sed 's/  //g' | sed -e 's/ |/|/g' | sed -e 's/| /|/g' | sed -e 's/^ //g' | sed -e 's/|/,/g'"
+  log "---"
+  log
+
+
+
+#  log_tee "## Pulp"
+#  log
+#
+#  log "// number of tasks not finished"
+#  log "$GREP '\"task_id\"' $base_dir/sos_commands/pulp/pulp-running_tasks -c"
+#  log "---"
+#  log_cmd "$GREP '\"task_id\"' $base_dir/sos_commands/pulp/pulp-running_tasks -c"
+#  log "---"
+#  log
+#
+#
+##grep "\"task_id\"" 02681559/0050-sosreport-pc1ustsxrhs06-2020-06-26-kfmgbpf.tar.xz/sosreport-pc1ustsxrhs06-2020-06-26-kfmgbpf/sos_commands/pulp/pulp-running_tasks | wc -l
+#
+#  log "// pulp task not finished"
+#  log "$EGREP '(\"finish_time\" : null|\"start_time\"|\"state\"|\"pulp:|^})' $base_dir/sos_commands/pulp/pulp-running_tasks"
+#  log "---"
+#  log_cmd "$EGREP '(\"finish_time\" : null|\"start_time\"|\"state\"|\"pulp:|^})' $base_dir/sos_commands/pulp/pulp-running_tasks"
+#  log "---"
+#  log
+
+
+
+
+  log_tee "## Hammer Ping"
+  log
+
+  log "// hammer ping output"
+
+  cmd="cat $base_dir/sos_commands/foreman/hammer_ping"
+
+  log "$cmd"
+  log "---"
+  log_cmd "$cmd"
+  log "---"
+  log
+
+
+  log "## Katello service status"
+  log
+
+  log "// katello-service status output"
+
+  cmd="cat $base_dir/sos_commands/foreman_installer/foreman-maintain_service_status"
+
+  log "$cmd"
+  log "---"
+  log_cmd "$cmd"
+  log "---"
+  log
+
+
+  log "// katello-service status output - condensed"
+
+  cmd="$EGREP '(^\*|Active)' $base_dir/sos_commands/foreman_installer/foreman-maintain_service_status | tr '^\*' '\n'"
+
+  log "$cmd"
+  log "---"
+  log_cmd "$cmd"
+  log "---"
+  log
+
+
+  log_tee "## Puppet Server"
+  log
+
+  log "// Puppet Server Error"
+  log "$GREP ERROR $base_dir/var/log/puppetlabs/puppetserver/puppetserver.log"
+  log "---"
+  log_cmd "$GREP ERROR $base_dir/var/log/puppetlabs/puppetserver/puppetserver.log"
+  log "---"
+  log
+
+
+  log_tee "## Audit"
+  log
+
+  log "// denied in audit.log"
+  log "$GREP -o denied.* $base_dir/var/log/audit/audit.log  | sort -u"
+  log "---"
+  log_cmd "$GREP -o denied.* $base_dir/var/log/audit/audit.log  | sort -u"
+  log "---"
+  log
+
+
+  log_tee "## PostgreSQL"
+  log
+
+  log "// Checking the process/path"
+  log "cat $base_dir/ps | grep postgres | grep data"
+  log "---"
+  log_cmd "cat $base_dir/ps | grep postgres | grep data"
+  log "---"
+  log
+
+  log "// postgres storage consumption - /var/lib/psql"
+  log "cat $base_dir/sos_commands/postgresql/du_-sh_.var.lib.pgsql"
+  log "---"
+  log_cmd "cat $base_dir/sos_commands/postgresql/du_-sh_.var.lib.pgsql"
+  log "---"
+  log
+
+  log "// TOP foreman tables consumption"
+  log "head -n30 $base_dir/sos_commands/foreman/foreman_db_tables_sizes"
+  log "---"
+  log_cmd "head -n30 $base_dir/sos_commands/foreman/foreman_db_tables_sizes"
+  log "---"
+  log  
+
+
+  log_tee "## PostgreSQL Log - /var/lib/pgsql/"
+  log
+
+  log "// Deadlock count"
+  log "$GREP -I -i deadlock $base_foreman/var/lib/pgsql/data/log/*.log -c"
+  log "---"
+  log_cmd "$GREP -I -i deadlock $base_foreman/var/lib/pgsql/data/log/*.log -c"
+  log "---"
+  log
+
+  log "// Deadlock"
+  log "$GREP -I -i deadlock $base_foreman/var/lib/pgsql/data/log/*.log"
+  log "---"
+  log_cmd "$GREP -I -i deadlock $base_foreman/var/lib/pgsql/data/log/*.log"
+  log "---"
+  log
+
+  log "// ERROR count"
+  log "$GREP -F ERROR $base_foreman/var/lib/pgsql/data/log/*.log -c"
+  log "---"
+  log_cmd "$GREP -F ERROR $base_foreman/var/lib/pgsql/data/log/*.log -c"
+  log "---"
+  log
+
+  log "// ERROR"
+  log "$GREP -I ERROR $base_foreman/var/lib/pgsql/data/log/*.log"
+  log "---"
+  log_cmd "$GREP -I ERROR $base_foreman/var/lib/pgsql/data/log/*.log"
+  log "---"
+  log
+
+  log "// Current Configuration"
+  log "cat $base_foreman/var/lib/pgsql/data/postgresql.conf | $GREP -v ^# | $GREP -v ^$ | $GREP -v ^\"\\t\\t\".*#"
+  log "---"
+  log_cmd "cat $base_foreman/var/lib/pgsql/data/postgresql.conf | $GREP -v ^# | $GREP -v ^$ | $GREP -v ^\"\\t\\t\".*#"
+  log "---"
+  log
+
+
+  log_tee "## Foreman Tasks"
+  log
+
+  log "// dynflow running"
+  log "cat $base_dir/ps | $GREP sidekiq"
+  log "---"
+  log_cmd "cat $base_dir/ps | $GREP sidekiq"
+  log "---"
+  log
+
+
+
+  log_tee "## Foreman logs (error)"
+  log
+
+  # Note: `grep -I` differs from `rg -I` but the difference in behavior is not causing differences in output here. So I'm leaving `$GREP -I`.
+  log "// total number of errors found on production.log - TOP 40"
+  log "$GREP -I -F \"[E\" $base_foreman/var/log/foreman/production.log* | awk '{print \$3, \$4, \$5, \$6, \$7, \$8, \$9, \$10, \$11, \$12}' | sort | uniq -c | sort -nr | head -n40"
+  log "---"
+  log_cmd "$GREP -I -F \"[E\" $base_foreman/var/log/foreman/production.log* | awk '{print \$3, \$4, \$5, \$6, \$7, \$8, \$9, \$10, \$11, \$12}' | sort | uniq -c | sort -nr | head -n40"
+  log "---"
+  log
+
+
+
+  log_tee "## Foreman cron"
+  log
+
+  log "// last 20 entries from foreman/cron.log"
+  log "tail -20 $base_foreman/var/log/foreman/cron.log"
+  log "---"
+  log_cmd "tail -20 $base_foreman/var/log/foreman/cron.log"
+  log "---"
+  log
+
+
+  log_tee "## Httpd"
+  log
+
+  log "// queues on error_log means the # of requests crossed the border. Satellite inaccessible"
+  log "$GREP -F 'Request queue is full' $base_foreman/var/log/httpd/error_log | wc -l"
+  log "---"
+  log_cmd "$GREP -F 'Request queue is full' $base_foreman/var/log/httpd/error_log | wc -l"
+  log "---"
+  log
+
+  log "// when finding something on last step, we will here per date"
+  log "$GREP -F queue $base_foreman/var/log/httpd/error_log  | awk '{print \$2, \$3}' | cut -d: -f1,2 | uniq -c"
+  log "---"
+  log_cmd "$GREP -F queue $base_foreman/var/log/httpd/error_log  | awk '{print \$2, \$3}' | cut -d: -f1,2 | uniq -c"
+  log "---"
+  log
+
+  log "// TOP 20 of ip address requesting the satellite via https"
+  log "cat $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | awk '{print \$1}' | sort | uniq -c | sort -nr | head -n20"
+  log "---"
+  log_cmd "cat $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | awk '{print \$1}' | sort | uniq -c | sort -nr | head -n20"
+  log "---"
+  log
+
+  log "// TOP 20 of ip address requesting the satellite via https (detailed)"
+  log "cat $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | awk '{print \$1,\$4}' | cut -d: -f1,2,3 | sort | uniq -c | sort -nr | head -n20"
+  log "---"
+  log_cmd "cat $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | awk '{print \$1,\$4}' | cut -d: -f1,2,3 | sort | uniq -c | sort -nr | head -n20"
+  log "---"
+  log
+
+  log "// TOP 50 of uri requesting the satellite via https"
+  log "cat $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | awk '{print \$1, \$6, \$7}' | sort | uniq -c | sort -nr | head -n 50"
+  log "---"
+  log_cmd "cat $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | awk '{print \$1, \$6, \$7}' | sort | uniq -c | sort -nr | head -n 50"
+  log "---"
+  log
+
+  log "// Possible scanner queries"
+  log "cat $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | grep \" 404 \" | grep -E '(\"-\" \"-\")' | head -n10"
+  log "---"
+  log_cmd "cat $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | grep \" 404 \" | grep -E '(\"-\" \"-\")' | head -n10"
+  log "---"
+  log
+
+
+
+  log "// General 2XX errors on httpd logs"
+  log "$GREP '\" 2[0-9][0-9] ' $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | awk '{print \$9}' | sort | uniq -c | sort -nr"
+  log "---"
+  log_cmd "$GREP '\" 2[0-9][0-9] ' $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | awk '{print \$9}' | sort | uniq -c | sort -nr"
+  log "---"
+  log
+
+  log "// General 3XX errors on httpd logs"
+  log "$GREP '\" 3[0-9][0-9] ' $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | awk '{print \$9}' | sort | uniq -c | sort -nr"
+  log "---"
+  log_cmd "$GREP '\" 3[0-9][0-9] ' $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | awk '{print \$9}' | sort | uniq -c | sort -nr"
+  log "---"
+  log
+
+  log "// General 4XX errors on httpd logs"
+  log "$GREP '\" 4[0-9][0-9] ' $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | awk '{print \$9}' | sort | uniq -c | sort -nr"
+  log "---"
+  log_cmd "$GREP '\" 4[0-9][0-9] ' $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | awk '{print \$9}' | sort | uniq -c | sort -nr"
+  log "---"
+  log
+
+  log "// General 5XX errors on httpd logs"
+  log "$GREP '\" 5[0-9][0-9] ' $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | awk '{print \$9}' | sort | uniq -c | sort -nr"
+  log "---"
+  log_cmd "$GREP '\" 5[0-9][0-9] ' $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log | awk '{print \$9}' | sort | uniq -c | sort -nr"
+  log "---"
+  log
+
+
+
+
+  log_tee "## RHSM"
+  log
+
+  log "// RHSM Proxy"
+  log "$GREP -F proxy $base_dir/etc/rhsm/rhsm.conf | $GREP -v ^#"
+  log "---"
+  log_cmd "$GREP -F proxy $base_dir/etc/rhsm/rhsm.conf | $GREP -v ^#"
+  log "---"
+  log
+
+  log "// Satellite Proxy"
+  log "$EGREP '(^  proxy_url|^  proxy_port|^  proxy_username|^  proxy_password)' $base_dir/etc/foreman-installer/scenarios.d/satellite-answers.yaml"
+  log "---"
+  log_cmd "$EGREP '(^  proxy_url|^  proxy_port|^  proxy_username|^  proxy_password)' $base_dir/etc/foreman-installer/scenarios.d/satellite-answers.yaml"
+  log "---"
+  log
+
+  log "// Virt-who Proxy"
+  log "$GREP -F -i proxy $base_dir/etc/sysconfig/virt-who"
+  log "---"
+  log_cmd "$GREP -F -i proxy $base_dir/etc/sysconfig/virt-who"
+  log "---"
+  log
+
+  log "// RHSM errors"
+  log "$GREP -F ERROR $base_dir/var/log/rhsm/rhsm.log"
+  log "---"
+  log_cmd "$GREP -F ERROR $base_dir/var/log/rhsm/rhsm.log"
+  log "---"
+  log
+
+  log "// RHSM Warnings"
+  log "$GREP -F WARNING $base_dir/var/log/rhsm/rhsm.log"
+  log "---"
+  log_cmd "$GREP -F WARNING $base_dir/var/log/rhsm/rhsm.log"
+  log "---"
+  log
+
+  log "// duplicated hypervisors #"
+  log "$GREP -F \"is assigned to 2 different systems\" $base_dir/var/log/rhsm/rhsm.log | grep -o \"'[^']*' is assigned\" | cut -d\"'\" -f2 | sort -u | wc -l"
+  log "---"
+  log_cmd "$GREP -F \"is assigned to 2 different systems\" $base_dir/var/log/rhsm/rhsm.log | grep -o \"'[^']*' is assigned\" | cut -d\"'\" -f2 | sort -u | wc -l"
+  log "---"
+  log
+
+  log "// duplicated hypervisors list"
+  log "$GREP -F \"is assigned to 2 different systems\" $base_dir/var/log/rhsm/rhsm.log | grep -o \"'[^']*' is assigned\" | cut -d\"'\" -f2 | sort -u"
+  log "---"
+  log_cmd "$GREP -F \"is assigned to 2 different systems\" $base_dir/var/log/rhsm/rhsm.log | grep -o \"'[^']*' is assigned\" | cut -d\"'\" -f2 | sort -u"
+  log "---"
+  log
+
+  log "// Sending updated Host-to-guest"
+  log "$GREP -F \"Sending updated Host-to-guest\" $base_dir/var/log/rhsm/rhsm.log"
+  log "---"
+  log_cmd "$GREP -F \"Sending updated Host-to-guest\" $base_dir/var/log/rhsm/rhsm.log"
+  log "---"
+  log
+
+
+
+
+  log_tee "## Virt-who"
+  log
+
+  log "// virt-who status"
+  log "cat $base_dir/sos_commands/systemd/systemctl_list-units | $GREP -F virt-who"
+  log "---"
+  log_cmd "cat $base_dir/sos_commands/systemd/systemctl_list-units | $GREP -F virt-who"
+  log "---"
+  log
+
+  log "// virt-who default configuration"
+  log "cat $base_dir/etc/sysconfig/virt-who | $GREP -v ^# | $GREP -v ^$"
+  log "---"
+  log_cmd "cat $base_dir/etc/sysconfig/virt-who | $GREP -v ^# | $GREP -v ^$"
+  log "---"
+  log
+
+  log "// virt-who configuration"
+  log "ls $base_dir/etc/virt-who.d"
+  log "---"
+  log_cmd "ls $base_dir/etc/virt-who.d"
+  log "---"
+  log
+
+  log "// duplicated server entries on virt-who configuration"
+  log "$GREP -I ^server $base_dir/etc/virt-who.d/*.conf | sort | uniq -c"
+  log "---"
+  log_cmd "$GREP -I ^server $base_dir/etc/virt-who.d/*.conf | sort | uniq -c"
+  log "---"
+  log
+
+
+
+  log "// virt-who configuration content files"
+  log "for b in \$(ls -1 \$base_dir/etc/virt-who.d/*.conf); do echo; echo \$b; echo \"===\"; cat \$b; echo \"===\"; done"
+  log "---"
+  log_cmd "for b in \$(ls -1 $base_dir/etc/virt-who.d/*.conf); do echo; echo \$b; echo \"===\"; cat \$b; echo \"===\"; done"
+  log "---"
+  log
+
+  log "// virt-who configuration content files (hidden characters)"
+  log "for b in \$(ls -1 \$base_dir/etc/virt-who.d/*.conf); do echo; echo \$b; echo \"===\"; cat -vet \$b; echo \"===\"; done"
+  log "---"
+  log_cmd "for b in \$(ls -1 $base_dir/etc/virt-who.d/*.conf); do echo; echo \$b; echo \"===\"; cat -vet \$b; echo \"===\"; done"
+  log "---"
+  log
+
+  log "// virt-who server(s)"
+  log "cat $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log  | $GREP -F \"cmd=virt-who\" | awk '{print \$1}' | sort | uniq -c"
+  log "---"
+  log_cmd "cat $base_foreman/var/log/httpd/foreman-ssl_access_ssl.log  | $GREP -F \"cmd=virt-who\" | awk '{print \$1}' | sort | uniq -c"
+  log "---"
+  log
+
+
+
+  log_tee "## Hypervisors tasks"
+  log
+
+  log "// latest 30 hypervisors tasks"
+
+  cmd="cat $base_dir/sos_commands/foreman/foreman_tasks_tasks | $EGREP '(^id,|Hypervisors)' | sed -e 's/,/ /g' | sort -rk6 | head -n 30 | cut -d\| -f3,4,5,6,7"
+
+  log "$cmd"
+  log "---"
+  log_cmd "$cmd"
+  log "---"
+  log
+
+
+  log_tee "## Tomcat"
+  log
+
+  log "// Memory (Xms and Xmx)"
+  log "$GREP -F tomcat $base_dir/ps"
+  log "---"
+  log_cmd "$GREP -F tomcat $base_dir/ps"
+  log "---"
+  log
+
+
+  log_tee "## Candlepin"
+  log
+
+  log "// latest state of candlepin (updating info)"
+  log "$GREP -F -B1 Updated $base_foreman/var/log/candlepin/candlepin.log"
+  log "---"
+  log_cmd "$GREP -F -B1 Updated $base_foreman/var/log/candlepin/candlepin.log"
+  log "---"
+  log
+
+  log "// ERROR on candlepin log - candlepin.log"
+  log "$GREP -F ERROR $base_foreman/var/log/candlepin/candlepin.log | cut -d ' ' -f1,3- | sed -E 's/\[(thread|req)=[^]]*\] //g' | sort | uniq -c"
+  log "---"
+  log_cmd "$GREP -F ERROR $base_foreman/var/log/candlepin/candlepin.log | cut -d ' ' -f1,3- | sed -E 's/\[(thread|req)=[^]]*\] //g' | sort | uniq -c"
+  log "---"
+  log
+
+  log "// ERROR on candlepin log - error.log"
+  log "$GREP -F ERROR $base_foreman/var/log/candlepin/error.log | cut -d ' ' -f1,3- | sed -E 's/\[(thread|req)=[^]]*\] //g' | sort | uniq -c"
+  log "---"
+  log_cmd "$GREP -F ERROR $base_foreman/var/log/candlepin/error.log | cut -d ' ' -f1,3- | sed -E 's/\[(thread|req)=[^]]*\] //g' | sort | uniq -c"
+  log "---"
+  log
+
+  log "// latest entry on error.log"
+  log "tail -30 $base_foreman/var/log/candlepin/error.log"
+  log "---"
+  log_cmd "tail -30 $base_foreman/var/log/candlepin/error.log"
+  log "---"
+  log
+
+  log "// candlepin storage consumption"
+  log "cat $base_dir/sos_commands/candlepin/du_-sh_.var.lib.candlepin"
+  log "---"
+  log_cmd "cat $base_dir/sos_commands/candlepin/du_-sh_.var.lib.candlepin"
+  log "---"
+  log
+
+  log "// SCA Information"
+  log "$GREP -i \"content access mode\" $base_dir/var/log/candlepin/* | grep -o \"Auto-attach is disabled.*\" | sort -u | grep -v Skipping"
+  log "---"
+  log_cmd "$GREP -i \"content access mode\" $base_dir/var/log/candlepin/* | grep -o \"Auto-attach is disabled.*\" | sort -u | grep -v Skipping"
+  log "---"
+  log
+
+  log "// Tasks in Candlepin - Time in miliseconds - TOP 20"
+  log "$GREP -H -o 'time=.*' $base_dir/var/log/candlepin/* | sed -e 's/=/ /g' | sort -k2 -nr | uniq -c | head -n20 | sed -s 's/time /time=/g' | cut -d: -f2"
+  log "---"
+  log_cmd "$GREP -H -o 'time=.*' $base_dir/var/log/candlepin/* | sed -e 's/=/ /g' | sort -k2 -nr | uniq -c | head -n20 | sed -s 's/time /time=/g' | cut -d: -f2"
+  log "---"
+  log
+
+
+
+
+
+  log_tee "## Cron"
+  log
+
+  log "// cron from the base OS"
+  log "ls $base_dir/var/spool/cron/*"
+  log "---"
+  log_cmd "ls $base_dir/var/spool/cron/*"
+  log "---"
+  log
+
+  log "// checking the content of base OS cron"
+  log "for b in \$(ls -1 $base_dir/var/spool/cron/*); do echo; echo \$b; echo \"===\"; cat \$b; echo \"===\"; done"
+  log "---"
+  log_cmd "for b in $(ls -1 $base_dir/var/spool/cron/* 2>/dev/null); do echo; echo \$b; echo \"===\"; cat \$b; echo \"===\"; done"
+  log "---"
+  log
+
+
+  log_tee "## Files in etc/cron*"
+  log
+
+  log "// all files located on /etc/cron*"
+  log "find $base_dir/etc/cron* -type f | awk -F/etc/ '{print \$2}'"
+  log "---"
+  log_cmd "find $base_dir/etc/cron* -type f | awk -F/etc/ '{print \$2}'"
+  log "---"
+  log
+
+
+  log_tee "## Foreman Settings"
+  log
+
+  log "// foreman settings"
+  log "cat $base_foreman/etc/foreman/settings.yaml"
+  log "---"
+  log_cmd "cat $base_foreman/etc/foreman/settings.yaml"
+  log "---"
+  log
+
+  log "// custom hiera"
+  log "cat $base_foreman/etc/foreman-installer/custom-hiera.yaml"
+  log "---"
+  log_cmd "cat $base_foreman/etc/foreman-installer/custom-hiera.yaml"
+  log "---"
+  log
+
+
+  log_tee "## Tuning"
+  log
+
+  log "// 05-foreman.conf configuration"
+  log "cat $base_dir/etc/httpd/conf.d/05-foreman.conf | $EGREP 'KeepAlive\b|MaxKeepAliveRequests|KeepAliveTimeout|PassengerMinInstances'"
+  log "---"
+  log_cmd "cat $base_dir/etc/httpd/conf.d/05-foreman.conf | $EGREP 'KeepAlive\b|MaxKeepAliveRequests|KeepAliveTimeout|PassengerMinInstances'"
+  log "---"
+  log
+
+  log "// 05-foreman-ssl.conf configuration"
+  log "cat $base_dir/etc/httpd/conf.d/05-foreman-ssl.conf | $EGREP 'KeepAlive\b|MaxKeepAliveRequests|KeepAliveTimeout|PassengerMinInstances'"
+  log "---"
+  log_cmd "cat $base_dir/etc/httpd/conf.d/05-foreman-ssl.conf | $EGREP 'KeepAlive\b|MaxKeepAliveRequests|KeepAliveTimeout|PassengerMinInstances'"
+  log "---"
+  log
+
+  log "// katello.conf configuration"
+  log "cat $base_dir/etc/httpd/conf.d/05-foreman-ssl.d/katello.conf | $EGREP 'KeepAlive\b|MaxKeepAliveRequests|KeepAliveTimeout'"
+  log "---"
+  log_cmd "cat $base_dir/etc/httpd/conf.d/05-foreman-ssl.d/katello.conf | $EGREP 'KeepAlive\b|MaxKeepAliveRequests|KeepAliveTimeout'"
+  log "---"
+  log
+
+  log "// postgres configuration"
+  log "cat $base_dir/var/lib/pgsql/data/postgresql.conf | $EGREP 'max_connections|shared_buffers|work_mem|checkpoint_segments|checkpoint_completion_target' | $GREP -v '^#'"
+  log "---"
+  log_cmd "cat $base_dir/var/lib/pgsql/data/postgresql.conf | $EGREP 'max_connections|shared_buffers|work_mem|checkpoint_segments|checkpoint_completion_target' | $GREP -v '^#'"
+  log "---"
+  log
+
+  log "// tomcat configuration"
+  log "cat $base_dir/etc/tomcat/tomcat.conf | $GREP -F 'JAVA_OPTS'"
+  log "---"
+  log_cmd "cat $base_dir/etc/tomcat/tomcat.conf | $GREP -F 'JAVA_OPTS'"
+  log "---"
+  log
+
+  log "// httpd|apache limits"
+  log "cat $base_dir/etc/systemd/system/httpd.service.d/limits.conf | $GREP -F 'LimitNOFILE'"
+  log "---"
+  log_cmd "cat $base_dir/etc/systemd/system/httpd.service.d/limits.conf | $GREP -F 'LimitNOFILE'"
+  log "---"
+  log
+
+  log "// sysctl configuration"
+  log "cat $base_dir/etc/sysctl.conf | $GREP -F 'fs.aio-max-nr'"
+  log "---"
+  log_cmd "cat $base_dir/etc/sysctl.conf | $GREP -F 'fs.aio-max-nr'"
+  log "---"
+  log
+
+  log "// Used answer file during the satellite-installer run"
+  log "cat $base_dir/etc/foreman-installer/scenarios.d/satellite.yaml | grep answer"
+  log "---"
+  log_cmd "cat $base_dir/etc/foreman-installer/scenarios.d/satellite.yaml | grep answer"
+  log "---"
+  log
+
+  log "// Current tuning preset"
+  log "cat $base_dir/etc/foreman-installer/scenarios.d/satellite.yaml | grep tunin"
+  log "---"
+  log_cmd "cat $base_dir/etc/foreman-installer/scenarios.d/satellite.yaml | grep tunin"
+  log "---"
+  log
+
+  log "// Current puma setting"
+  log "cat $base_dir/etc/foreman-installer/scenarios.d/satellite-answers.yaml | grep puma"
+  log "---"
+  log_cmd "cat $base_dir/etc/foreman-installer/scenarios.d/satellite-answers.yaml | grep puma"
+  log "---"
+  log
+
+
+
+
+## TODO
+
+# cat apache/rpm_-V_httpd 
+# cat foreman/rpm_-V_foreman-debug 
+# cat krb5/rpm_-V_krb5-libs 
+# cat ldap/rpm_-V_openldap 
+# cat postgresql/rpm_-V_postgresql 
+# cat qpid/rpm_-V_qpid-cpp-server_qpid-tools 
+# cat qpid_dispatch/rpm_-V_qpid-dispatch-router 
+# cat tomcat/rpm_-V_tomcat 
+# cat virtwho/rpm_-V_virt-who 
+
+
+  log_tee "### Welcome to Report ###"
+  log_tee "### CEE/Anaconda ###"
+  log
+  log
+
+  log_tee "## LEAPP"
+  log
+
+  log "// Checking for leapp package"
+  log "grep leapp $base_dir/installed-rpms | sort"
+  log "---"
+  log_cmd "grep leapp $base_dir/installed-rpms | sort"
+  log "---"
+  log
+
+  log "// Checking for grub package"
+  log "grep grub $base_dir/installed-rpms | sort"
+  log "---"
+  log_cmd "grep grub $base_dir/installed-rpms | sort"
+  log "---"
+  log
+
+  log "// Checking for grub/grub2 folders"
+  log "ls $base_dir/boot/"
+  log "---"
+  log_cmd "ls $base_dir/boot/"
+  log "---"
+  log
+
+  log "// Checking the current default grub content"
+  log "cat $base_dir/etc/default/grub"
+  log "---"
+  log_cmd "cat $base_dir/etc/default/grub"
+  log "---"
+  log
+
+  log "// Checking the upgrade entry on grub2 menu"
+  log "grep upgrade $base_dir/boot/grub2/grub.cfg"
+  log "---"
+  log_cmd "grep upgrade $base_dir/boot/grub2/grub.cfg"
+  log "---"
+  log
+
+  log "// Checking for inhibitor"
+  log "grep inhibitor -A1 $base_dir/var/log/leapp/leapp-report.txt"
+  log "---"
+  log_cmd "grep inhibitor -A1 $base_dir/var/log/leapp/leapp-report.txt"
+  log "---"
+  log
+
+  log "// Full inhibitor list"
+  log "cat $base_dir/var/log/leapp/leapp-report.txt | awk 'BEGIN {} /.*inhibitor.*/,/^---/ { print } END {}'"
+  log "---"
+  log_cmd "cat $base_dir/var/log/leapp/leapp-report.txt | awk 'BEGIN {} /.*inhibitor.*/,/^---/ { print } END {}'"
+  log "---"
+  log
+
+  log "// Checking for error"
+  log "grep \"(error)\" -A1 $base_dir/var/log/leapp/leapp-report.txt"
+  log "---"
+  log_cmd "grep \"(error)\" -A1 $base_dir/var/log/leapp/leapp-report.txt"
+  log "---"
+  log
+
+  log "// Full error list"
+  log "cat $base_dir/var/log/leapp/leapp-report.txt | awk 'BEGIN {} /.*\(error\).*/,/^---/ { print } END {}'"
+  log "---"
+  log_cmd "cat $base_dir/var/log/leapp/leapp-report.txt | awk 'BEGIN {} /.*\(error\).*/,/^---/ { print } END {}'"
+  log "---"
+  log
+
+  log "// Unsupported LEAPP?"
+  log "grep -o LEAPP_UNSUPPORTED.* $base_dir/var/log/leapp/leapp-upgrade.log | awk '{print \$1}' | sort -u | sed \"s/',//g\""
+  log "---"
+  log_cmd "grep -o LEAPP_UNSUPPORTED.* $base_dir/var/log/leapp/leapp-upgrade.log | awk '{print \$1}' | sort -u | sed \"s/',//g\""
+  log "---"
+  log
+
+  log "// Target Version"
+  log "grep -o LEAPP_UPGRADE_PATH_TARGET_RELEASE.* $base_dir/var/log/leapp/leapp-upgrade.log | awk '{print \$1}' | sort -u | sed \"s/',//g\""
+  log "---"
+  log_cmd "grep -o LEAPP_UPGRADE_PATH_TARGET_RELEASE.* $base_dir/var/log/leapp/leapp-upgrade.log | awk '{print \$1}' | sort -u | sed \"s/',//g\""
+  log "---"
+  log
+
+  log "// Failed with exit"
+  log "grep \"failed with exit\" $base_dir/var/log/leapp/leapp-report.txt"
+  log "---"
+  log_cmd "grep \"failed with exit\" $base_dir/var/log/leapp/leapp-report.txt"
+  log "---"
+  log
+
+  log "// overlay filesystem"
+  log "grep overlay $base_dir/mount"
+  log "---"
+  log_cmd "grep overlay $base_dir/mount"
+  log "---"
+  log
+
+  log "// Error in the leapp-upgrade.log"
+  log "grep ERROR $base_dir/var/log/leapp/leapp-upgrade.log"
+  log "---"
+  log_cmd "grep ERROR $base_dir/var/log/leapp/leapp-upgrade.log"
+  log "---"
+  log
+
+  log "// Last lines of leapp-upgrade.log"
+  log "tail -n 40 $base_dir/var/log/leapp/leapp-upgrade.log"
+  log "---"
+  log_cmd "tail -n 40 $base_dir/var/log/leapp/leapp-upgrade.log"
+  log "---"
+  log
+
+
+
+  # Insights call, in case the binary is around
+  which insights &>/dev/null
+
+  if [ $? -eq 0 ]; then
+    log "Calling insights ..."
+    $(which insights) run -p shared_rules,telemetry,threescale_rules,ccx_ocp_core,ccx_rules_ocp $sos_path >> $FOREMAN_REPORT
+    echo "done."
+  fi
+
+
+  if [ $COPY_TO_CURRENT_DIR ] || [ $OPEN_IN_VIM_RO_LOCAL_DIR ]; then
+    echo 
+    echo
+    echo "## Creating a copy of the report in your current directory - $MYPWD/report_${USER}_$final_name.log"
+    cp $FOREMAN_REPORT $MYPWD/report_${USER}_$final_name.log
+  fi
+
+  mv $FOREMAN_REPORT /tmp/report_${USER}_$final_name.log
+  echo 
+  echo
+  echo "## Please check out the file /tmp/report_${USER}_$final_name.log"
+
+
+}
+
+
+
+
+# Main
+
+if [ "$1" == "" ] || [ "$1" == "--help" ]; then
+  echo "Please inform the path to the sosrepor dir that you would like to analyze."
+  echo "$0 [OPTION] 01234567/sosreport_do_wall"
+  echo ""
+  echo "OPTION"
+  echo "You can add a flags after $0 as informed below"
+  echo "   -c copies the output file from the /tmp directory to the current directory"
+  echo "   -l opens the output file from the current directory"
+  echo "   -t opens the output file from the /tmp directory"
+  exit 1
+fi
+
+main $1
+
+
+# the following code will open the requested report
+# in the user's editor of choice
+# if none is defined, "less" will be chosen.
+
+if [ ! "$EDITOR" ]; then
+   EDITOR=`which less`
+fi
+
+if [ $OPEN_IN_VIM_RO_LOCAL_DIR ]; then
+   $EDITOR -R $MYPWD/report_${USER}_$final_name.log
+fi
+
+if [ $OPEN_IN_EDITOR_TMP_DIR ]; then
+   #echo placeholder 
+   $EDITOR /tmp/report_${USER}_$final_name.log
+fi
+
+'''
+
+
+# ---- the original analysis script: run on the report, and shown as the first view of the Report ----------------------
+# ORIG_SH (above) is the script with a few small fixes. It runs with bash on the extracted report, in its own directory, while sosview reads the report. Its output is
+# shown as written; sosview adds only styling and links around it.
+
+ORIG_TIMEOUT = 300           # seconds; the script is stopped after this and what it wrote so far is shown
+ORIG_SHOWN = 4000            # output lines of one block on the page; the rest are in the .log
+# characters bash reads as more than a name. The script puts the report's own path and the names of the files in
+# var/spool/cron into a command line that it runs, so one of these in such a name would run a command here.
+_ORIG_UNSAFE = re.compile(r"[;&|$`<>()\\'\"\n\r]")
+# the script also uses the report's folder unquoted, so a space or a * ? [ in it splits or expands its commands
+_ORIG_ROOT_BAD = re.compile(r"[\s*?\[\]]")
+_ORIG_RUNNING = []           # [(process, its directory)] until read, so that an interrupted sosview stops them
+_ORIG_TITLES = None
+
+
+def orig_titles():
+    """The ## sections, // block titles and ### banners the script writes, read from the script itself: a line of output
+    is only taken for a title when the script has that title."""
+    global _ORIG_TITLES
+    if _ORIG_TITLES is None:
+        _ORIG_TITLES = set(re.findall(r'\blog(?:_tee)? "((?:##|//)[^"]*)"', ORIG_SH))
+    return _ORIG_TITLES
+
+
+def orig_unsafe(root):
+    """The names the script would run as part of a command, when one of them holds shell characters; [] when safe."""
+    bad = []
+    if _ORIG_UNSAFE.search(root) or _ORIG_ROOT_BAD.search(root):
+        bad.append(root)
+    d = os.path.join(root, "var", "spool", "cron")
+    try:
+        names = os.listdir(d) if os.path.isdir(d) else []
+    except OSError:
+        names = []
+    for n in names:
+        if _ORIG_UNSAFE.search(n):
+            bad.append("var/spool/cron/" + n)
+    return bad
+
+
+def orig_start(root, run=True):
+    """Start the script on the report; returns the state that orig_finish() reads. Nothing is started when it must not
+    run, and the state says why."""
+    import subprocess
+    import time as _time
+    root = os.path.abspath(root).rstrip("/") or "/"      # it runs in its own directory: a relative path would point elsewhere
+    st = {"root": root, "t0": _time.time(), "proc": None, "why": None}
+    if not run:
+        st["why"] = "off"
+        return st
+    bash = shutil.which("bash") if os.name == "posix" else None      # stopping it needs process groups: Linux and macOS
+    if not bash:
+        st["why"] = "nobash"
+        return st
+    bad = orig_unsafe(root)
+    if bad:
+        st["why"], st["bad"] = "unsafe", bad
+        return st
+    d = tempfile.mkdtemp(prefix=".sosview-orig-", dir=_tmp_base())
+    st["dir"] = d
+    sh = os.path.join(d, "original-script.sh")
+    with open(sh, "w", encoding="ascii", newline="\n") as fh:
+        fh.write(ORIG_SH)
+    env = dict(os.environ)
+    # Python turns a plain C locale into C.UTF-8 for the programs it starts (PEP 538); the script gets the locale the
+    # shell had, so its commands print what they print when it is run by hand
+    if env.get("LC_CTYPE") in ("C.UTF-8", "C.utf8", "UTF-8") and not env.get("LC_ALL") and not env.get("LANG"):
+        del env["LC_CTYPE"]
+    try:
+        with open(os.path.join(d, "stdout"), "wb") as so, open(os.path.join(d, "stderr"), "wb") as se:
+            st["proc"] = subprocess.Popen([bash, sh, root], cwd=d, stdin=subprocess.DEVNULL, stdout=so, stderr=se,
+                                          start_new_session=True, env=env)
+    except OSError as e:
+        st["why"], st["err"] = "error", str(e)
+        shutil.rmtree(d, ignore_errors=True)
+        return st
+    if not _ORIG_RUNNING:
+        import atexit
+        atexit.register(orig_stop_all)
+    _ORIG_RUNNING.append((st["proc"], d))
+    return st
+
+
+def orig_stop_all():
+    """Stop the script and remove its directory and its /tmp file: sosview is ending before it read them."""
+    while _ORIG_RUNNING:
+        p, d = _ORIG_RUNNING.pop()
+        if p.poll() is None:
+            try:
+                os.killpg(p.pid, 9)
+                p.wait(timeout=5)
+            except Exception:
+                pass
+        shutil.rmtree(d, ignore_errors=True)
+        try:
+            os.remove("/tmp/%d.log" % p.pid)
+        except OSError:
+            pass
+
+
+def orig_finish(st, wait=None):
+    """Wait for the script and read what it wrote: {"text", "items", "secs", "elapsed", "why", ...}."""
+    import subprocess
+    import time as _time
+    out = {"why": st.get("why"), "bad": st.get("bad") or [], "err": st.get("err", ""), "text": "", "elapsed": 0.0, "stopped": False, "root": st["root"]}
+    p = st.get("proc")
+    if p is None:
+        return out
+    left = (ORIG_TIMEOUT if wait is None else wait) - (_time.time() - st["t0"])
+    try:
+        p.wait(timeout=max(0.1, left))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, 15)
+            p.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(p.pid, 9)
+            except OSError:
+                pass
+        out["stopped"] = True
+    out["elapsed"] = _time.time() - st["t0"]
+    d = st["dir"]
+    if (p, d) in _ORIG_RUNNING:
+        _ORIG_RUNNING.remove((p, d))
+    try:
+        so = open(os.path.join(d, "stdout"), "rb").read().decode("utf-8", "replace")
+    except OSError:
+        so = ""
+    # where the script left its report: the last line it prints names the file; a run that was stopped is still
+    # writing to /tmp/<its pid>.log
+    try:
+        se = open(os.path.join(d, "stderr"), "rb").read().decode("utf-8", "replace")
+    except OSError:
+        se = ""
+    m = re.findall(r"## Please check out the file (\S+)", so)
+    path = m[-1] if m and os.path.isfile(m[-1]) else "/tmp/%d.log" % p.pid
+    try:
+        with open(path, "rb") as fh:
+            out["text"] = fh.read().decode("utf-8", "replace")
+        out["log_path"] = path
+    except OSError as e:
+        out["why"], out["err"] = "error", "the script wrote no report (%s); it printed:\n%s" % (e, (so + se)[-2000:])
+    if not out["text"] and out["why"] is None:          # it stopped before writing a line, e.g. "This is not a sosreport dir"
+        out["why"], out["err"] = "error", "the script wrote an empty report; it printed:\n%s" % ((so + se).strip()[-2000:] or "(nothing)")
+    for f in (path, "/tmp/%d.log" % p.pid):          # sosview keeps its own copy; the one in /tmp would pile up
+        if f.startswith("/tmp/") and os.path.isfile(f):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+    shutil.rmtree(d, ignore_errors=True)
+    if out["text"]:
+        out["items"] = orig_parse(out["text"])
+    return out
+
+
+def orig_parse(text):
+    """The script's report as items: ("head", line) before the first section, ("sec", title, [items]) for each
+    ## section, and in a section ("blk", {title, cmd, out, after}) or ("line", text). Every line of the text is in
+    exactly one place, unchanged."""
+    titles = orig_titles()
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    # a line starts a section or a block only when it is one of the script's titles and follows an empty line
+    starts = [i for i, l in enumerate(lines) if l in titles and (i == 0 or lines[i - 1] == "")]
+    tail = next((i for i, l in enumerate(lines) if l == "Calling insights ..."), None)    # insights output, as it came
+    items, cur = [], None
+    first = starts[0] if starts else len(lines)
+    for l in lines[:min(first, tail if tail is not None else first)]:
+        items.append(("head", l))
+    bounds = starts + [tail if tail is not None else len(lines)]
+    for k, i in enumerate(starts):
+        j = bounds[k + 1]
+        if tail is not None and i >= tail:
+            break
+        l = lines[i]
+        if l.startswith("## "):
+            cur = ("sec", l, [])
+            items.append(cur)
+            for x in lines[i + 1:j]:
+                if x != "":
+                    cur[2].append(("line", x))
+            continue
+        chunk = lines[i + 1:j]
+        while chunk and chunk[-1] == "":
+            chunk.pop()
+        seps = [n for n, x in enumerate(chunk) if x == "---"]
+        if len(seps) >= 2:
+            cmd, out, after = chunk[:seps[0]], chunk[seps[0] + 1:seps[-1]], [x for x in chunk[seps[-1] + 1:] if x != ""]
+        elif len(seps) == 1:
+            cmd, out, after = chunk[:seps[0]], chunk[seps[0] + 1:], []
+        else:
+            cmd, out, after = chunk, [], []
+        b = ("blk", {"title": l, "cmd": cmd, "out": out, "after": after})
+        (cur[2] if cur else items).append(b)
+    if tail is not None:
+        items.append(("tail", lines[tail:]))
+    return items
+
+
+_ORIG_NOTES = (
+    ("// Memory Consumption", "/tmp/script/oom-process-stats.py is not part of the script; it runs only when that file is on the computer sosview ran on"),
+)
+
+
+_ORIG_CTL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def _orig_vis(l):
+    """A line of the script's output for the page: a control character (a log with binary bytes in it has them) is drawn
+    as \ufffd, since a page cannot hold it. The .log keeps the line as written."""
+    return _ORIG_CTL.sub("\ufffd", l) if _ORIG_CTL.search(l) else l
+
+
+def _orig_files(cmd, root, t):
+    """The report files a command line names: [(text as written, slashes, path relative to the report, file to open or None)]."""
+    import glob
+    out = []
+    for m in re.finditer(re.escape(root) + r"(/+)([^\s'\"|;)<>]*)", cmd):
+        rel = m.group(2).rstrip("/")
+        f = None
+        if t is not None and rel:
+            if re.search(r"[*?\[]", rel):
+                hits = sorted(glob.glob(os.path.join(t.root, rel)))
+                hits = [h for h in hits if os.path.isfile(h)]
+                f = os.path.relpath(hits[0], t.root) if hits else None
+            elif os.path.isfile(os.path.join(t.root, rel)):
+                f = rel
+        out.append((m.group(0), m.group(1), rel, f))
+    return out
+
+
+def _orig_cmd_html(cmd, root, t, serve):
+    h, at = [], 0
+    for m in re.finditer(re.escape(root) + r"(/+)([^\s'\"|;)<>]*)", cmd):
+        h.append(esc(cmd[at:m.start()]))
+        rel = m.group(2)
+        f = [x[3] for x in _orig_files(m.group(0), root, t)]
+        f = f[0] if f else None
+        h.append("<span class='obase'>%s%s</span>" % (esc(root), esc(m.group(1))))
+        if serve and f:
+            h.append("<a href='#' class='vw ofile' data-view='%s:1' title='open %s in the viewer'>%s</a>" % (esc(f), esc(f), esc(rel)))
+        else:
+            h.append("<span class='ofile%s'>%s</span>" % ("" if f else " ono", esc(rel)))
+        at = m.end()
+    h.append(esc(cmd[at:]))
+    return "".join(h)
+
+
+def orig_html(ctx, secs, t, serve):
+    """The Report's first view: the original script's report, with the switch above it."""
+    o = ctx.get("orig") or {}
+    root = o.get("root") or (os.path.abspath(t.root).rstrip("/") if t is not None else "")     # the path the script was given
+    own = {}                                       # a report file -> the first sosview block that reads it
+    for s in secs:
+        for i, b in enumerate(s["blocks"]):
+            for x in b["src"]:
+                own.setdefault(x, ("b%s-%d" % (s["num"], i), b["title"]))
+    switch = ("<div class='rvsw'><div class='rvbs' role='group' aria-label='which view of the Report'>"
+              "<button type='button' class='rvb' data-rv='orig' aria-pressed='false' title='the original analysis script, run on this report (o)'>ORIGINAL SCRIPT</button>"
+              "<button type='button' class='rvb' data-rv='own' aria-pressed='false' title=\"sosview's report (o)\">SOSVIEW</button></div>%s</div>")
+    if o.get("text"):
+        cap = ("<div class='rvcap'><span><b>the original analysis script</b> run on this report · its output as it wrote it%s</span>"
+               "<span class='r'>%s · %s</span></div>" % (
+                   " · paths and lines link to the files" if serve else "",
+                   "<a href='%s' download>report.log ⇩</a>" % esc(ctx.get("orig_log_url") or "#"),
+                   ("stopped after %d s: below is what it wrote until then" % o["elapsed"]) if o.get("stopped") else "ran in %s" % (
+                       "%.1f s" % o["elapsed"] if o["elapsed"] < 10 else "%d s" % o["elapsed"])))
+    else:
+        cap = ""
+    nav, body = [], []
+    if not o.get("text"):
+        why = o.get("why")
+        if why == "unsafe":
+            msg = ("<div class='rvt'>The original script was not run on this report</div>"
+                   "<div>A name in this report holds characters the shell does not read as a plain name:</div><pre class='out'>%s</pre>"
+                   "<div>The script puts the report's folder and the names of the files in var/spool/cron into a command line and runs it, "
+                   "so this name could run a command on this computer. A space or a * ? [ in the report's folder would split or expand "
+                   "its commands. The script was not run; sosview's view is shown instead.</div>"
+                   % "\n".join(esc(x) for x in o["bad"][:10]))
+        elif why == "nobash":
+            msg = "<div class='rvt'>The original script was not run</div><div>It needs bash on Linux or macOS, and this computer has none.</div>"
+        elif why == "off":
+            msg = "<div class='rvt'>The original script was not run</div><div>sosview was started with --no-original.</div>"
+        else:
+            msg = "<div class='rvt'>The original script did not give a report</div><pre class='out'>%s</pre>" % esc(o.get("err") or "it was not run")
+        body.append("<div class='rvno'>%s<div><button type='button' class='rvb2' data-rv='own'>SOSVIEW ›</button></div></div>" % msg)
+    items = o.get("items") or []
+    n = [0]
+    import time as _time
+    t0 = _time.time()
+
+    def blk(b):
+        bid = "o%03d" % n[0]
+        n[0] += 1
+        files = [x for c in b["cmd"] for x in _orig_files(c, root, t)]
+        opened = [x[3] for x in files if x[3]]
+        acts = ["<button type='button' class='cp' data-cmd='%s' title='copy the command (y)'>copy</button>" % esc("\n".join(b["cmd"])),
+                "<button type='button' class='cpb' title='copy title, command and output (Y)'>copy block</button>",
+                "<button type='button' class='pin' title='pin this block to your notes (p)'>pin</button>"]
+        if serve and opened:
+            acts.append("<button type='button' class='vw' data-view='%s:1' title='open %s in the viewer'>view file</button>" % (esc(opened[0]), esc(opened[0])))
+        acts.append("<a href='#%s' class='pl' title='link to this block'>#</a>" % bid)
+        same = next((own[x[2]] for x in files if x[2] in own), None) or next((own[f] for f in opened if f in own), None)
+        sl = ("<a href='#%s' class='osame' data-b='%s' title=\"the same file in sosview's view: %s\">in sosview ›</a>" % (same[0], same[0], esc("// " + same[1]))) if same else ""
+        h = ["<div class='blk oblk' id='%s'><div class='bh'><span class='t'>%s</span>%s<span class='act'>%s</span></div>" % (bid, esc(b["title"]), sl, "".join(acts))]
+        for c in b["cmd"]:
+            h.append("<div class='cmd ocmd'>%s</div>" % _orig_cmd_html(c, root, t, serve))
+        lines = b["out"]
+        if not lines:
+            h.append("<div class='nc'>(the command printed nothing)</div>")
+        else:
+            refs = []
+            if serve and t is not None and opened and _time.time() - t0 < REF_BUDGET:
+                for l in lines[:200]:
+                    r = None
+                    if len(l.strip()) >= 6:
+                        for f in opened[:3]:
+                            ln = t.locate(f, l)
+                            if ln:
+                                r = ["%s:%d" % (f, ln), ""]
+                                break
+                    refs.append(r)
+            shown, more = [_orig_vis(l) for l in lines[:ORIG_SHOWN]], len(lines) - ORIG_SHOWN
+            first, rest = shown[:40], shown[40:]
+            h.append("<pre class='out'>%s</pre>" % _lines_html(first, refs=refs[:40]))
+            if rest:
+                h.append("<details><summary>+ %s more lines</summary><pre class='out'>%s</pre></details>" % (fmt_n(len(rest)), _lines_html(rest, refs=refs[40:])))
+            if more > 0:
+                h.append("<div class='nc'>… %s more lines: they are in report.log</div>" % fmt_n(more))
+        for a in b["after"]:
+            h.append("<div class='oafter'>%s</div>" % esc(_orig_vis(a)))
+        for k, v in _ORIG_NOTES:
+            if b["title"].startswith(k):
+                h.append("<div class='onote'>sosview: %s</div>" % esc(v))
+        h.append("</div>")
+        return "".join(h)
+    si = 0
+    heads = [it[1] for it in items if it[0] == "head"]
+    if heads:                                     # the lines before the first section, as one piece
+        body.append("<div class='ohead'>%s</div>" % esc("\n".join(heads)))
+    for it in items:
+        if it[0] == "head":
+            continue
+        elif it[0] == "blk":
+            body.append(blk(it[1]))
+        elif it[0] == "tail":
+            body.append("<pre class='out otail'>%s</pre>" % esc("\n".join(_orig_vis(l) for l in it[1])))
+        elif it[0] == "sec":
+            sid = "o-s%02d" % si
+            si += 1
+            nb = sum(1 for x in it[2] if x[0] == "blk")
+            nav.append("<a href='#%s' data-sec='%s' title='%d block%s'><span class='n'></span><span>%s</span><span class='m'><span class='m1'>%d</span><span class='m2'>%d</span></span></a>"
+                       % (sid, sid, nb, "" if nb == 1 else "s", esc(it[1][3:]), nb, nb))
+            body.append("<section class='sec osec' id='%s'><div class='sh'><span class='t'>%s</span></div>" % (sid, esc(it[1])))
+            for x in it[2]:
+                body.append(blk(x[1]) if x[0] == "blk" else "<div class='oline'>%s</div>" % esc(_orig_vis(x[1])))
+            body.append("</section>")
+    aside = ("<aside class='idx' id='oidx' data-rvv='orig'><h4>THE ORIGINAL SCRIPT</h4>%s</aside>"
+             "<div class='split' data-for='oidx' data-side='left' data-rvv='orig' title='drag to resize, all the way left to hide · double-click to reset'></div>" % "".join(nav))
+    main = "<main class='doc odoc' data-rvv='orig'>%s%s</main>" % (switch % cap, "".join(body))
+    return aside + main, switch % ""
+def render_text(ctx, secs, full=False, limit=25):
+    o = []
+    o.append("sosview %s · %s · %s · %s%s · sos %s" % (VERSION, ctx["hostname"], ctx["os"], ctx["role"], (" " + ctx["satellite"]) if ctx.get("satellite") else "",
+                                                      ctx["sos_version"].replace("sosreport: ", "")))
+    o.append("kernel %s · %s · collected %s" % (ctx["kernel"], ctx["uptime"].strip(), ctx["collected"]))
+    o.append(" · ".join(x for x in (ctx.get("log_window", ""), "%s files" % fmt_n(ctx.get("files", 0))) if x))
+    if ctx.get("partial"):
+        o.append("partial: " + ctx["partial"])
+    o.append("")
+    o.append("sections: " + "  ".join("%s %s" % (s["num"], s["title"]) for s in secs))
+    iss = issues_text(ctx.get("issues"))
+    if iss:
+        o.append("")
+        o += iss
+    tl = ctx.get("timeline")
+    if tl and any(ln["total"] for ln in tl["lanes"]):
+        o.append("")
+        head = "== TIMELINE: lines per day, %s to %s (host time%s) " % (tl["start"][:10], tl["last_day"], (", " + tl["tz"]) if tl["tz"] else "")
+        o.append(head + "=" * max(4, 96 - len(head)))
+        o.extend(timeline_text(tl))
+    itr = in_this_report(ctx, secs)
+    if itr:
+        o.append("")
+        o.append("== IN THIS REPORT: counts and times from the sections below " + "=" * 36)
+        o.extend("   %-7s %s" % ("" if tg.startswith(("learn", "s")) else tg[1:3], tx) for tx, tg in itr)
+    for s in secs:
+        o.append("")
+        head = "== %s %s " % (s["num"], s["title"].upper())
+        o.append(head + "=" * max(4, 96 - len(head)))
+        pbs = ([])
+        for b in s["blocks"]:
+            o.append("")
+            o.append("// " + b["title"] + (("   [%s]" % b["note"]) if b["note"] and b["state"] == "ok" else ""))
+            if b["cmd"]:
+                o.append(("≈ " if b["approx"] else "$ ") + b["cmd"])
+            if b["state"] in ("nc", "empty") or (b["state"] == "ok" and not b["lines"]):
+                o.append("   " + b["note"])
+                continue
+            if b["state"] == "error":
+                o.append("   " + b["note"] + ":")
+            if not full and (b["title"].startswith(FOLDED_TOP) or (b.get("fold") and b["state"] == "ok")):       # folded on the page, one line here
+                o.append("   %s (--full)" % plural(len(b["lines"]), "line"))
+                continue
+            lines = b["lines"] if full else b["lines"][:limit]
+            o.extend(lines)
+            if not full and len(b["lines"]) > limit:
+                o.append("   + %d more lines (--full)" % (len(b["lines"]) - limit))
+    known = ctx.get("known")
+    o.append("")
+    return "\n".join(o)
+
+
+# ---- HTML -----------------------------------------------------------------------------
+
+CSS = r"""
+:root{--bg:#0d1117;--panel:#11161d;--bar:#161b22;--line:#1d232c;--line2:#2a313c;--fg:#e6edf3;--fg2:#c9d1d9;--dim:#9aa7b4;--dim2:#808b97;--cmd:#6fdc9a;--link:#79b8ff;--sel:#1d2530;--hit:#5c4a12;--hitfg:#ffe08a}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 "JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace}
+a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
+button{font:inherit}
+.top{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:22px;padding:0 22px;height:50px;background:var(--bar);border-bottom:1px solid var(--line2)}
+.top .me{white-space:nowrap}.top .me b{color:var(--cmd)}
+.tabs{display:flex;height:50px}.tabs button{background:none;border:0;border-bottom:2px solid transparent;color:var(--dim);padding:0 14px;cursor:pointer}
+.tabs button[aria-selected=true]{color:var(--fg);font-weight:700;border-bottom-color:var(--fg)}
+.qs{margin-left:auto;display:flex;align-items:center;gap:8px;width:min(420px,40vw);height:32px;padding:0 10px;background:var(--bg);border:1px solid var(--line2);border-radius:6px}
+.qs input{flex:1;min-width:0;background:none;border:0;color:var(--fg);font:inherit;outline:none}
+.facts{padding:8px 22px;color:var(--dim);font-size:12px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+.pane{display:none}.pane.on{display:flex}
+.idx{width:270px;flex-shrink:0;border-right:1px solid var(--line);padding:12px 0;position:sticky;top:50px;align-self:flex-start;max-height:calc(100vh - 50px);overflow:auto}
+.idx h4,.lbl{margin:0;padding:0 18px 6px;color:var(--dim);font-size:11px;font-weight:400;letter-spacing:.08em}
+.idx a{display:flex;gap:8px;padding:4px 18px;color:var(--fg2);font-size:12.5px;white-space:nowrap}.idx a span:nth-child(2){white-space:normal;line-height:1.35;flex:1}.idx a:hover{background:var(--sel);text-decoration:none}
+.idx a .n{color:var(--dim2);width:20px}.idx a .m{margin-left:auto;color:var(--dim2);font-size:11px}.idx a.cur{background:var(--sel);color:var(--fg);font-weight:700}
+.idx a.na{color:var(--dim2)}
+.doc{flex:1;min-width:0;padding:16px 30px 80px;display:flex;flex-direction:column;gap:26px}
+.sec{display:flex;flex-direction:column;gap:16px;scroll-margin-top:60px}
+.sh{display:flex;align-items:baseline;gap:14px;border-bottom:1px solid var(--line2);padding-bottom:8px}.sh .t{font-size:17px;font-weight:700}.sh .s{color:var(--dim);font-size:12px}
+.blk{display:flex;flex-direction:column;gap:3px;scroll-margin-top:60px}.blk.cur{outline:1px solid var(--line2);outline-offset:6px;border-radius:2px}
+.bh{display:flex;align-items:baseline;gap:12px}.bh .t{font-weight:700}.bh .note{color:var(--dim);font-size:12px}
+.bh .act{margin-left:auto;display:flex;gap:12px;font-size:12px}.bh .act a,.bh .act button{color:var(--dim2);background:none;border:0;padding:0;cursor:pointer}.bh .act a:hover,.bh .act button:hover{color:var(--fg)}.bh .act{opacity:0;transition:opacity .12s}.blk:hover .act,.blk.cur .act,.blk:focus-within .act{opacity:1}@media (hover:none){.bh .act{opacity:1}}
+.cmd{color:var(--cmd);font-size:12px;overflow-wrap:anywhere}.cmd.approx{opacity:.85}.cmd .g{cursor:help}.itools{display:flex;flex-wrap:wrap;gap:4px 12px;padding:0 18px 10px;font-size:11.5px;color:var(--dim)}.itools a{color:var(--dim)}.itools a:hover{color:var(--fg)}.itools label{display:flex;gap:5px;align-items:center;cursor:pointer}body.hidenc .blk.nc{display:none}body.wrap pre.out{white-space:pre-wrap;overflow-wrap:anywhere}.ml{cursor:pointer}.ml:hover{text-decoration:underline dotted;color:var(--fg)}pre.out a.vw{color:var(--link);text-decoration:underline dotted}.pbsum{font-size:15.5px;color:var(--fg2);margin:0 0 4px!important}.pflow{display:flex;align-items:stretch;gap:0;overflow-x:auto;padding-bottom:2px}.pnode{flex:1 1 0;min-width:150px;border:1px solid var(--line2);border-radius:10px;background:var(--panel);padding:9px 11px}.pnode b{display:block;color:var(--fg);font-size:14px}.pnode .pw{font-size:12.5px;color:var(--dim);margin:2px 0 7px;line-height:1.4}.pnode.hit{border-color:#7a6420}.pf{display:flex;gap:6px;align-items:center;font:11.5px 'JetBrains Mono',monospace;color:var(--fg2);margin:2px 0;overflow-wrap:anywhere}.pf b{margin-left:auto;color:var(--hitfg);font-weight:400;display:inline}.pf.pn,.pf .pn{color:var(--dim2)}.pf a{color:var(--link)}.pflow i.d,.pcap i.d{width:8px;height:8px;border-radius:50%;background:#3f7a52;display:inline-block;flex:none}.pflow i.d.no,.pcap i.d.no{background:#3a414c}.parr{align-self:center;color:var(--dim2);padding:0 5px;font-size:18px}.pcap{font-size:12px;color:var(--dim)}.pcap b{color:var(--hitfg);font-weight:400}.sgrp{margin:0 0 6px}.sgh{display:flex;gap:10px;align-items:baseline;margin:4px 0;cursor:default}details.sgrp>summary{cursor:pointer;list-style:none}details.sgrp>summary::before{content:'▸ ';color:var(--dim2)}details.sgrp[open]>summary::before{content:'▾ '}.sgt{font-weight:600;color:var(--fg)}.sgc{font:11.5px 'JetBrains Mono',monospace;color:var(--dim2)}.sgr{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr) minmax(0,.7fr);border-top:1px solid var(--line);font-size:13.5px}.sgr>div{padding:6px 9px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}.sgr .sh{font:11px 'JetBrains Mono',monospace;color:var(--dim2);letter-spacing:.05em;padding:3px 9px}.sgr .seen{background:#1c1a12}.sn{font:11px 'JetBrains Mono',monospace;color:var(--hitfg);border:1px solid #7a6420;border-radius:8px;padding:0 6px;margin-left:6px;white-space:nowrap}.mb{font-family:'IBM Plex Sans',system-ui,sans-serif;position:absolute;border:1px solid var(--line2);border-radius:10px;background:#141a22;height:104px;box-sizing:border-box}.mb.me{box-shadow:0 0 0 2px #2c5a3c inset}.mb.out{border-style:dashed;background:#10151c}.mb:hover,.mb:focus-within{outline:2px solid #79b8ff;z-index:5}.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none;background:#3a414c}.dot.r{background:#3f7a52}.dot.f{background:#a8423c}.gt{border-bottom:1px dotted #8b98a5;cursor:help}#tbar .tbn{background:#13202f;border:1px solid #24405f;border-radius:6px;padding:1px 8px;color:var(--fg2)}#tbar .tbn a{color:var(--link)}.ewh{display:grid;grid-template-columns:minmax(120px,auto) auto 1fr;gap:2px 14px;font-size:12px}.ewh .z{color:var(--dim2)}pre.out a.ln{color:inherit;text-decoration:none;cursor:pointer}pre.out a.ln:hover{text-decoration:underline dotted;background:rgba(121,184,255,.10)}.qx{pointer-events:none}body.serve .qx{pointer-events:auto;cursor:pointer}body.serve .qx .dl{text-decoration:underline;fill:var(--link)}.tlr{margin:0 0 22px;border:1px solid var(--line);border-radius:8px;padding:10px 14px;background:var(--panel)}.tlr summary{cursor:pointer;color:var(--fg2);font-size:12.5px}.tlr+.tlr.fold{margin-top:-14px}.tlr.fold .blk{margin-top:8px}
+
+
+.cp.mini{background:none;border:0;color:var(--dim2);cursor:pointer;font:inherit;font-size:11px;padding:0 4px}.cp.mini:hover{color:var(--fg)}.tin{width:128px;background:var(--bg);border:1px solid var(--line2);border-radius:4px;color:var(--fg);font:inherit;font-size:12px;padding:2px 6px}.vh .tin{width:110px}.rid{color:inherit;text-decoration:underline dotted;cursor:pointer}.bh .act .pl{text-decoration:none}
+pre.out{margin:2px 0 0;padding:9px 14px;background:var(--panel);border:1px solid var(--line);border-radius:6px;font:inherit;font-size:12.5px;color:#d3dce6;overflow-x:auto}
+.blk details summary{cursor:pointer;color:var(--dim);font-size:12px;margin-top:2px}
+.nc{color:var(--dim2);font-size:12.5px;padding:2px 14px}
+.err{color:var(--fg);font-size:12.5px;padding:6px 14px;background:var(--panel);border:1px dashed var(--line2);border-radius:6px}
+.keys{position:fixed;left:0;right:0;bottom:0;display:flex;gap:18px;padding:6px 22px;background:var(--bg);border-top:1px solid var(--line);color:var(--dim2);font-size:12px;z-index:4}
+.keys span{white-space:nowrap}.keys{overflow:hidden}.qs.qsn{color:var(--dim2);border:0;background:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;line-height:32px;width:auto;max-width:min(420px,40vw)}.qsn code{color:var(--cmd)}
+.keys span.ver{margin-left:auto}.keys span[data-k]{display:none}body[data-tab=report] .keys span[data-k=report],body[data-tab=search] .keys span[data-k=search],body[data-tab=learn] .keys span[data-k=learn]{display:inline}
+
+.sbox{display:flex;flex-direction:column;gap:8px;padding:16px 22px 12px;border-bottom:1px solid var(--line);width:100%}
+.sform{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.sform .in{flex:1 1 380px;display:flex;align-items:center;gap:10px;height:42px;padding:0 14px;background:var(--panel);border:1px solid var(--dim2);border-radius:8px}
+.sform .in input{flex:1;min-width:0;background:none;border:0;color:var(--fg);font:inherit;font-size:15px;outline:none}
+.sform select{height:42px;padding:0 10px;border:1px solid var(--line2);border-radius:8px;background:var(--bg);color:var(--fg);font:inherit}
+.btn{height:42px;padding:0 18px;border-radius:8px;border:0;background:var(--fg);color:var(--bg);font-weight:700;cursor:pointer}
+.btn2{white-space:nowrap;height:28px;padding:0 10px;border-radius:5px;border:1px solid var(--line2);background:var(--bar);color:var(--fg2);cursor:pointer}
+.sstat{display:flex;gap:16px;color:var(--dim);font-size:12px;flex-wrap:wrap;align-items:center}
+.sopts{display:flex;gap:18px;color:var(--fg2);font-size:12px;flex-wrap:wrap;align-items:center}.sopts label{display:flex;align-items:center;gap:6px;white-space:nowrap}
+.sopts .xin{width:230px;height:24px;padding:0 8px;background:var(--panel);border:1px solid var(--line2);border-radius:5px;color:var(--fg);font:inherit;font-size:12px}
+.sopts select{height:24px;background:var(--bg);color:var(--fg);border:1px solid var(--line2);border-radius:5px;font:inherit;font-size:12px}
+.quick{display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:12px;color:var(--dim)}.quick .chip{height:24px;padding:0 10px;font-size:12px}
+.split{width:7px;margin:0 -3px;flex-shrink:0;cursor:col-resize;position:relative;z-index:2;background:transparent}.split:hover,.split.on{background:var(--line2)}
+body.drag{user-select:none;cursor:col-resize}
+.scols{display:flex;flex:none;min-height:0;width:100%;height:calc(100vh - 50px - 170px)}
+.sfiles{width:330px;flex-shrink:0;border-right:1px solid var(--line);overflow:auto;padding:10px 0}
+.sfiles label{display:flex;align-items:center;gap:9px;padding:5px 18px;font-size:12.5px;color:var(--fg2);cursor:pointer}.sfiles label.off{color:var(--dim2)}
+.sfiles .nm{flex:1;min-width:0;display:flex;flex-direction:column}.sfiles .nm span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.sfiles .nm span+span{color:var(--dim2);font-size:11px}
+.sfiles .fam .nm span:first-child{color:var(--fg)}.sfiles label.off .nm span:first-child{color:var(--dim2)}.sfiles .c{flex-shrink:0;color:var(--fg2)}
+.sfiles .lbl a{color:var(--cmd);text-decoration:none;letter-spacing:0}.sfiles .lbl a:hover{text-decoration:underline}
+.sfiles .fo{flex-shrink:0;background:none;border:1px solid var(--line2);border-radius:9px;color:var(--dim);font:inherit;font-size:10.5px;padding:0 6px;height:18px;cursor:pointer;opacity:0}
+.sfiles label:hover .fo,.sfiles .fo:focus{opacity:1}.sfiles .fo:hover{color:var(--fg);border-color:var(--dim)}
+.sact{display:flex;gap:6px;align-items:center;flex-wrap:wrap}.sact:empty{display:none}
+.fchip{height:20px;padding:0 8px;border-radius:10px;border:1px solid var(--line2);background:var(--panel);color:var(--fg);font:inherit;font-size:11.5px;cursor:pointer;white-space:nowrap;max-width:420px;overflow:hidden;text-overflow:ellipsis}.fchip:hover{border-color:var(--dim)}
+.dist .hn{margin-left:8px;color:var(--dim);font-size:11px}
+.dist .fs{color:var(--dim);white-space:pre}.dist .dord{color:var(--dim);text-decoration:none;letter-spacing:0;margin-left:4px}.dist .dord.on{color:var(--fg);text-decoration:underline}
+.when{margin:0 0 12px;font-size:11px;color:var(--dim)}.wbars{display:flex;align-items:flex-end;gap:2px;height:44px;border-bottom:1px solid var(--line2)}
+.wb{flex:1 1 0;min-width:2px;max-width:26px;height:100%;display:flex;align-items:flex-end}.wb i{display:block;width:100%;background:var(--cmd);opacity:.75;border-radius:2px 2px 0 0}.wb:hover i{opacity:1}
+.waxis{display:flex;justify-content:space-between;padding-top:3px}
+.sfiles .fx{display:block;background:none;border:0;color:var(--dim);cursor:pointer;padding:0 18px 5px 44px;font-size:11.5px;text-align:left}.sfiles .fx:hover{color:var(--fg)}
+.sfiles .mem label{padding:2px 18px 2px 44px;font-size:12px}
+.sres{flex:1;min-width:300px;overflow:auto;padding:12px 22px;display:flex;flex-direction:column;gap:14px}
+.grp .gh{display:flex;gap:10px;align-items:baseline;cursor:pointer;position:sticky;top:-12px;background:var(--bg);padding:5px 0;z-index:1}.grp .gh:hover b{text-decoration:underline}
+.grp .gh b{font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.grp .gh span{color:var(--dim);font-size:12px;white-space:nowrap}.grp .gh .tw{width:12px;flex-shrink:0}
+.grp.shut .gl{display:none}.grp .gl .mh{color:var(--dim);font-size:11.5px;padding:6px 12px 3px 88px;border-top:1px solid var(--line)}.grp .gl .mh:first-child{border-top:0;padding-top:2px}
+.grp .gl a.ctx{color:var(--dim2)}.grp .gl a.gap{color:var(--dim2)}.rbar{display:flex;gap:16px;font-size:12px;color:var(--dim);flex-wrap:wrap;white-space:nowrap}
+.grp .gl{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:5px 0;font-size:12.5px}
+.grp .gl a{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:1px 10px 1px 0;color:var(--fg2)}.grp .gl a:hover,.grp .gl a.cur{background:var(--sel);text-decoration:none}
+.grp .gl a i{font-style:normal;display:inline-block;width:76px;text-align:right;padding-right:12px;color:var(--cmd)}
+mark{background:var(--hit);color:var(--hitfg)}
+.view{width:min(560px,42vw);flex-shrink:1;min-width:260px;border-left:1px solid var(--line);display:flex;flex-direction:column;background:#0b0e13;overflow:hidden;min-height:0}
+.vh{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:8px 14px;border-bottom:1px solid var(--line);font-size:12px}.vh b{color:var(--fg)}.vh span{color:var(--dim)}.vh .r{margin-left:auto;display:flex;flex-wrap:wrap;gap:6px}
+.vb{flex:1;min-height:0;overflow:auto;padding:6px 0;font-size:12px;color:var(--dim)}.vb div{white-space:pre;padding:0 12px 0 0}.vb div i{font-style:normal;display:inline-block;width:70px;text-align:right;padding-right:12px;color:var(--dim2)}
+.vb div.cur{background:#2b2410;color:var(--hitfg)}.vb div.hit{color:#e8d9a8}
+.vf{padding:6px 14px;border-top:1px solid var(--line);font-size:11.5px;color:var(--dim2)}
+.dist{font-size:12px;color:var(--fg2)}.dist div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+.tbar{display:flex;align-items:center;gap:8px 8px;padding:10px 22px;border-bottom:1px solid var(--line);font-size:12.5px;flex-wrap:wrap;width:100%}
+.idx .cmp{margin-top:14px;padding-top:10px;border-top:1px solid var(--line)}.idx .cmp div{padding:2px 18px 6px;color:var(--dim);font-size:11.5px}.idx .cmp code{display:block;color:var(--cmd);font-size:11.5px;overflow-wrap:anywhere}
+.blk.quiet{margin-top:6px;margin-bottom:6px}.blk.quiet .bh{cursor:pointer}.blk.quiet .bh .t{color:var(--dim);font-weight:400}
+.blk.quiet .qn{color:var(--dim2);font-size:12px;margin-left:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
+.blk.quiet:not(.open) .cmd,.blk.quiet:not(.open) div.nc,.blk.quiet:not(.open) .act{display:none}.blk.fold:not(.open)>*:not(.bh){display:none}.blk.fold .bh .t::before{content:"▸ ";color:var(--cmd)}.blk.fold:not(.open) .bh .t{color:var(--fg2)}
+.ftag{flex:none;margin-left:12px;padding:0 8px;border:1px solid var(--cmd);border-radius:999px;color:var(--cmd);font-size:11px;line-height:17px;white-space:nowrap}.blk.fold.open .ftag{display:none}.blk.fold.open .bh .t::before{content:"▾ "}.blk.quiet.open .qn{display:none}
+.sec.na{margin-top:14px}.sec.na .sh{border-bottom:0;padding-bottom:0}.sec.na .sh .t{color:var(--dim);font-size:13px;font-weight:400}
+.cmd.long{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer}.cmd.long.open{white-space:normal;overflow:visible}
+.inrep{margin:0 0 18px;padding:10px 14px;border:1px solid var(--line2);border-radius:8px;background:var(--panel);columns:2 420px;column-gap:28px}
+.inrep .lbl{padding:0 0 6px;column-span:all}.inrep .lbl span{letter-spacing:0;color:var(--dim2);margin-left:8px}
+.inrep a{display:block;color:var(--fg2);text-decoration:none;font-size:12.5px;padding:2px 0;break-inside:avoid;overflow-wrap:anywhere}.inrep a:hover{color:var(--fg);text-decoration:underline}
+.dsp{position:relative}.dsp summary{list-style:none;cursor:pointer;color:var(--dim);white-space:nowrap}.dsp summary::-webkit-details-marker{display:none}.dsp summary:hover{color:var(--fg)}
+.dspm{position:absolute;right:0;top:26px;z-index:9;display:flex;flex-direction:column;gap:6px;padding:10px 14px;background:var(--panel);border:1px solid var(--line2);border-radius:8px;white-space:nowrap}.dspm a{color:var(--fg2);text-decoration:none}.dspm a:hover{color:var(--fg)}
+.tabs button[data-none]{opacity:.5}
+.keys span{flex:0 1 auto;overflow:hidden;text-overflow:ellipsis}.keys span.ver{flex-shrink:0}
+.sact .tlgo{color:var(--link);text-decoration:none;font-size:11.5px;margin-left:4px}
+body[data-tab=search] .top label.qs{visibility:hidden}
+.reqc{border:1px solid var(--line2);border-radius:8px;background:var(--panel);padding:12px 16px;margin:0 0 14px;font-size:12.5px}.reqc .lbl{padding:0 0 4px}
+.reqc .rh{display:flex;gap:12px;align-items:baseline;flex-wrap:wrap;margin-bottom:8px}.reqc .rh b{font-size:15px;color:var(--fg)}.reqc .rh span{color:var(--dim)}
+.reqc .rr{display:grid;grid-template-columns:66px 88px 1fr;gap:0 10px;padding:3px 0;border-top:1px solid var(--line)}.reqc .rt{color:var(--dim)}.reqc .rk{color:var(--cmd)}.reqc .rr.e .rk{color:var(--hitfg)}
+.reqc .rr.n .rv{color:var(--dim)}.reqc .rv{overflow-wrap:anywhere;white-space:pre-wrap;min-width:0}.reqc .rv a{margin-left:6px;white-space:nowrap;text-decoration:none}
+.idp{display:none;position:fixed;top:50px;right:0;bottom:0;width:min(820px,58vw);z-index:46;background:#0f141b;border-left:1px solid var(--line2);box-shadow:-14px 0 30px rgba(0,0,0,.5);flex-direction:column}.idp.on{display:flex}.idh{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line)}.idh b{color:var(--cmd);overflow-wrap:anywhere}#idsrch{margin-left:auto}.idb{overflow:auto;padding:8px 16px 16px;flex:1;outline:none}.idb .reqc{margin:0;border:0;padding:0;background:none}@media (max-width:700px){.idp{width:100%}}
+.sopts label[hidden]{display:none}.pk{cursor:pointer}.pk:hover{text-decoration:underline dotted;text-underline-offset:2px;color:var(--fg)}.ptag::after{content:attr(data-t);font-family:var(--sans,system-ui,sans-serif);font-size:11px;border:1px solid var(--line2);border-radius:4px;padding:0 6px;margin-left:12px;color:var(--dim)}.ptag.r::after{color:var(--hitfg);border-color:currentColor}.pkd{display:block;white-space:normal;margin:2px 0 6px;padding:4px 12px 6px;border-left:2px solid var(--cmd);background:var(--panel);font-size:12px;line-height:1.7}.pkd>span{display:inline-block;margin-right:22px}.pkd i{font-style:normal;color:var(--dim);margin-right:6px}#czst.czoff{color:var(--hitfg)}.smode{display:inline-flex;align-items:center;gap:0;color:var(--dim)}.smode button{font:inherit;font-size:12px;background:none;border:1px solid var(--line2);color:var(--fg2);padding:3px 10px;min-height:28px;cursor:pointer;margin-left:-1px}.smode button:first-of-type{margin-left:8px;border-radius:5px 0 0 5px}.smode button:last-of-type{border-radius:0 5px 5px 0}.smode button[aria-pressed=true]{background:var(--panel);color:var(--cmd);border-color:var(--cmd);position:relative}
+.uid,.rid{cursor:pointer;text-decoration:underline dotted;text-underline-offset:2px}.uid:hover,.rid:hover{color:var(--fg)}
+.reqc .rh.rs{margin:14px 0 4px}.reqc .rsub{color:var(--dim);font-size:11px;letter-spacing:.04em;margin:8px 0 2px;text-transform:uppercase}.reqc .rsub span{text-transform:none;letter-spacing:0}.reqc details.rmo{margin:6px 0 2px}.reqc details.rmo>summary{cursor:pointer;color:var(--dim);padding:4px 0;list-style-position:inside}.reqc details.rmo>summary:hover{color:var(--fg)}.reqc .rh.rs b{font-size:13px;color:var(--fg2)}.reqc .ex{color:var(--hitfg)}
+.reqc .rbt{padding:1px 0 4px 164px;color:var(--dim);overflow-wrap:anywhere}.reqc .rbt b{color:var(--fg2);font-weight:400;overflow-wrap:anywhere}@media (max-width:700px){.reqc .rbt{padding-left:0}}
+.reqc .rf{display:flex;gap:6px 22px;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px solid var(--line2);color:var(--dim)}.reqc .rf a{color:var(--link);text-decoration:none}
+.tgl{font:11px 'JetBrains Mono',monospace;color:var(--dim2);letter-spacing:.05em;margin-left:8px}.thint{color:var(--dim2);font-size:11px;white-space:nowrap}
+.chip .dot{width:8px;height:8px;border-radius:2px;margin-right:5px}.chip .cn{font-style:normal;color:var(--dim2);margin-left:3px}.chip[aria-pressed=true] .cn{color:#444}
+.tsel{background:var(--bg);border:1px solid var(--line2);border-radius:14px;color:var(--fg2);font:inherit;font-size:12.5px;height:28px;padding:0 8px;width:auto;max-width:190px}
+.tsum{display:flex;flex-wrap:wrap;gap:4px 8px;padding:6px 22px;border-bottom:1px solid var(--line);font:12px 'JetBrains Mono',monospace;color:var(--dim);width:100%}.tsum a{color:var(--link)}.tsum .tsrc{margin-left:auto;color:var(--dim2)}
+.tsum .tbn{background:#13202f;border:1px solid #24405f;border-radius:6px;padding:0 8px;color:var(--fg2)}
+.tcols{position:relative;display:flex;width:100%;height:calc(100vh - 50px - 52px)}
+.tm{flex:1;min-width:0;overflow:auto;font:12px 'JetBrains Mono',monospace}
+.tm .th,.tm .tr{display:grid;grid-template-columns:104px minmax(140px,1.1fr) 140px 140px 96px 80px 104px minmax(160px,2fr);gap:0 10px;padding:4px 22px;align-items:center}
+.tm .th{position:sticky;top:0;z-index:2;background:#10151c;padding-left:40px;border-bottom:1px solid var(--line2);color:var(--dim2);font-size:11px;letter-spacing:.04em}.tm .srt{cursor:pointer}.tm .srt:hover,.tm .srt.on{color:var(--fg)}
+.tm .tr{width:100%;background:none;border:0;border-bottom:1px solid var(--line);color:var(--fg2);text-align:left;cursor:pointer;font:inherit;padding-left:40px}.tm .tr:hover{background:#141a22}.tm .tr.cur{background:var(--sel);color:var(--fg)}
+.tm .tr>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tm .tr .te{color:var(--dim)}
+.tgrp{display:grid;grid-template-columns:14px minmax(0,1fr) 100px 96px minmax(0,280px) 290px;gap:0 12px;padding:7px 22px;align-items:center;background:#121820;border-bottom:1px solid var(--line);color:var(--fg);cursor:pointer}
+.tgrp:hover{background:#18202b}.tgrp.op{background:#16202c}.tgrp.rare{color:var(--dim)}.tgrp .tw{color:var(--dim2)}.tgrp .gk{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tgrp .gn{text-align:right}
+.tgrp .gl,.tgrp .gw{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.tgrp .kn{margin-left:6px}
+.rb{display:flex;height:9px;border-radius:2px;overflow:hidden}.rb i{display:block}
+.pill{border-radius:8px;padding:0 7px;font-size:11px}.pill.pe{background:#3a1f1d;color:#ff9a90}.pill.pw{background:#3a2f12;color:#f1c96b}.pill.po{background:#162a40;color:#8cc0ff}.pill.ps{background:#173022;color:#8fd4a6}
+.tmore{padding:6px 22px 6px 40px;border-bottom:1px solid var(--line);color:var(--dim)}.tmore a{color:var(--link)}.tm .nc{padding:18px 22px}
+.td{display:none;position:absolute;right:0;top:0;bottom:0;width:min(520px,44vw);z-index:5;border-left:1px solid var(--line2);box-shadow:-12px 0 30px rgba(0,0,0,.45);padding:14px 18px;overflow:auto;background:#0f141b;font-size:12.5px;flex-direction:column;gap:10px}
+.td.on{display:flex}.td>*{flex-shrink:0}.tdx{margin-left:auto;background:none;border:1px solid var(--line2);border-radius:6px;color:var(--dim);cursor:pointer;font-size:12px;padding:1px 8px}.tdx:hover{color:var(--fg)}
+.chip{height:28px;padding:0 11px;border-radius:14px;border:1px solid var(--line2);background:none;color:var(--fg2);cursor:pointer}.chip[aria-pressed=true]{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+.tl-e{background:#a8423c}.tl-w{background:#a17a1c}.tl-o{background:#3a6ea8}.tl-s{background:#3f7a52}
+.sub{display:flex;flex-direction:column;gap:2px;font-size:12px}.sub a{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.steps{display:flex;flex-direction:column;gap:2px;font-size:12px}.stp{display:grid;grid-template-columns:34px 70px minmax(0,1fr) 30px;gap:6px;padding:2px 4px;border-radius:4px}.stp.er{background:#2a1515}.stp em{color:var(--dim);font-style:normal}
+.kv{display:grid;grid-template-columns:minmax(90px,max-content) minmax(0,1fr);gap:3px 12px}
+.td>.tdh{position:sticky;top:-14px;z-index:4;margin:-14px 0 0;padding:14px 0 8px;background:#0f141b}.kv span:nth-child(odd){color:var(--dim)}
+
+
+.lc{flex:1;min-width:0;padding:20px 34px 80px;display:none;flex-direction:column;gap:16px}.lc.on{display:flex}.lc .prose{max-width:120ch}.lc .pcp{position:absolute;top:4px;right:6px;font-size:11px}
+.pane[data-pane='learn']{display:none}.pane[data-pane='learn'].on{display:block}.lc .ti{font-size:21px;line-height:1.3}
+.lhero{display:block}
+.lhero h2{font:600 25px/1.25 "IBM Plex Sans",system-ui,sans-serif;margin:6px 0 10px;color:var(--fg)}
+.lhero p{font:15px/1.6 "IBM Plex Sans",system-ui,sans-serif;color:#c3ccd6;margin:0;max-width:66ch}
+.lsec{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-top:16px;padding-bottom:4px}.lsec .ti{font-size:17px}
+.ltiles{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:10px}.ltiles.small{grid-template-columns:repeat(auto-fill,minmax(200px,1fr))}
+.lc .ti{font-size:19px;font-weight:700}.lc .prose{font-family:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;font-size:15px;line-height:1.6;color:#d3dce6}
+.lc ul{margin:0;padding-left:18px}
+.hop{padding:8px 12px;background:var(--panel);border:1px solid var(--line);border-radius:6px;max-width:520px}.hop span{display:block;color:var(--dim);font-size:11.5px}
+.arrow{color:var(--dim2);padding-left:24px}
+
+
+.lc .gp{color:var(--dim);font-size:12px}
+.lc code{font:12.5px "JetBrains Mono",ui-monospace,monospace;background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:0 4px;color:#e3e9f0}.lc code.has{border-color:#2f5b3f}
+.fills{font-size:12px;color:var(--dim);padding:6px 10px;border:1px dashed var(--line2);border-radius:6px}.fill{color:var(--cmd);border-bottom:1px dotted var(--cmd)}
+.kn{display:inline-block;margin-left:8px;padding:0 6px;border-radius:8px;border:1px solid #7a6420;background:#2b2410;color:var(--hitfg);font:11px/16px "JetBrains Mono",ui-monospace,monospace;cursor:pointer;vertical-align:1px}
+.sr{padding:8px 10px;border:1px solid var(--line);border-radius:6px;display:flex;flex-direction:column;gap:3px}.sr.flash{outline:2px solid var(--hitfg)}#vb .vmore{padding:6px 12px;color:var(--dim);font-size:12px;border-top:1px dashed var(--line);border-bottom:1px dashed var(--line);margin:4px 0}#vb .vmore a{color:var(--link,#79c0ff)}.hl.tlhit{background:var(--hit,rgba(252,238,10,.16));outline:1px solid var(--hitfg)}.tlmsg{color:var(--hitfg);font-size:12px;margin:2px 0 4px}
+.hud{display:none}
+.blk.flash,.flash{outline:2px solid var(--hitfg);outline-offset:4px;border-radius:4px}.sr .sm{color:var(--dim);font-size:12.5px;font-family:"IBM Plex Sans",system-ui,sans-serif}
+.sr .hn{color:var(--hitfg)}.sr .sv{font-size:11px;color:var(--dim);border:1px solid var(--line2);border-radius:8px;padding:0 6px;margin-left:6px;vertical-align:middle}.sl{display:flex;flex-direction:column;gap:6px;margin-top:8px}details.more>summary{cursor:pointer;color:var(--dim);font-size:12.5px}
+.plbar{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:baseline;margin:8px 0 0}.plb{background:none;border:1px solid var(--line2);color:var(--dim);font:inherit;padding:2px 14px;border-radius:4px;cursor:pointer}.plb.on{border-color:var(--acc,#22d3ee);color:var(--acc,#22d3ee)}.plb:hover{color:var(--fg)}
+#plout{margin-top:10px}.plr{display:flex;flex-direction:column;gap:5px;padding:12px 2px;border-top:1px solid var(--line2)}.plraw{font:12.5px "JetBrains Mono",ui-monospace,monospace;color:var(--dim);white-space:pre-wrap;overflow-wrap:anywhere}
+.plf{font:12.5px "IBM Plex Sans",system-ui,sans-serif;color:var(--dim);display:flex;flex-wrap:wrap;gap:2px 16px}.plf b{font-weight:400;color:var(--fg);opacity:.9}.pls{font:14.5px/1.5 "IBM Plex Sans",system-ui,sans-serif;color:var(--fg)}.pls b{font-weight:600;color:#7ee0f2}
+.plc{font:13px "IBM Plex Sans",system-ui,sans-serif;color:var(--fg);opacity:.92}.plc code{border:none;font:12.5px "JetBrains Mono",ui-monospace,monospace;color:#e6c84a;background:none;padding:0;margin-right:8px}.pln{font:13.5px "IBM Plex Sans",system-ui,sans-serif;color:var(--dim)}
+.plr details>summary{cursor:pointer;font:12.5px "IBM Plex Sans",system-ui,sans-serif;color:#79b8ff;list-style:none}.plr details>summary::before{content:"▸ "}.plr details[open]>summary::before{content:"▾ "}.plbg{font:13px/1.5 "IBM Plex Sans",system-ui,sans-serif;color:var(--fg);opacity:.9;border-left:2px solid var(--line2);padding-left:10px;margin-top:4px}.plbg i{font-style:normal;color:var(--dim)}
+.plr pre{margin:6px 0 0;font:12px "JetBrains Mono",ui-monospace,monospace;color:var(--dim);white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}.pld{font:12.5px "IBM Plex Sans",system-ui,sans-serif;color:var(--dim)}
+.lgrp{display:grid;grid-template-columns:170px minmax(0,1fr);gap:10px;align-items:start;margin:0 0 10px}.lgn{color:var(--dim);font:13px "IBM Plex Sans",system-ui,sans-serif;padding-top:11px}
+@media(max-width:760px){.lgrp{grid-template-columns:1fr;gap:4px}.lgn{padding-top:4px}}
+.lcmds{display:flex;flex-direction:column;gap:8px}.lcmd{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:2px 10px;align-items:start;border-left:2px solid var(--line2);padding-left:10px}
+.lcmd code{font:12.5px "JetBrains Mono",ui-monospace,monospace;color:#6fdc9a;background:none;border:none;padding:0;white-space:pre-wrap;overflow-wrap:anywhere}.lcmd span{grid-column:1/-1;font:13px "IBM Plex Sans",system-ui,sans-serif;color:var(--dim)}.rlt{height:10px;background:var(--panel);position:relative}.rlt div{position:absolute;top:0;bottom:0;background:var(--acc,#22d3ee);opacity:.75}
+@media (max-width:900px){.idx,.sfiles,.view,.tl,.td{display:none}.doc{padding:14px}}
+@media (max-width:1300px){.sfiles{width:230px}.view{width:min(520px,36vw)}.vh .tin{display:none}.td{width:min(420px,32vw)}.tl{width:230px}}
+
+.split{background:linear-gradient(var(--line2),var(--line2)) center/1px 100% no-repeat}
+.split>i{position:sticky;top:45vh;display:block;width:3px;height:30px;margin:0 auto;border-left:1px dotted var(--dim2);border-right:1px dotted var(--dim2);opacity:.6}
+.split:hover>i,.split.on>i{opacity:1;border-color:var(--fg2)}
+.pcol,.split.pcol{display:none!important}
+.rail{display:none;flex:0 0 18px;align-items:flex-start;justify-content:center;padding-top:14px;background:var(--bar);border:0;border-right:1px solid var(--line);color:var(--dim);cursor:pointer;font:15px/1 inherit}
+.rail.on{display:flex}
+.rail:hover{color:var(--fg);background:var(--sel)}
+#pane-report>.rail{position:sticky;top:50px;align-self:flex-start;height:calc(100vh - 50px)}
+.pcl{position:sticky;top:0;float:right;margin:-4px 8px 0 0;z-index:2;background:none;border:1px solid transparent;border-radius:4px;color:var(--dim2);cursor:pointer;font:14px/1 inherit;padding:2px 6px}
+.pcl:hover{color:var(--fg);border-color:var(--line2);background:var(--sel)}
+
+.td,.notes{border-left-width:2px}
+.td.edgehot,.notes.edgehot{cursor:col-resize;border-left-color:var(--link)}
+body.dragging,body.dragging *{cursor:col-resize!important;user-select:none!important}
+.tfull .lbl{padding:8px 0 3px;border-top:1px solid var(--line);margin-top:6px}
+.tsay{margin:2px 0 4px;padding-left:18px;color:var(--fg2);line-height:1.55}
+.tsay li{margin:2px 0}
+.tsay .ex,.tstb .ex{color:#ff8b84;font-weight:600}
+.tstep{border:1px solid var(--line);border-radius:6px;margin:4px 0;background:var(--panel)}
+.tstep>summary{display:grid;grid-template-columns:28px 64px 62px 1fr auto;gap:8px;padding:5px 8px;cursor:pointer;list-style:none}
+.tstep>summary::-webkit-details-marker{display:none}
+.tstep>summary.er{background:rgba(255,80,80,.10)}
+.tstb{padding:4px 10px 10px}
+.tstb details>summary,.tfull details>summary{cursor:pointer;margin-top:6px}
+.tstb pre.out{max-height:420px;overflow:auto}
+.tsep{border:0;border-top:1px dashed var(--line2);margin:6px 0}
+.tlogf{margin-top:6px;color:var(--dim)}
+.tlog{max-height:360px;overflow:auto}
+
+.sbox .sfb{margin-left:auto}
+.sbox.folded{padding-top:8px;padding-bottom:6px;gap:4px}
+.sbox.folded .quick,.sbox.folded .sopts{display:none}
+body[data-tab=search].sfold .facts,body[data-tab=search].sfold .tiles{display:none}
+
+.tiles,.vtw,.ncsum,.idx .m2{display:none}
+.idx .ncd{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--dim2);margin-right:7px;vertical-align:middle}
+html[data-layout=clean] .facts{display:none}
+html[data-layout=clean] .tiles{display:flex;flex-wrap:wrap;gap:10px;padding:12px 22px;border-bottom:1px solid var(--line)}
+.tile{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:5px 14px 6px;min-width:96px;max-width:360px}
+.tile .k{font:10.5px/1.5 "IBM Plex Sans",system-ui,sans-serif;letter-spacing:.07em;text-transform:uppercase;color:var(--dim2)}
+.tile .v{font:600 14px/1.45 "IBM Plex Sans",system-ui,sans-serif;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tile .v.mono{font:500 12.5px/1.6 "JetBrains Mono",ui-monospace,monospace}
+.tile .v small{font-weight:400;color:var(--dim);font-size:12px}
+html[data-layout=clean] .idx .m1{display:none}
+html[data-layout=clean] .idx .m2{display:inline}
+html[data-layout=clean] .sec{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);column-gap:18px;row-gap:18px}
+html[data-layout=clean] .sec>*{grid-column:1/-1;min-width:0}
+html[data-layout=clean] .sec>.sh{position:sticky;top:50px;z-index:3;background:var(--bg);flex-wrap:wrap;row-gap:2px;padding-top:12px}
+html[data-layout=clean] .sec>.sh>.t{font:650 19px/1.3 "IBM Plex Sans",system-ui,sans-serif;color:var(--fg)}
+html[data-layout=clean] .sec>.sh>.s{flex-basis:100%;order:9;font-size:11.5px}
+html[data-layout=clean] .bh .t{font:600 14px/1.4 "IBM Plex Sans",system-ui,sans-serif;color:var(--fg)}
+html[data-layout=clean] .blk.half table.vt td.nw{white-space:normal}
+html[data-layout=clean] .blk{position:relative}
+html[data-layout=clean] .blk .act{opacity:0;transition:opacity .12s;position:absolute;right:0;top:0;background:var(--bg);padding:0 0 0 12px;z-index:1}
+html[data-layout=clean] .blk.half .act{right:14px;top:10px;background:var(--panel)}
+html[data-layout=clean] .blk:hover .act,html[data-layout=clean] .blk.cur .act,html[data-layout=clean] .blk:focus-within .act{opacity:1}
+html[data-layout=clean] .cmd{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;opacity:.8}
+html[data-layout=clean] .blk:hover .cmd{white-space:normal;overflow-wrap:anywhere;opacity:1}
+html[data-layout=clean] pre.out.tabd,html[data-layout=clean] .blk.nc{display:none!important}
+html[data-layout=clean] .vtw{display:block;margin:2px 0 0;padding:3px 6px;background:var(--panel);border:1px solid var(--line);border-radius:6px;overflow-x:auto}
+table.vt{border-collapse:collapse;width:100%;font-size:12.5px}
+table.vt th{text-align:left;font:500 10.5px/1.6 "IBM Plex Sans",system-ui,sans-serif;letter-spacing:.06em;text-transform:uppercase;color:var(--dim2);padding:5px 10px;border-bottom:1px solid var(--line2);white-space:nowrap}
+table.vt td{padding:4px 10px;border-bottom:1px solid var(--line);vertical-align:top;color:var(--fg2);overflow-wrap:break-word}
+table.vt td.nw{white-space:nowrap}
+table.vt td.cz-num{width:1%;padding-right:14px}
+table.vt td a.ln{color:inherit;text-decoration:none}
+table.vt td a.ln:hover{color:var(--link);text-decoration:underline}
+html[data-layout=clean] .blk.half .bh{flex-wrap:wrap}
+table.vt tbody tr:last-child td{border-bottom:0}
+table.vt .r{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+table.vt td.bc{width:28%;min-width:80px}
+table.vt .vbar{display:inline-block;height:8px;border-radius:2px;background:var(--link);opacity:.5;vertical-align:middle}
+table.vt .pb{display:inline-block;width:64px;height:6px;background:var(--line2);border-radius:2px;margin-left:8px;vertical-align:middle}
+table.vt .pb i{display:block;height:100%;background:var(--link);opacity:.65;border-radius:2px}
+table.vt tr.fr{display:none}
+table.vt tr.fr.open{display:table-row}
+table.vt tr.fr td{background:var(--sel)}
+table.vt button.fold{background:none;border:1px solid var(--line2);border-radius:999px;color:var(--link);font:inherit;font-size:11.5px;padding:0 8px;margin-left:8px;cursor:pointer}
+html[data-layout=clean] .ncsum{display:block;color:var(--dim2);font-size:12.5px;border-top:1px dashed var(--line2);padding-top:9px;line-height:2}
+.ncsum code{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:1px 7px;margin:0 3px;color:var(--dim);cursor:help}
+html[data-layout=clean] .sec>.blk.half{grid-column:auto;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px 14px}
+html[data-layout=clean] .blk.half pre.out,html[data-layout=clean] .blk.half .vtw{background:transparent;border:0;padding:0 2px}
+@media (max-width:1100px){html[data-layout=clean] .sec>.blk.half{grid-column:1/-1}}
+@media print{.run,.top,.keys,.idx,.itools,.bh .act,.pane:not([data-pane=report]),.facts a{display:none!important}body,.doc,.blk,pre.out{background:#fff!important;color:#000!important}
+ .pane[data-pane=report]{display:block!important}.doc{padding:0;max-width:none}pre.out{border:1px solid #999;white-space:pre-wrap;overflow-wrap:anywhere}.cmd{color:#064}
+ details>summary{display:none}details>*{display:block}[class^='cz-']{color:inherit!important}.sec{break-inside:auto}.blk{break-inside:avoid}.nc,.note{color:#555!important}}
+@media (max-width:1280px){.top{gap:14px;padding:0 14px}.top .qs{flex:1 1 70px;min-width:70px;width:auto}.top .me{max-width:170px;overflow:hidden;text-overflow:ellipsis}.top>a{white-space:nowrap}}
+@media (max-width:1010px){.top .me{display:none}}
+@media (max-width:700px){.top{gap:12px;padding:0 12px}.top .qs,.top>a{display:none}.top .me{display:none}.tabs{overflow-x:auto;min-width:0}.keys{display:none}}
+.sh .spb{font-size:12px;color:var(--dim);margin:0 10px;white-space:nowrap;flex:0 0 auto}.sh .spb a+a{margin-left:0}.sh>.s{min-width:0;overflow-wrap:anywhere}.sh .spb a{color:var(--link)}.sh .spb i{font-style:normal;color:var(--hitfg);margin-left:4px;font-size:11px}
+.pbnote{font-size:12.5px;color:var(--dim);margin:-4px 0 12px}.pbnote a{color:var(--link)}
+.runb{background:none;border:1px solid var(--line2);border-radius:6px;color:var(--cmd);padding:2px 10px;cursor:pointer;white-space:nowrap}.runb:hover,.runb[aria-expanded=true]{border-color:var(--cmd)}
+.run{display:none;position:fixed;left:0;right:0;top:50px;z-index:45;background:#0f141b;border-bottom:1px solid var(--line2);box-shadow:0 14px 30px rgba(0,0,0,.5);padding:10px 22px 12px;flex-direction:column;gap:8px;max-height:calc(100vh - 80px)}.run.on{display:flex}
+.rnh{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.rnh b{color:var(--cmd)}#rncopy{margin-left:auto}.rnh .tdx{margin-left:0}#rncwd{overflow-wrap:anywhere}
+.rnout{flex:1 1 auto;min-height:90px;max-height:58vh;overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--bg);padding:8px 12px;white-space:pre;font-size:12.5px;line-height:1.5}.rnout:empty::before{content:'output appears here';color:var(--dim2)}
+.rnout .rc{color:var(--cmd);display:block}.rnout .rc i{font-style:normal;color:var(--dim)}.rnout .rs{color:var(--dim);display:block;margin-bottom:8px}.rnout .rs.e{color:var(--hitfg)}
+.rnf{display:flex;align-items:center;gap:10px}.rnp{color:var(--cmd);font-weight:700}#rnq{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line2);border-radius:6px;color:var(--fg);font:inherit;padding:7px 10px}#rnq:focus{outline:none;border-color:var(--cmd)}
+.rnn{font-size:11.5px;line-height:1.5}
+@media (max-width:700px){.run{padding:8px 12px}.runb{padding:2px 6px}.sh{flex-wrap:wrap}.sh .spb{white-space:normal;flex:1 1 100%;margin:4px 0 0;overflow-wrap:anywhere}.sform label{flex:1 1 100%;min-width:0}.sform select{flex:1 1 auto;min-width:0;max-width:100%}.split{display:none}.sopts{flex-wrap:wrap}.sopts label{min-width:0;max-width:100%;flex-wrap:wrap}.sopts .xin{min-width:0;max-width:100%;flex:1 1 120px}.smode{flex-wrap:wrap}.bh{flex-wrap:wrap;min-width:0}.bh .t{overflow-wrap:anywhere;min-width:0}.bh .act{flex-wrap:wrap}}
+.notes{display:none;position:fixed;right:0;top:50px;bottom:28px;width:min(560px,46vw);z-index:40;background:#0f141b;border-left:1px solid var(--line2);box-shadow:-12px 0 30px rgba(0,0,0,.45);padding:12px 16px;overflow:auto;font-size:12.5px}
+.notes.on{display:block}.notes .nh{display:flex;gap:8px;align-items:baseline;padding-bottom:8px;border-bottom:1px solid var(--line)}.notes .nh .tdx{margin-left:0}
+.notes .nn{border-bottom:1px solid var(--line);padding:8px 0}.notes .nt{display:flex;gap:8px;align-items:baseline}.notes .ntag{font:11px 'JetBrains Mono',monospace;color:var(--dim2);border:1px solid var(--line2);border-radius:8px;padding:0 6px}
+.notes .ngo{color:var(--link);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}.notes .nrm{background:none;border:0;color:var(--dim2);cursor:pointer}.notes .nrm:hover{color:var(--fg)}
+.notes pre.out{margin:6px 0;max-height:150px;overflow:auto;font-size:11.5px}.notes .ncm{width:100%;box-sizing:border-box;background:var(--bg);color:var(--fg2);border:1px solid var(--line2);border-radius:6px;font:inherit;padding:4px 6px;resize:vertical}
+button.pin{background:none;border:0;color:var(--dim);cursor:pointer;font:inherit;font-size:12px;padding:0 4px}button.pin:hover{color:var(--link)}button.pin.mini{font-size:11px;margin-left:6px;border:1px solid var(--line2);border-radius:8px;padding:0 6px}.hd{display:inline-flex;align-items:flex-end;gap:1px;height:13px;width:83px;margin-right:7px;vertical-align:-1px;border-bottom:1px solid var(--line2)}.hd i{flex:1 1 0;min-height:0;background:var(--cmd);opacity:.8;border-radius:1px 1px 0 0}.tsub{color:var(--dim)}.tr.kid{background:rgba(121,184,255,.04)}.tr.par{border-bottom-color:var(--line2)}.karr{font-style:normal;color:var(--dim2);margin-right:5px}.sbad{font-weight:500;color:var(--hitfg)}.sfl{display:flex;flex-direction:column;gap:4px;padding:2px 0 6px}.sf{display:grid;grid-template-columns:auto 1fr;gap:2px 8px;align-items:baseline;font:12px/1.5 'JetBrains Mono',monospace}.sf .hn{margin:0}.sf .sft{overflow-wrap:anywhere}.sf .sfi{grid-column:2;font-size:11px}
+#notesl.flash{color:var(--hitfg)!important}
+.kbov{display:none;position:fixed;left:50%;top:80px;bottom:auto;height:auto;max-height:80vh;overflow:auto;transform:translateX(-50%);width:min(860px,92vw);z-index:50;background:#0f141b;border:1px solid var(--line2);border-radius:10px;box-shadow:0 20px 50px rgba(0,0,0,.5);padding:14px 18px;font-size:13px}
+.kbov.on{display:block}.kbov .kh{display:flex;align-items:center;margin-bottom:8px}.kbov .kg{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px 24px}
+.kbov .kr{display:grid;grid-template-columns:110px 1fr;gap:8px;padding:3px 0;color:var(--fg2);align-items:start}.kbov kbd{font:12px 'JetBrains Mono',monospace;color:var(--fg);background:var(--panel);border:1px solid var(--line2);border-radius:5px;padding:0 6px;justify-self:start;align-self:start;line-height:1.6;height:auto}
+.lstrip{display:none;width:30px;flex:none;position:sticky;top:48px;flex-direction:column;align-items:center;gap:6px;border-right:1px solid var(--line);padding-top:8px;min-height:60vh}
+.lstrip button{writing-mode:vertical-rl;background:none;border:0;color:#e6c84a;font:10px 'JetBrains Mono',monospace;letter-spacing:.1em;padding:8px 0;cursor:pointer}.lstrip button:hover{color:var(--fg)}@media(max-width:820px){.lstrip{display:none!important}.lc{padding-left:16px;padding-right:16px}}
+.how{margin-top:4px}.how summary{cursor:pointer;color:var(--dim);font:12px "IBM Plex Sans",system-ui,sans-serif}.how summary:hover{color:var(--fg)}
+
+.iss .ijbox{border:1px solid var(--line2);border-radius:8px;background:var(--panel)}
+.ijhead{display:flex;gap:14px;align-items:baseline;padding:8px 14px;border-bottom:1px solid var(--line);font:12.5px 'JetBrains Mono',monospace;color:var(--dim2)}
+.ijhead .r{margin-left:auto}
+.ijr{border-bottom:1px solid var(--line)}.ijr:last-child{border-bottom:0}
+.ijr>summary{list-style:none;display:flex;gap:14px;align-items:baseline;padding:7px 14px;cursor:pointer;font:13px 'JetBrains Mono',monospace}
+.ijr>summary::-webkit-details-marker{display:none}
+.ijr>summary:before{content:'▸';color:var(--dim2);font-size:11px;width:10px;flex:none}.ijr[open]>summary:before{content:'▾'}
+.ijr>summary:hover{background:var(--sel)}
+.ijs{width:110px;flex:none;font-weight:700;letter-spacing:.04em}
+.ijt{width:300px;flex:none;font-weight:700;color:var(--fg)}
+.ijv{flex:1;min-width:0;color:var(--fg2);overflow-wrap:anywhere}
+.ijclear>summary .ijv{color:var(--dim2)}
+.ijl,.ijl:visited{color:var(--link);white-space:nowrap;font-size:12.5px;text-decoration:none}.ijl:hover{text-decoration:underline}
+.ijna{color:var(--dim2);font-size:12px;white-space:nowrap}
+.ijd{padding:2px 14px 14px 38px}.ijd pre.out{margin:0}
+.ijclear .ijd{padding-left:24px}.ijclear .ijd .ijr{border-bottom:0}
+.ijlim{color:var(--dim2);font:12px 'JetBrains Mono',monospace;padding-top:6px}
+.isf{color:#ff9a90}.isc{color:#f1c96b}.isk{color:#8fd4a6}
+@media(max-width:900px){.ijt{width:auto}.ijs{width:auto}.ijr>summary{flex-wrap:wrap;row-gap:2px}.ijr>summary .ijv{flex:1 1 100%;padding-left:24px}.ijhead{flex-wrap:wrap;row-gap:2px}.ijhead .r{margin-left:0}.ijd{padding-left:14px}}
+
+#pane-report[data-rv=orig] [data-rvv=own],#pane-report[data-rv=own] [data-rvv=orig]{display:none!important}
+.rvsw{position:sticky;top:50px;z-index:4;background:var(--bg);padding:6px 0;margin-bottom:-12px;border-bottom:1px solid var(--line2);display:flex;flex-direction:row;flex-wrap:wrap;align-items:center;gap:6px 14px}
+.rvbs{display:flex;border:1px solid #e6c84a;width:max-content;max-width:100%;flex:none}
+.rvb{font-family:inherit;font-weight:700;font-size:11px;line-height:1;letter-spacing:.1em;padding:5px 12px;background:transparent;color:#e6c84a;border:0;cursor:pointer}
+.rvb[aria-pressed=true]{background:#e6c84a;color:#0d1117}
+.rvb:focus-visible{outline:2px solid var(--link);outline-offset:2px}
+.rvcap{color:var(--dim);font-size:11.5px;display:flex;gap:16px;flex-wrap:wrap;flex:1;min-width:0}.rvcap b{color:var(--fg2);font-weight:500}.rvcap .r{margin-left:auto}
+.rvno{border:1px solid #e6c84a;border-radius:6px;padding:16px 18px;display:flex;flex-direction:column;gap:10px;color:var(--fg2);max-width:1100px}
+.rvt{color:#e6c84a;font-size:15px;font-weight:700}
+.rvb2{font-family:inherit;font-weight:700;font-size:13px;line-height:1;letter-spacing:.1em;padding:9px 20px;background:transparent;color:#e6c84a;border:2px solid #e6c84a;cursor:pointer}
+.osec .sh .t,.osec .sh{text-transform:none!important;letter-spacing:normal!important}
+.ocmd{white-space:normal;overflow-wrap:anywhere;opacity:1}
+.obase{opacity:.5}
+.ofile{text-decoration:underline dotted;text-underline-offset:3px}.ofile.ono{text-decoration:none}
+a.ofile{color:inherit}
+.osame{color:var(--link);font-size:12px;margin:0 auto 0 18px;white-space:nowrap}
+.oafter,.oline{color:var(--fg2);font-size:12.5px;padding:2px 0;white-space:pre-wrap;overflow-wrap:anywhere}
+.ohead{color:var(--fg2);white-space:pre-wrap}
+.onote{color:#e6c84a;font-size:12px;border-left:2px solid #e6c84a;padding:2px 10px;margin-top:4px}
+
+.tltw{overflow-x:auto;max-width:100%}
+.tlt{border-collapse:separate;border-spacing:3px;width:100%;margin-top:8px;font-size:12.5px}
+@media(max-width:700px){.tlt td{min-width:40px}.tlt td.tll{max-width:140px}.tlg{grid-template-columns:120px 1fr}}
+.tlt th{font-weight:400;color:var(--dim);font-size:11.5px;text-align:center;padding:2px;white-space:nowrap;vertical-align:bottom}
+.tlt th .tday{background:none;border:0;color:inherit;font:inherit;cursor:pointer;padding:2px 4px;border-radius:3px}
+.tlt th .tday:hover{color:var(--fg);text-decoration:underline}
+.tlt th .tday.on{color:var(--hitfg);font-weight:700}
+.tlcol{display:block;color:var(--hitfg);font-size:10px;font-weight:400}
+.tlt td{text-align:center;border-radius:4px;padding:4px;min-width:56px}
+.tlt td.tll{text-align:left;color:var(--fg2);white-space:nowrap;padding-left:0;min-width:0;max-width:280px;overflow:hidden;text-overflow:ellipsis}
+.tlt td.z{color:var(--line2)}
+.tlt td.mx{font-weight:700}
+.tlt td.tdc{cursor:pointer}
+.tlt td.sel{box-shadow:inset 0 0 0 1px var(--hitfg)}
+.tlt .tltot{text-align:right;color:var(--fg2);font-weight:700;padding-left:12px}
+.tlt tr.tlgh td{color:var(--dim2);font-size:10.5px;letter-spacing:.12em;text-align:left;padding:8px 0 0}
+.tl-p{--tc:#ff5c7a}.tl-a{--tc:#22d3ee}
+.tlsq{display:inline-block;width:9px;height:9px;border-radius:2px;background:var(--tc);margin-right:8px}
+.tlq{margin:4px 0 0}
+.tlday{border-top:1px solid var(--line2);margin-top:10px;padding-top:8px}
+.tldh{display:flex;gap:12px;flex-wrap:wrap;align-items:baseline}.tldh b{color:var(--hitfg);font-size:12.5px;font-weight:700}
+.tlg{display:grid;grid-template-columns:230px 1fr;gap:4px 10px;margin-top:6px;align-items:end}
+.tlx{display:grid;grid-template-columns:repeat(8,1fr);font-size:10.5px;color:var(--dim2)}
+.tll{font-size:11.5px;color:var(--fg2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tlc.hb{display:grid;grid-template-columns:repeat(24,1fr);height:30px;margin-top:12px;gap:2px;align-items:end;border-bottom:1px solid var(--line)}
+.tlc.hb i{display:block;position:relative;height:var(--h,0);background:var(--tc);border-radius:1px 1px 0 0}
+.tlc.hb i.v0{height:100%;background:transparent}
+.tlc.hb i.aft{background:repeating-linear-gradient(45deg,transparent 0 3px,var(--line2) 3px 4px)}
+.tlc.hb i.col{box-shadow:2px 0 0 var(--hitfg)}
+.tlc.hb i b{position:absolute;bottom:100%;left:50%;transform:translateX(-50%);font-size:10px;font-weight:400;color:var(--fg);white-space:nowrap}
+.tlc.qable i.v5{cursor:pointer}
+.tlc.hb i.v5:hover{filter:brightness(1.3);outline:1px solid var(--fg)}
+"""
+
+
+_MSG_LINE = re.compile(r"^(\s*[\d,]+  )(\S.*)$")
+
+
+_COUNT_LINE = re.compile(r"^(\s*[\d,]+\s{2})(.+)$")
+
+
+_HOUR_LINE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d):\d\d\b")
+
+
+def _lines_html(lines, match=None, sigs=None, links=None, msgs=False, refs=None, pk=None, hours=False):
+    """Output lines as HTML: a ? after a known error string; in serve mode a line that came from a file opens the
+    viewer at the place it was found (counted lines: the newest one, with all the others listed by a search), and
+    'file:123' references open the viewer."""
+    lrx = None
+    if links:
+        lrx = re.compile(r"(?<![\w/.-])(%s):(\d+)\b" % "|".join(re.escape(esc(n)) for n in sorted(links, key=len, reverse=True)))
+    out = []
+    for i, l in enumerate(lines):
+        k = match(l) if match else None
+        r = refs[i] if refs and i < len(refs) else None
+        mm = _MSG_LINE.match(l) if msgs else None
+        if r and r[0].startswith("task"):
+            kind, _, val = r[0].partition(":")
+            cm = _COUNT_LINE.match(l)
+            head, body = (cm.group(1), cm.group(2)) if cm else ("", l)
+            tip = {"task": "open this task in the Tasks tab", "tasklabel": "show the tasks with this label in the Tasks tab",
+                   "taskday": "show the tasks started this day in the Tasks tab", "taskerr": "find the tasks with this error text in the Tasks tab"}.get(kind, "")
+            h = esc(head) + "<a href='#' class='tk ln' data-k='%s' data-v='%s' title='%s'>%s</a>" % (esc(kind), esc(val), tip, esc(body))
+        elif r and not (lrx and lrx.search(esc(l))):
+            cm = _COUNT_LINE.match(l) if r[1] else None
+            head, body = (cm.group(1), cm.group(2)) if cm else ("", l)
+            tip = ("open the newest of these lines in %s; the search lists the others" if r[1] else "open this line in %s") % r[0]
+            if len(r) > 2 and r[2]:
+                tip = r[2] + "\n\n" + tip
+            h = esc(head) + "<a href='#' class='vw ln' data-view='%s'%s title='%s'>%s</a>" % (
+                esc(r[0]), (" data-q='%s'" % esc(r[1])) if r[1] else "", esc(tip), esc(body))
+        elif mm:
+            h = esc(mm.group(1)) + "<span class='ml' data-q='%s' title='search the logs for this message'>%s</span>" % (esc(mm.group(2)), esc(mm.group(2)))
+        else:
+            h = esc(l)
+        if lrx and not (r and "class='vw ln'" in h) and not (r and r[0].startswith("task")):
+            h = lrx.sub(lambda m: "<a href='#' class='vw' data-view='%s:%s'>%s:%s</a>" % (esc(links[html.unescape(m.group(1))]), m.group(2), m.group(1), m.group(2)), h)
+        p = pk[i] if pk and i < len(pk) else None
+        if p:             # a line that starts with an installed package: its name opens what the report records about it,
+            en = esc(p[0])  # and a tag says what sets it apart; neither changes the line's text
+            h = h.replace(en, "<span class='pk' data-p='%s' title='what the report records about this package'>%s</span>" % (en, en), 1)
+            h += "".join("<span class='ptag %s' data-t='%s'></span>" % (c, esc(tx)) for tx, c in p[1])
+        if k is not None:
+            h += "<button type='button' class='kn' data-sig='%d' title='known error string · one known cause: %s'>?</button>" % (k, esc(sigs[k]["c"][:140]))
+        hm = _HOUR_LINE.match(l) if hours else None
+        if hm:            # the hour a line belongs to, so that the timeline can point at the lines of one hour
+            h = "<span class='hl' data-h='%s'>%s</span>" % (hm.group(1), h)
+        out.append((h, bool(p)))
+    s = []
+    for i, (h, ispk) in enumerate(out):
+        nl = "\n" if i < len(out) - 1 else ""
+        s.append(("<span class='pkl'>%s%s</span>" % (h, nl)) if ispk else h + nl)
+    return "".join(s)
+
+
+def _first_line_no(t, rel, b):
+    """Where in the file the block's output starts, so 'view file' opens there: the block's own line references,
+    the end of the file for 'tail -N', else the first output line found in the file; 1 when none of these work."""
+    for r in (b.get("refs") or []):
+        if isinstance(r, (list, tuple)) and r and str(r[0]).startswith(rel + ":"):
+            try:
+                return max(1, int(str(r[0]).rsplit(":", 1)[1]))
+            except ValueError:
+                pass
+    if t is None or b.get("state") != "ok" or not b.get("lines"):
+        return 1
+    path = os.path.join(t.root, rel)
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) > 64 * 1024 * 1024:
+            return 1
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except (OSError, IOError):
+        return 1
+    m = re.match(r"tail -(\d+) (\S+)", b.get("cmd") or "")
+    if m and m.group(2) == rel:
+        n = data.count(b"\n") + (0 if data.endswith(b"\n") or not data else 1)
+        return max(1, n - int(m.group(1)) + 1)
+    for l in b["lines"][:5]:
+        s = l.strip().encode("utf-8", "replace")
+        if len(s) >= 8:
+            i = data.find(s)
+            if i >= 0:
+                return data.count(b"\n", 0, i) + 1
+    return 1
+
+
+def _out_html(b, limit=25, match=None, sigs=None, serve=False):
+    if b["state"] == "nc" or b["state"] == "empty" or (b["state"] == "ok" and not b["lines"]):
+        return "<div class='nc'>%s</div>" % esc(b["note"])
+    if b["state"] == "error":
+        k = match(b["lines"][0]) if match else None
+        chip = "" if k is None else "<button type='button' class='kn' data-sig='%d' title='known error string'>?</button>" % k
+        return "<div class='nc'>%s:</div><div class='err'>%s%s</div>" % (esc(b["note"]), "<br>".join(esc(x) for x in b["lines"]), chip)
+    first, rest = b["lines"][:limit], b["lines"][limit:]
+    links = dict((x.split("/")[-1], x) for x in b["src"] if "/" in x and not x.endswith("/")) if serve else None
+    msgs = serve and bool(re.search(r"by text|most common error text|by process and text", b["title"]))
+    refs = (b.get("refs") or []) if serve else []
+    pk = b.get("pk") or []
+    hrs = bool(b.get("hours"))
+    h = "<pre class='out'>%s</pre>" % _lines_html(first, match, sigs, links, msgs, refs[:limit], pk[:limit], hrs)
+    if rest:
+        h += "<details><summary>+ %s more lines</summary><pre class='out'>%s</pre></details>" % (fmt_n(len(rest)), _lines_html(rest[:3000], match, sigs, links, msgs, refs[limit:limit + 3000], pk[limit:limit + 3000], hrs))
+        if len(rest) > 3000:
+            h += "<div class='nc'>… %s more not shown here; the text report has them with --full</div>" % fmt_n(len(rest) - 3000)
+    return h
+
+
+# task labels (as the Tasks tab shows them, without "Actions::") that belong to a playbook; "" = every label
+# short playbook names for links, and which playbooks cover each Report section (by section id)
+
+
+GROUP_HUES = ["#6cb6ff", "#d2a8ff", "#7ee787", "#e3b341", "#ff9bce", "#56d4dd", "#ffa198", "#a5d6ff", "#c9d1d9", "#f0b072", "#b4a7ff", "#8ddb8c"]
+
+
+# ---- themes: dark (the stylesheet as written), light and neon -------------------------------------------------------
+# The light and neon stylesheets are made from the dark one: every rule that sets a colour is repeated under
+# html[data-theme=…] with each colour passed through the theme's mapping, then a few hand-set values and touches.
+
+def _rgb(hexs):
+    hexs = hexs.lstrip("#")
+    if len(hexs) == 3:
+        hexs = "".join(c * 2 for c in hexs)
+    return tuple(int(hexs[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def _hex(rgb):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, int(round(c * 255)))) for c in rgb)
+
+
+def _map_light(rgb):
+    import colorsys
+    h, l, s = colorsys.rgb_to_hls(*rgb)
+    if max(rgb) - min(rgb) < 0.09:                 # greys: backgrounds become light, text becomes dark
+        l2 = 1.0 - l * 0.94 if l < 0.5 else (1.0 - l) * 1.05 + 0.08
+        return colorsys.hls_to_rgb(h, max(0.0, min(1.0, l2)), s * 0.6)
+    if l < 0.32:                                   # dark tinted backgrounds (badges, highlights): pale tints
+        return colorsys.hls_to_rgb(h, 0.92, min(1.0, s * 0.9 + 0.1))
+    return colorsys.hls_to_rgb(h, min(0.38, 1.0 - l), min(1.0, s + 0.1))   # accents: deeper, to read on white
+
+
+NEON = {"red": (1.0, 0.0, 0.235), "yellow": (0.988, 0.933, 0.039), "green": (0.0, 1.0, 0.624), "cyan": (0.0, 0.941, 1.0), "pink": (1.0, 0.165, 0.427)}
+
+
+def _map_neon(rgb):
+    import colorsys
+    h, l, s = colorsys.rgb_to_hls(*rgb)
+    if max(rgb) - min(rgb) < 0.09:                 # greys: near-black panels, teal lines, cyan-white text
+        if l < 0.2:
+            return colorsys.hls_to_rgb(0.53, l * 0.55, 0.45)
+        if l < 0.5:
+            return colorsys.hls_to_rgb(0.51, l * 0.85, 0.5)
+        return colorsys.hls_to_rgb(0.52, 0.55 + l * 0.42, 0.9)
+    deg = h * 360
+    name = ("red" if deg < 18 or deg >= 345 else "yellow" if deg < 70 else "green" if deg < 160 else "cyan" if deg < 255 else "pink")
+    if l < 0.32:                                   # dark tinted backgrounds keep their darkness, in the neon hue
+        nh, nl, ns = colorsys.rgb_to_hls(*NEON[name])
+        return colorsys.hls_to_rgb(nh, 0.11, 0.9)
+    return NEON[name]
+
+
+# inferno: the look of an early-90s shooter. Brown-black stone, bone text, blood red for errors, brass for titles.
+INFERNO = {"red": "#e02a1e", "orange": "#ff7b24", "yellow": "#ffcf4a", "green": "#86c23a", "cyan": "#6fb3c9", "blue": "#8aa4e6", "pink": "#d86a9a"}
+
+
+def _map_inferno(rgb):
+    import colorsys
+    h, l, s = colorsys.rgb_to_hls(*rgb)
+    if max(rgb) - min(rgb) < 0.09:                 # greys: brown-black stone, warm lines, bone text
+        if l < 0.2:
+            return colorsys.hls_to_rgb(0.07, 0.055 + l * 0.6, 0.28)
+        if l < 0.5:
+            return colorsys.hls_to_rgb(0.075, 0.13 + l * 0.72, 0.24)
+        return colorsys.hls_to_rgb(0.10, 0.50 + l * 0.38, 0.42)
+    deg = h * 360
+    name = ("red" if deg < 14 or deg >= 345 else "orange" if deg < 38 else "yellow" if deg < 70 else "green" if deg < 160 else "cyan" if deg < 200
+            else "blue" if deg < 262 else "pink")
+    ph, pl, ps = colorsys.rgb_to_hls(*_rgb(INFERNO[name]))
+    if l < 0.32:                                   # dark tinted backgrounds stay dark, in the palette's hue
+        return colorsys.hls_to_rgb(ph, 0.16, 0.55)
+    return _rgb(INFERNO[name])
+
+
+_COLOR_RX = re.compile(r"#[0-9a-fA-F]{6}\b|#[0-9a-fA-F]{3}\b|rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*(?:,\s*([\d.]+)\s*)?\)")
+
+
+def _map_colors(text, fn):
+    def one(m):
+        if m.group(0).startswith("#"):
+            return _hex(fn(_rgb(m.group(0))))
+        r, g, b = (int(m.group(i)) / 255.0 for i in (1, 2, 3))
+        a = m.group(4)
+        if r == g == b and r < 0.1:                 # black shadows stay shadows
+            return m.group(0)
+        rr, gg, bb = fn((r, g, b))
+        return ("rgba(%d,%d,%d,%s)" % (rr * 255, gg * 255, bb * 255, a)) if a is not None else _hex((rr, gg, bb))
+    return _COLOR_RX.sub(one, text)
+
+
+def _css_rules(css):
+    """Top-level rules as (at, selector, body); at is the @media prelude for rules inside one, else ''."""
+    out, i, n, at = [], 0, len(css), ""
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    n = len(css)
+    while i < n:
+        j = css.find("{", i)
+        if j < 0:
+            break
+        sel = css[i:j].strip()
+        if sel.startswith("@"):
+            depth, k = 1, j + 1
+            while k < n and depth:
+                depth += {"{": 1, "}": -1}.get(css[k], 0)
+                k += 1
+            if sel.startswith("@media") and "print" not in sel:
+                for _, s2, b2 in _css_rules(css[j + 1:k - 1]):
+                    out.append((sel, s2, b2))
+            i = k
+            continue
+        k = css.find("}", j)
+        out.append(("", sel, css[j + 1:k]))
+        i = k + 1
+    return out
+
+
+def _themed(css, theme, fn):
+    pre = "html[data-theme=%s]" % theme
+    out = []
+    for at, sel, body in _css_rules(css):
+        decls = [d for d in body.split(";") if _COLOR_RX.search(d)]
+        if not decls:
+            continue
+        sels = []
+        for s in sel.split(","):
+            s = s.strip()
+            if s == ":root" or s == "html":
+                sels.append(pre)
+            elif s.startswith(":root"):
+                sels.append(pre + s[5:])
+            else:
+                sels.append(pre + " " + s)
+        rule = "%s{%s}" % (",".join(sels), ";".join(_map_colors(d, fn) for d in decls))
+        out.append(("%s{%s}" % (at, rule)) if at else rule)
+    return "\n".join(out)
+
+
+THEME_VARS = {
+    "light": "--bg:#ffffff;--panel:#f6f8fa;--bar:#f6f8fa;--line:#d8dee4;--line2:#c4ccd5;--fg:#1f2328;--fg2:#30363d;--dim:#57606a;--dim2:#6e7781;"
+             "--cmd:#1a7f37;--link:#0969da;--sel:#ddf4ff;--hit:#fff1a8;--hitfg:#7a4b00",
+    "neon": "--bg:#05060a;--panel:#0b0d13;--bar:#08090e;--line:#13333a;--line2:#1f4c55;--fg:#eafcff;--fg2:#c4eef6;--dim:#7fb4bf;--dim2:#5d8f99;"
+            "--cmd:#fcee0a;--link:#00f0ff;--sel:#10262d;--hit:#3a3600;--hitfg:#fcee0a",
+    "inferno": "--bg:#17110d;--panel:#211811;--bar:#3b3029;--line:#4a3b2f;--line2:#6f5a49;--fg:#eadfc9;--fg2:#d3c5aa;--dim:#a8937a;--dim2:#86735e;"
+               "--cmd:#f0a81c;--link:#ff8a3a;--sel:#3a241a;--hit:#5a1410;--hitfg:#ffcf4a",
+}
+
+# inferno: square corners, panels sunk into stone with a bevel, raised metal buttons, section titles in blood red,
+# and at the bottom a status bar with the report's own numbers in big digits (status_bar). Fonts and texts stay as they are.
+INFERNO_EXTRA = """
+html[data-theme=inferno] *{border-radius:0!important}
+html[data-theme=inferno] body{background:#17110d radial-gradient(rgba(255,214,170,.045) 1px,transparent 1.6px) 0 0/4px 4px;padding-bottom:64px}
+html[data-theme=inferno] .top{background:linear-gradient(#54453a,#2e241d);border-bottom:3px solid #0e0906;box-shadow:inset 0 2px 0 #8a735e}
+html[data-theme=inferno] .top .me b{color:#e02a1e}
+html[data-theme=inferno] .tabs button{text-transform:uppercase;letter-spacing:.12em;font-weight:800;font-size:12.5px;color:#cdbb9e;border-bottom-width:0;text-shadow:1px 1px 0 #000}
+html[data-theme=inferno] .tabs button[aria-selected=true]{background:linear-gradient(#a81c14,#6e0f0a);color:#ffe9b0;box-shadow:inset 0 2px 0 #e0564a,inset 0 -3px 0 #3a0806}
+html[data-theme=inferno] .sec .sh{border-bottom:3px solid #4a3b2f;box-shadow:0 2px 0 #0e0906}
+html[data-theme=inferno] .sec .sh .t{color:#e02a1e;text-transform:uppercase;letter-spacing:.14em;font-weight:800;text-shadow:2px 2px 0 #000}
+html[data-theme=inferno] .bh .t{color:#f0a81c}
+html[data-theme=inferno] pre.out,html[data-theme=inferno] .inrep,html[data-theme=inferno] .tlr,html[data-theme=inferno] .iss .ijbox{background:#211811;border:2px solid;border-color:#0e0906 #7a6552 #7a6552 #0e0906;box-shadow:inset 2px 2px 0 rgba(0,0,0,.35)}
+html[data-theme=inferno] .btn2,html[data-theme=inferno] .chip,html[data-theme=inferno] .runb,html[data-theme=inferno] .rvbs{background:linear-gradient(#54453a,#3b3029);border:2px solid;border-color:#8a735e #0e0906 #0e0906 #8a735e;color:#eadfc9}
+html[data-theme=inferno] .btn2:hover,html[data-theme=inferno] .chip:hover{color:#ffcf4a}
+html[data-theme=inferno] .chip[aria-pressed=true]{background:linear-gradient(#a81c14,#6e0f0a);color:#ffe9b0;border-color:#3a0806 #e0564a #e0564a #3a0806}
+html[data-theme=inferno] .chip[aria-pressed=true] .cn{color:#ffe9b0}
+html[data-theme=inferno] .btn{background:linear-gradient(#a81c14,#6e0f0a);color:#ffe9b0;border:2px solid;border-color:#e0564a #3a0806 #3a0806 #e0564a;font-weight:800;text-transform:uppercase;letter-spacing:.08em}
+html[data-theme=inferno] .rvb{color:#f0a81c}
+html[data-theme=inferno] .rvb[aria-pressed=true]{background:linear-gradient(#a81c14,#6e0f0a);color:#ffe9b0}
+html[data-theme=inferno] .idx{max-height:calc(100vh - 114px)}
+html[data-theme=inferno] .idx a.cur{background:#3a241a;box-shadow:inset 4px 0 0 #e02a1e;color:#ffe9b0}
+html[data-theme=inferno] .ftag{border-width:2px;font-weight:700}
+html[data-theme=inferno] .ijs.isf{color:#ff3a2a;text-shadow:1px 1px 0 #000}
+html[data-theme=inferno] .tl-p{--tc:#e02a1e}
+html[data-theme=inferno] .tl-a{--tc:#f0a81c}
+html[data-theme=inferno] .tlt tr.tl-p td.tdc:not(.z){background:color-mix(in srgb,#e02a1e calc(var(--a,1)*100%),transparent)!important}
+html[data-theme=inferno] .tlt tr.tl-a td.tdc:not(.z){background:color-mix(in srgb,#f0a81c calc(var(--a,1)*100%),transparent)!important}
+html[data-theme=inferno] .tlt tr.tl-p td.tdc.hi{color:#fff3d6!important}
+html[data-theme=inferno] .tlt tr.tl-a td.tdc.hi{color:#17110d!important}
+html[data-theme=inferno] ::selection{background:#e02a1e;color:#fff}
+html[data-theme=inferno] ::-webkit-scrollbar{width:14px;height:14px}
+html[data-theme=inferno] ::-webkit-scrollbar-track{background:#17110d}
+html[data-theme=inferno] ::-webkit-scrollbar-thumb{background:#54453a;border:2px solid;border-color:#8a735e #0e0906 #0e0906 #8a735e}
+html[data-theme=inferno] .keys{display:none}
+html[data-theme=inferno] .hud{position:fixed;left:0;right:0;bottom:0;height:58px;z-index:6;display:flex;gap:4px;padding:4px;box-sizing:border-box;background:linear-gradient(#5a4a3e,#33291f);border-top:3px solid #0e0906;box-shadow:inset 0 2px 0 #8a735e}
+html[data-theme=inferno] .hud a{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#1c1410;border:2px solid;border-color:#0e0906 #7a6552 #7a6552 #0e0906;min-width:0;text-decoration:none;text-shadow:none;overflow:hidden}
+html[data-theme=inferno] .hud a:hover{background:#2a1c14}
+html[data-theme=inferno] .hud a.w{flex:1.7}
+html[data-theme=inferno] .hud b{font-size:25px;line-height:1;font-weight:900;color:#f0a81c;text-shadow:2px 2px 0 #000;letter-spacing:.02em;white-space:nowrap}
+html[data-theme=inferno] .hud b.bad{color:#e02a1e}
+html[data-theme=inferno] .hud b.ok{color:#86c23a}
+html[data-theme=inferno] .hud span{font-size:9.5px;letter-spacing:.16em;color:#a8937a;margin-top:4px;text-transform:uppercase;white-space:nowrap}
+@media (max-width:900px){html[data-theme=inferno] .hud a.opt{display:none}}
+"""
+
+NEON_EXTRA = """
+html[data-theme=neon] *{border-radius:0!important}
+html[data-theme=neon] body{background:#05060a linear-gradient(rgba(0,240,255,.035) 1px,transparent 1px) 0 0/100% 3px}
+html[data-theme=neon] .top{border-bottom:1px solid #fcee0a;box-shadow:0 1px 14px rgba(252,238,10,.18)}
+html[data-theme=neon] .tabs button{text-transform:uppercase;letter-spacing:.08em;font-size:12.5px}
+html[data-theme=neon] .tabs button[aria-selected=true]{color:#fcee0a;border-bottom-color:#fcee0a;text-shadow:0 0 8px rgba(252,238,10,.55)}
+html[data-theme=neon] .sec .sh{border-left:3px solid #fcee0a;padding-left:10px}
+html[data-theme=neon] .sec .sh .t{color:#fcee0a;text-transform:uppercase;letter-spacing:.06em}
+html[data-theme=neon] .blk{border-color:#1f4c55}
+html[data-theme=neon] .bh .t{color:#00f0ff}
+html[data-theme=neon] a{text-shadow:0 0 6px rgba(0,240,255,.25)}
+html[data-theme=neon] .hit,html[data-theme=neon] mark{text-shadow:0 0 6px rgba(252,238,10,.6)}
+html[data-theme=neon] .cz-le,html[data-theme=neon] .cz-exc{text-shadow:0 0 6px rgba(255,0,60,.55)}
+html[data-theme=neon] .btn2,html[data-theme=neon] .chip,html[data-theme=neon] .tin,html[data-theme=neon] .tsel{border-color:#1f4c55}
+html[data-theme=neon] .btn2:hover,html[data-theme=neon] .chip:hover{border-color:#fcee0a;color:#fcee0a}
+html[data-theme=neon] .chip[aria-pressed=true]{background:#2a2800;color:#fcee0a;border-color:#fcee0a;box-shadow:0 0 8px rgba(252,238,10,.3)}
+html[data-theme=neon] .chip[aria-pressed=true] .cn{color:#fcee0a}
+html[data-theme=neon] .btn{background:#fcee0a;color:#05060a;box-shadow:0 0 12px rgba(252,238,10,.35)}
+html[data-theme=neon] h1,html[data-theme=neon] h5,html[data-theme=neon] .lbl{letter-spacing:.08em}
+html[data-theme=neon] ::selection{background:#ff003c;color:#fff}
+"""
+
+LIGHT_EXTRA = """
+html[data-theme=light] .tabs button[aria-selected=true]{color:#1f2328;border-bottom-color:#fd8c73}
+html[data-theme=light] ::selection{background:#b6e3ff}
+"""
+
+_THEME_CACHE = {}
+
+
+def theme_css():
+    """The light, neon and inferno stylesheets, made once from CSS and COLOR_CSS."""
+    if "css" not in _THEME_CACHE:
+        base = CSS + COLOR_CSS + ":root{%s}" % ";".join("--gh%d:%s" % (i, c) for i, c in enumerate(GROUP_HUES))
+        _THEME_CACHE["css"] = (":root{%s}\n" % ";".join("--gh%d:%s" % (i, c) for i, c in enumerate(GROUP_HUES))
+                               + _themed(base, "light", _map_light) + "\nhtml[data-theme=light]{%s}" % THEME_VARS["light"] + LIGHT_EXTRA
+                               + _themed(base, "neon", _map_neon) + "\nhtml[data-theme=neon]{%s}" % THEME_VARS["neon"] + NEON_EXTRA
+                               + _themed(base, "inferno", _map_inferno) + "\nhtml[data-theme=inferno]{%s}" % THEME_VARS["inferno"] + INFERNO_EXTRA)
+    return _THEME_CACHE["css"]
+
+
+# the page is written with the neon theme; this puts back the theme chosen earlier in this browser before anything is drawn
+THEME_HEAD = ("<script id='th'>try{var _t=localStorage.getItem('sv.theme');if(_t==='dark')document.documentElement.removeAttribute('data-theme');"
+              "else if(_t==='retro')document.documentElement.setAttribute('data-theme','inferno');"      # the name of an earlier try at this theme
+              "else if(_t==='light'||_t==='inferno'||_t==='neon')document.documentElement.setAttribute('data-theme',_t);"
+              "if(localStorage.getItem('sv.view')==='clean')document.documentElement.setAttribute('data-layout','clean')}catch(e){}</script>")
+
+
+def hit_frame(h, ref):
+    """Which time frame a counted string falls in, by the last time it was seen, counted back from the collection."""
+    last = parse_when(h["last"]) if h.get("last") else None
+    if last is None:
+        return "old" if h.get("old") else "none"
+    age = ref - last
+    if age <= datetime.timedelta(hours=24):
+        return "d1"
+    if age <= datetime.timedelta(days=7):
+        return "d7"
+    if age <= datetime.timedelta(days=30):
+        return "d30"
+    return "old"
+
+
+# ---- Learn: "Follow one through", a worked example read from the open report -------------------------------------
+
+
+FOLDED_TOP = "what sos skipped"                # this block sits under the timeline, closed, in place of its section
+FOLDED_TOP_LABEL = "what sos skipped or could not finish while collecting"
+
+
+_TL_ERR = re.compile(r"error|5xx|fail|out-of-memory", re.I)     # rows of error and failure lines; the rest are changes and activity
+
+
+def status_bar(ctx, secs):
+    """The bar at the bottom of the inferno theme: a few of the report's own numbers in big digits, each a link to where
+    it comes from. A number the report does not hold has no cell. Every other theme hides the bar."""
+    def find(prefix):
+        for s in secs:
+            for i, b in enumerate(s["blocks"]):
+                if b["title"].startswith(prefix) and b["state"] == "ok":
+                    return "b%s-%d" % (s["num"], i), b
+        return None, None
+    cells = []                                   # (target, value, label, colour class, cell class)
+    issues = ctx.get("issues") or []
+    if issues:
+        n = sum(1 for x in issues if x.get("state") == "FOUND")
+        cells.append(("s00", fmt_n(n), "issue found" if n == 1 else "issues found", "bad" if n else "ok", ""))
+    bid, b = find("download and connection failures")
+    if b is not None:
+        m = re.match(r"([\d,]+) lines? in", b["note"] or "")
+        cells.append((bid, m.group(1) if m else "0", "connection failures", "bad" if m else "ok", ""))
+    bid, b = find("tasks at a glance")
+    if b is not None:
+        m = next((re.match(r"error/warning\s+([\d,]+)", l) for l in b["lines"] if l.startswith("error/warning")), None)
+        if m:
+            cells.append((bid, m.group(1), "tasks in error or warning", "bad" if m.group(1) != "0" else "ok", ""))
+    when = parse_when(ctx.get("collected", ""))
+    if when is not None:
+        cells.append(("s01", when.strftime("%b %d %H:%M").upper(), "collected \u00b7 %s" % (ctx.get("hostname") or ""), "", "w"))
+    bid, b = find("filesystems")
+    if b is not None:
+        f = next((l.split() for l in b["lines"] if l.split()[-1:] == ["/"]), None)
+        pct = next((x for x in (f or []) if re.match(r"^\d+%$", x)), None)
+        if pct:
+            cells.append((bid, pct, "disk /", "bad" if int(pct[:-1]) >= 90 else "", "opt"))
+    bid, b = find("main services")
+    if b is not None and len(b["lines"]) > 1:
+        rows = [l for l in b["lines"][1:] if l.strip() and not l.startswith(("+", "("))]
+        up = sum(1 for l in rows if "active (running)" in l)
+        if rows:
+            cells.append((bid, "%d/%d" % (up, len(rows)), "services running", "ok" if up == len(rows) else "bad", "opt"))
+    m = re.search(r"\bup\s+(?:(\d+)\s+days?)?,?\s*(?:(\d+):(\d\d)|(\d+)\s+min)?", ctx.get("uptime") or "")
+    if m and any(m.groups()):
+        d, hh, mm, mins = m.groups()
+        cells.append(("s01", ("%sd" % d) if d else ("%sh" % int(hh)) if hh and int(hh) else ("%sm" % int(mins or mm or 0)), "uptime", "", "opt"))
+    if not cells:
+        return ""
+    return "<div class='hud' id='hud'>%s</div>" % "".join(
+        "<a href='#%s'%s><b%s>%s</b><span>%s</span></a>" % (tg, (" class='%s'" % cc) if cc else "", (" class='%s'" % vc) if vc else "", esc(v), esc(lb))
+        for tg, v, lb, vc, cc in cells)
+
+
+def _timeline_html(tl, serve, targets=None):
+    """A week table: one row per kind of line, one cell per day with its count, darker for more; the day that is picked
+    opens underneath, hour by hour. Rows of error and failure lines come first, then changes and activity."""
+    if not tl or not tl.get("lanes") or not any(ln["total"] for ln in tl["lanes"]):
+        return ""
+    start = datetime.datetime.strptime(tl["start"], "%Y-%m-%d %H:%M")
+    nb = tl["hours"]
+    nd = nb // 24
+    days = [start + datetime.timedelta(days=d) for d in range(nd)]
+    coll = tl.get("collected")
+    lanes = [(li, ln, "p" if _TL_ERR.search(ln["label"]) else "a") for li, ln in enumerate(tl["lanes"])]
+    rows = [x for x in lanes if x[1]["total"]]
+    quiet = [ln["label"] for _, ln, _ in lanes if not ln["total"]]
+
+    def per_day(ln):
+        return [sum(n for k, n in ln["bins"].items() if k // 24 == d) for d in range(nd)]
+    # the day opened at first: the one with the most error and failure lines, else the collection day
+    errs = [sum(per_day(ln)[d] for _, ln, g in rows if g == "p") for d in range(nd)]
+    sel = max(range(nd), key=lambda d: (errs[d], d)) if any(errs) else (coll // 24 if coll is not None else nd - 1)
+    h = ["<details class='tlr' id='tlr' open><summary>timeline · %s to %s · %s · %s</summary>"
+         % (esc(tl["start"][:10]), esc(tl["last_day"]), "host time" + ((" (%s)" % esc(tl["tz"])) if tl.get("tz") else ""), plural(len(rows), "row"))]
+    h.append("<div class='tltw'><table class='tlt'><thead><tr><th></th>")
+    for d, day in enumerate(days):
+        h.append("<th><button type='button' class='tday%s' data-d='%s' title='open this day hour by hour'>%s%s</button></th>"
+                 % (" on" if d == sel else "", day.strftime("%Y-%m-%d"), day.strftime("%a %m-%d"), " <span class='tlcol'>◂ collected</span>" if coll is not None and coll // 24 == d else ""))
+    h.append("<th class='tltot'>%d days</th></tr></thead><tbody>" % nd)
+    for g, name in (("p", "ERRORS AND FAILURES"), ("a", "CHANGES AND ACTIVITY")):
+        grp = [x for x in rows if x[2] == g]
+        if not grp:
+            continue
+        h.append("<tr class='tlgh'><td colspan='%d'>%s</td></tr>" % (nd + 2, name))
+        for li, ln, _ in grp:
+            per = per_day(ln)
+            mx = max(per) or 1
+            cells = []
+            for d, n in enumerate(per):
+                dd = days[d].strftime("%Y-%m-%d")
+                if not n:
+                    cells.append("<td class='tdc z%s' data-d='%s'>·</td>" % (" sel" if d == sel else "", dd))
+                    continue
+                a = 0.16 + 0.74 * n / mx
+                rgb = "255,92,122" if g == "p" else "34,211,238"
+                cells.append("<td class='tdc%s%s%s' data-d='%s' style='background:rgba(%s,%.2f);--a:%.2f%s' title='%s · %s'>%s</td>"
+                             % (" sel" if d == sel else "", " mx" if n == mx else "", " hi" if a > 0.55 else "", dd, rgb, a, a, ";color:#0b0d13" if a > 0.55 else "",
+                                days[d].strftime("%a %m-%d"), esc(plural(n, "task" if ln.get("task") else "line" if ln["kind"] == "count" else "event")), fmt_n(n)))
+            h.append("<tr class='tl-%s'><td class='tll' title='%s'><i class='tlsq'></i>%s</td>%s<td class='tltot'>%s</td></tr>"
+                     % (g, esc(ln["src"] or ""), esc(ln["label"]), "".join(cells), fmt_n(ln["total"])))
+    h.append("</tbody></table></div>")
+    if quiet:
+        h.append("<div class='gp tlq'>nothing in these %d days: %s</div>" % (nd, esc(", ".join(quiet))))
+    # each day hour by hour; the page shows the one picked
+    for d, day in enumerate(days):
+        dd = day.strftime("%Y-%m-%d")
+        h.append("<div class='tlday' data-d='%s'%s><div class='tldh'><b>%s, hour by hour</b><span class='gp'>%s%s</span></div>"
+                 % (dd, "" if d == sel else " hidden", day.strftime("%A %m-%d"),
+                    "the number is the busiest hour of the row · click an hour to search that log for it, on a task row to open those tasks, on the configuration files row to go to those files" if serve
+                    else "the number is the busiest hour of the row · click an hour on a task row to open those tasks, on the configuration files row to go to those files",
+                    (" · <a href='#' class='tday2' data-d='%s'>search every log for errors on this day</a>" % dd) if serve else ""))
+        h.append("<div class='tlg' data-s='%s' data-off='%d'><span></span><div class='tlx'>%s</div>"
+                 % (esc(tl["start"]), tl.get("off") or 0, "".join("<span>%02d</span>" % hh for hh in range(0, 24, 3))))
+        shown = 0
+        for li, ln, g in rows:
+            hb = dict((k - d * 24, n) for k, n in ln["bins"].items() if k // 24 == d)
+            if not hb:
+                continue
+            shown += 1
+            mx = max(hb.values())
+            tb = (targets or {}).get(ln["label"])        # a row with no log to search goes to its block in the Report
+            cells = []
+            for hh in range(24):
+                k = d * 24 + hh
+                n = hb.get(hh, 0)
+                when = (day + datetime.timedelta(hours=hh)).strftime("%a %m-%d %H:00")
+                after = coll is not None and k > coll
+                if not n:
+                    cells.append("<i class='v0%s%s' data-k='%d'></i>" % (" col" if k == coll else "", " aft" if after else "", k))
+                    continue
+                pct = int(18 + 82 * (n / mx) ** 0.5)
+                cells.append("<i class='v5%s' data-k='%d' style='--h:%d%%' title='%s · %s%s'>%s</i>" % (
+                    " col" if k == coll else "", k, pct, when, esc(plural(n, "task" if ln.get("task") else "line" if ln["kind"] == "count" else "event")),
+                    " · click: open these tasks in the Tasks tab" if ln.get("task") else " · click: go to these files in the Report" if tb else "",
+                    ("<b>%s</b>" % fmt_n(n)) if n == mx else ""))
+            h.append("<span class='tll tl-%s' title='%s'><i class='tlsq'></i>%s</span><div class='tlc hb tl-%s%s' data-l='%d' data-q='%s' data-f='%s'%s>%s</div>"
+                     % (g, esc(ln["src"] or ""), esc(ln["label"]), g, " qable" if (serve and ln["q"]) else (" qable tq" if ln.get("task") else " qable tb" if tb else ""), li,
+                        esc(ln["q"] or ""), esc(ln["src"] or ""), (" data-t='%s'" % ln["task"]) if ln.get("task") else (" data-b='%s'" % tb) if tb else "", "".join(cells)))
+        if not shown:
+            h.append("<span></span><div class='gp'>nothing on this day</div>")
+        h.append("</div></div>")
+    h.append("</details>")
+    return "".join(h)
+
+
+def _tiles_html(ctx, src_name):
+    """The summary as labelled tiles, shown in the clean view (the standard view keeps the one-line summary)."""
+    def tile(k, v, small="", mono=False, tip=""):
+        if not v:
+            return ""
+        return "<div class='tile'%s><div class='k'>%s</div><div class='v%s'>%s%s</div></div>" % (
+            (" title='%s'" % esc(tip)) if tip else "", esc(k), " mono" if mono else "", esc(v), (" <small>%s</small>" % esc(small)) if small else "")
+    osn = ctx.get("os", "")
+    short = re.sub(r"Red Hat Enterprise Linux( Server)? release ", "RHEL ", osn)
+    short = re.sub(r"\s*\(.*\)$", "", short)
+    up = re.sub(r"^.*?up\s+", "", ctx.get("uptime", "")).split(",  ")[0].strip().rstrip(",")
+    col = ctx.get("collected", "")
+    m = re.match(r"\w{3}\s+(\w{3})\s+(\d+)\s+(\d+:\d+):\d+\s+(\w+)\s+(\d{4})", col)
+    colv, cols = ("%s %s %s" % (m.group(1), m.group(2), m.group(3)), m.group(4)) if m else (col, "")
+    lw = ctx.get("log_window", "") or ""
+    lk, lv = (lw.split(" covers ", 1) + [""])[:2] if " covers " in lw else ("logs", lw)
+    t = [tile("OS", short, tip=osn),
+         tile(ctx["role"], ctx.get("satellite") or "", tip=ctx.get("role_why", "")) if ctx.get("satellite") else tile("role", ctx.get("role", "")),
+         tile("kernel", ctx.get("kernel", ""), mono=True),
+         tile("up", up),
+         tile("collected", colv, cols, tip=col),
+         tile(lk + " covers", lv.replace(" → ", " → ")),
+         tile("sos", ctx.get("sos_version", ""), "%s files%s" % (fmt_n(ctx.get("files", 0)), " · partial archive" if ctx.get("partial") else ""), tip=ctx.get("partial", "")),
+         tile("from", src_name, mono=True, tip=src_name)]
+    if ctx.get("pair"):
+        pc = ctx["pair"]["ctx"]
+        t.append(tile("paired with", pc["hostname"], "%s%s" % (pc["role"], (" " + pc["satellite"]) if pc.get("satellite") else "")))
+    return "<div class='tiles'>%s</div>" % "".join(t)
+
+
+def render_html(ctx, secs, src_name, serve=False, tasks=None, exports=None, t=None, txt_name=None):
+    kb = ({"sigs": [], "playbooks": []})
+    match = (None)
+    h = ["<!doctype html><html lang='en' data-theme='neon'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>",
+         "<title>sosview · %s</title><style>%s%s%s</style>%s</head><body>" % (esc(ctx["hostname"]), CSS, COLOR_CSS, theme_css(), THEME_HEAD)]
+    h.append("<div class='top'><span class='me'><b>$</b> sosview <strong>%s</strong></span><nav class='tabs' role='tablist'>" % esc(ctx["hostname"]))
+    for tid, label in (("report", "Report"), ("tasks", "Tasks"), ("search", "Search")) + ((())):
+        none = " data-none='1' title='no task data in this sosreport'" if tid == "tasks" and not (tasks and tasks.get("rows")) else ""
+        h.append("<button type='button' role='tab' id='tab-%s' aria-controls='pane-%s' data-tab='%s' aria-selected='%s'%s>%s</button>" % (tid, tid, tid, "true" if tid == "report" else "false", none, label))
+    h.append("</nav>")
+    if serve:
+        h.append("<label class='qs'><span style='color:var(--dim)'>/</span><input id='qtop' type='search' placeholder='search all logs' aria-label='search all logs'></label>")
+    else:
+        h.append("<span class='qs qsn' title='this page was written to a file: Search, file viewing and logs around a task need sosview-lite serve'>Search and file viewing need <code>sosview-lite serve</code></span>")
+    if serve:
+        h.append("<button type='button' class='runb' id='runl' aria-expanded='false' aria-controls='run' title='run a command line in the report directory (`)'>$ run</button>")
+    h.append("<details class='dsp' id='dsp'><summary title='layout of the Report and colours of the page; remembered in this browser'>display</summary><div class='dspm'>"
+             "<a href='#' id='viewl' title='standard or clean layout of the Report (v)'>view</a>"
+             "<a href='#' id='themel' title='neon, dark, light or inferno (t)'>theme</a></div></details>")
+    h.append("<a href='#' id='notesl' style='color:var(--dim);white-space:nowrap' title='lines, blocks, tasks and strings you pinned, with your comments; copy them as text (N)'>notes</a>")
+    h.append("<a href='%s' style='color:var(--dim);white-space:nowrap'>report.txt ⇩</a></div>" % ("/report.txt" if serve else esc(txt_name or os.path.splitext(src_name)[0] + ".txt")))
+    facts = [ctx["os"].replace("Red Hat Enterprise Linux release ", "RHEL ").replace("Red Hat Enterprise Linux Server release ", "RHEL "),
+             ctx["role"] + (" " + ctx["satellite"] if ctx.get("satellite") else "") + " (%s)" % ctx.get("role_why", ""), "kernel " + ctx["kernel"],
+             re.sub(r"^.*?up\s+", "up ", ctx["uptime"]).split(",  ")[0], "sos " + ctx["sos_version"], "collected " + ctx["collected"],
+             ctx.get("log_window", ""), "%s files" % fmt_n(ctx.get("files", 0)), src_name,
+             "partial: the archive is damaged or cut short" if ctx.get("partial") else ""]
+    if ctx.get("pair"):
+        pc = ctx["pair"]["ctx"]
+        facts.append("paired with %s (%s%s)" % (pc["hostname"], pc["role"], (" " + pc["satellite"]) if pc.get("satellite") else ""))
+    h.append("<div class='facts'>%s</div>" % " · ".join(esc(f) for f in facts if f))
+    h.append(_tiles_html(ctx, src_name))
+    # report pane
+    nnc_all = sum(1 for s in secs for b in s["blocks"] if b["state"] == "nc")
+    # two views when the original script was asked for: its report first, then sosview's; a switch at the top of each
+    oview, oswitch, rv = ("", "", "")
+    if "orig" in ctx:
+        oview, oswitch = orig_html(ctx, secs, t, serve)
+        rv = " data-rv='%s' data-rvdef='%s'" % (("orig", "orig") if ctx["orig"].get("text") else ("own", "own"))
+    h.append("<div class='pane on' id='pane-report' role='tabpanel' aria-labelledby='tab-report' data-pane='report'%s>%s<aside class='idx' id='ridx'%s><h4>SECTIONS</h4>" % (rv, oview, " data-rvv='own'" if rv else ""))
+    h.append(""
+             "<div class='itools'><label title='hide the %d blocks whose file is not in this sosreport'><input type='checkbox' id='hidenc'> hide not collected</label>"
+             "<a href='#' id='xall' title='open every cut block'>expand all</a><a href='#' id='wrapt' title='wrap long lines (w)'>wrap</a></div>" % nnc_all)
+    iss = ctx.get("issues") or []
+    if iss:
+        nf = sum(1 for x in iss if x["state"] == "FOUND")
+        nct = sum(1 for x in iss if x["state"] == "CANNOT")
+        h.append("<a href='#s00' data-sec='s00' title='checks that compare one value with a fixed limit'><span class='n'>!</span><span>Potential issues</span><span class='m'><span class='m1'>%s</span><span class='m2'>%s</span></span></a>"
+                 % ("%d found" % nf if nf else ("%d cannot tell" % nct if nct else "clear"), nf or ""))
+    for s in secs:
+        nb = len(s["blocks"])
+        nnc = sum(1 for b in s["blocks"] if b["state"] == "nc")
+        meta = "n/a" if s["na"] else ("%d%s" % (nb, (" · %d n/c" % nnc) if nnc else ""))
+        tip = "not applicable here" if s["na"] else "%d block%s%s" % (nb, "" if nb == 1 else "s", (", %d not collected" % nnc) if nnc else "")
+        meta2 = "n/a" if s["na"] else ("%s%d" % ("<i class='ncd'></i>" if nnc else "", nb))
+        h.append("<a href='#s%s' class='%s' data-sec='s%s' title='%s'><span class='n'>%s</span><span>%s</span><span class='m'><span class='m1'>%s</span><span class='m2'>%s</span></span></a>" % (s["num"], "na" if s["na"] else "", s["num"], esc(tip), s["num"], esc(s["title"]), meta, meta2))
+    cmp_ = []
+    if not ctx.get("diff"):
+        cmp_.append("<div title='adds a section 21: packages, repositories, settings, unit states and disk use that differ between two reports of this host'>with an older report of this host<code>sosview-lite THIS --diff OLDER</code></div>")
+    if not ctx.get("pair") and ctx.get("role") in ("satellite", "capsule"):
+        cmp_.append("<div title='compares the certificates the two ends trust and present'>%s<code>sosview-lite THIS --pair OTHER</code></div>" % ("with its Capsule's report" if ctx["role"] == "satellite" else "with its Satellite's report"))
+    if cmp_:
+        h.append("<div class='cmp'><h4>COMPARE</h4>%s</div>" % "".join(cmp_))
+    h.append("</aside><div class='split' data-for='ridx' data-side='left'%s title='drag to resize, all the way left to hide · double-click to reset'></div><main class='doc'%s>%s"
+             % ((" data-rvv='own'", " data-rvv='own'", oswitch) if rv else ("", "", "")))
+    h.append(issues_html(ctx, secs))
+    itr = in_this_report(ctx, secs)
+    if itr:
+        h.append("<div class='inrep' id='inrep'><div class='lbl'>IN THIS REPORT <span>counts and times from the blocks below; click a line to go there</span></div>%s</div>" % "".join(
+            ("<a href='#learn/seen' class='lk' data-card='seen'>%s</a>" % esc(tx)) if tg.startswith("learn:") else ("<a href='#%s'>%s</a>" % (tg, esc(tx))) for tx, tg in itr))
+    targets = {}                               # timeline rows that point at a block: the row's label -> that block's id
+    for ln in (ctx.get("timeline") or {}).get("lanes") or []:
+        if ln.get("blk"):
+            hit = [("b%s-%d" % (s["num"], i), b) for s in secs for i, b in enumerate(s["blocks"]) if b["title"].startswith(ln["blk"]) and b["state"] == "ok"]
+            pick = next((x for x in hit if x[1].get("hours")), hit[0] if hit else None)
+            if pick:
+                targets[ln["label"]] = pick[0]
+    h.append(_timeline_html(ctx.get("timeline"), serve, targets))
+    top_at, top = len(h), []                 # blocks shown folded under the timeline, not in their section
+    for s in secs:
+        srcs = []
+        for b in s["blocks"]:
+            for x in b["src"]:
+                if x not in srcs:
+                    srcs.append(x)
+        if s["na"]:
+            h.append("<section class='sec na' id='s%s'><div class='sh'><span class='t'>%s&nbsp;&nbsp;%s</span><span class='s'>not applicable: %s</span></div></section>"
+                     % (s["num"], s["num"], esc(s["title"]), esc(s["blocks"][0]["note"] if s["blocks"] else "")))
+            continue
+        h.append("<section class='sec' id='s%s'><div class='sh'><span class='t'>%s&nbsp;&nbsp;%s</span>%s<span class='s'>%s</span></div>"
+                 % (s["num"], s["num"], esc(s["title"]), (""), esc(" · ".join(srcs[:4]) + (" · …" if len(srcs) > 4 else ""))))
+        for i, b in enumerate(s["blocks"]):
+            acts = []
+            sec_h = h
+            if b["title"].startswith(FOLDED_TOP) and b["state"] == "ok":
+                h = []                           # written aside, placed under the timeline below
+            if b["cmd"]:
+                acts.append("<button type='button' class='cp' data-cmd='%s' title='copy the command (y)'>copy</button>" % esc(b["cmd"]))
+            acts.append("<button type='button' class='cpb' title='copy title, command and output (Y)'>copy block</button>")
+            acts.append("<button type='button' class='pin' title='pin this block to your notes (p)'>pin</button>")
+            vsrc = [x for x in b["src"] if "/" in x and not x.endswith("/") and not x.startswith("@")]
+            if t is not None:  # link the first file the block names that is really in the report
+                vsrc = [x for x in vsrc if os.path.isfile(os.path.join(t.root, x))] or vsrc
+            if vsrc and serve:
+                ln = _first_line_no(t, vsrc[0], b)
+                acts.append("<button type='button' class='vw' data-view='%s:%d' title='open %s in the viewer at the lines shown'>view file</button>" % (esc(vsrc[0]), ln, esc(vsrc[0])))
+            lid = ("")        # a block that names no card gets the card of the file it reads
+            acts.append("<a href='#b%s-%d' class='pl' title='link to this block'>#</a>" % (s["num"], i))
+            note = ("<span class='note'>%s</span>" % esc(b["note"])) if (b["note"] and b["state"] == "ok") else ""
+            quiet = b["state"] in ("nc", "empty")       # nothing to show: one line in place, which opens to the command
+            folded = b.get("fold") and b["state"] == "ok"   # closed by default: one line with its count, which opens to the block
+            if quiet:
+                note = "<span class='qn'>%s</span>" % esc(b["note"])
+            elif folded:        # a tag with what is inside, so it does not read as a block with nothing in it
+                note = "<span class='ftag'>%s · closed</span><span class='qn'>%s</span>" % (esc(plural(len(b["lines"]), "line")), esc(b["note"] or ""))
+            h.append("<div class='blk%s%s' id='b%s-%d'><div class='bh'%s><span class='t'>// %s</span>%s<span class='act'>%s</span></div>" % (
+                " nc" if b["state"] == "nc" else "", " quiet" if quiet else " quiet fold" if folded else "", s["num"], i,
+                " title='click to show the command that was checked'" if quiet else " title='click to open'" if folded else "", esc(b["title"]), note, "".join(acts)))
+            if b["cmd"]:
+                h.append("<div class='cmd%s%s' title='%s'><span class='g'>%s</span> %s</div>" % (" approx" if b["approx"] else "", " long" if len(b["cmd"]) > 150 else "", ("click to show the whole command · " if len(b["cmd"]) > 150 else "") + ("≈ this command gives the same information in another shape: sosview counted, sorted, shortened or lined it up" if b["approx"] else "$ run in the extracted report, this command prints exactly these lines"), "≈" if b["approx"] else "$", esc(b["cmd"])))
+            h.append(_out_html(b, limit=b.get("show") or 25, match=match, sigs=kb["sigs"], serve=serve) + "</div>")
+            if h is not sec_h:
+                top.append("<details class='tlr fold'><summary>%s · %s</summary>%s</details>" % (
+                    esc(FOLDED_TOP_LABEL), esc(b["note"].split(" · ")[0] if b["note"] else plural(len(b["lines"]), "line")), "".join(h)))
+                h = sec_h
+        h.append("</section>")
+    h[top_at:top_at] = top
+    h.append("</main></div>")
+    # search pane
+    h.append("<div class='pane' id='pane-search' role='tabpanel' aria-labelledby='tab-search' data-pane='search' style='flex-direction:column'>")
+    if serve:
+        opts = "".join("<option value='%s'>%s</option>" % (pid, esc(lbl)) for pid, lbl, _ in PRESETS)
+        h.append("<div class='sbox'><form class='sform' id='sf' role='search'><label class='in'><span style='color:var(--cmd)'>/</span><input id='q' type='search' list='qhist' aria-label='search' placeholder='text or regex, e.g.  Connection refused|timed out' autocomplete='off'></label>"
+                 "<label style='display:flex;align-items:center;gap:8px;color:var(--dim)'>in<select id='preset' aria-label='which files'>%s</select></label><button class='btn' type='submit'>search</button>"
+                 "<button class='btn2' type='button' id='sstop' hidden>stop</button><button class='btn2 sfb' type='button' id='sfold' title='show or hide the search options (o); they also fold away while you scroll the results'>options ▴</button></form>" % opts)
+        h.append("<div class='quick'><span>ready-made:</span>%s<span style='color:var(--dim2)'>fills the box; edit it before or after</span></div>"
+                 % "".join("<button type='button' class='chip' aria-pressed='false' data-q='%s' data-cs='%d' data-x='%s' title='%s&#10;&#10;%s'>%s</button>"
+                           % (esc(q), 1 if cs else 0, esc(x), esc(desc), esc(q), esc(lbl)) for _, lbl, q, cs, x, desc in QUICK))
+        h.append("<div class='sopts'><span class='smode' id='smode' role='group' aria-label='how the text matches'>match"
+                 "<button type='button' data-m='re' aria-pressed='true' title='a regular expression, as typed'>regex</button>"
+                 "<button type='button' data-m='ex' aria-pressed='false' title='the text as typed: . / ? and the rest mean themselves'>exact text</button>"
+                 "<button type='button' data-m='aw' aria-pressed='false' title='every word somewhere on the line, in any order, with anything between them'>all words</button></span>"
+                 "<label id='o_nearl' hidden title='the words may be on different lines of one request: Foreman, the smart proxy, Candlepin and Pulp lines carry its id'><input type='checkbox' id='o_near'> in one request</label>"
+                 "<label><input type='checkbox' id='o_cs'> case-sensitive</label><label><input type='checkbox' id='o_ww'> whole word</label>"
+                 "<label>hide lines matching <input id='o_x' class='xin' placeholder='regex' autocomplete='off'></label>"
+                 "<label>context <select id='o_ctx'><option>0</option><option selected>1</option><option>2</option><option>5</option></select></label>"
+                 "<label title='lines with a time inside this window only; lines without a time are left out'>between <input id='o_from' class='tin' placeholder='2026-11-02 08:00' autocomplete='off'> and <input id='o_to' class='tin' placeholder='10:30' autocomplete='off'></label>"
+                 "<label title='sos collects the journal more than once (whole, this boot, last boot); search them all'><input type='checkbox' id='o_dup'> include duplicate journal copies</label></div>"
+                 "<div class='sstat'><span id='sstat'>search the logs of this sosreport. Dated and rotated copies of a log are searched as one log. Untick files on the left to leave them out.</span><span class='sact' id='sact'></span></div></div>")
+        h.append("<div class='scols'><aside class='sfiles' id='sfiles'></aside><div class='split' data-for='sfiles' data-side='left' title='drag to resize, all the way left to hide · double-click to reset'></div>"
+                 "<div class='sres' id='sres'><div class='dist' id='dist'></div></div><div class='split' data-for='sview' data-side='right' title='drag to resize · double-click to reset'></div>"
+                 "<aside class='view' id='sview'><div class='vh'><a href='#' class='btn2' id='vback' hidden style='white-space:nowrap;flex:none' title='go back to where you clicked view file'>‹ back</a><b id='vpath' style='overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0'>no file open</b><span id='vpos' style='white-space:nowrap'></span><span class='r'><button class='btn2' type='button' id='vprev'>‹ prev</button>"
+                 "<button class='btn2' type='button' id='vnext'>next ›</button><input id='vat' class='tin' placeholder='go to time' title='jump to the first line at or after a time, e.g. 2026-11-02 14:05 or Nov 2 14:05' autocomplete='off'><button class='btn2' type='button' id='vpin' title='pin the selected line to your notes'>pin</button><button class='btn2' type='button' id='vwide' title='widen / narrow this pane'>⇔</button><a class='btn2' id='vraw' href='#' target='_blank' style='display:flex;align-items:center'>raw ↗</a></span></div>"
+                 "<div class='vb' id='vb'></div><div class='vf' id='vf'>click a line to open the file here</div></aside></div>")
+    else:
+        h.append("<div class='doc'><div class='nc' style='font-size:14px'>Search runs against the extracted sosreport, so it needs the local server:<br><br>"
+                 "<span class='cmd'>$ sosview-lite serve %s</span></div></div>" % esc(src_name))
+    h.append("</div>")
+    # tasks pane
+    h.append("<div class='pane' id='pane-tasks' role='tabpanel' aria-labelledby='tab-tasks' data-pane='tasks' style='flex-direction:column'><div class='tbar' id='tbar'></div><div class='tsum' id='tsum'></div><div class='tcols'><main class='tm' id='tm'></main><aside class='td' id='td' aria-label='task details'></aside></div></div>")
+    # learn pane
+    h.append("<div class='keys'><span data-k='report'>j / k  next / previous block</span><span data-k='report'>[ / ]  section</span><span data-k='report'>y / Y  copy command / block</span>"
+             "%s<span data-k='report'>w  wrap</span><span data-k='report'>$ exact · ≈ same information, other shape</span>"
+             "<span data-k='search'>Enter  search</span><span data-k='search'>n / p  next / previous hit</span>"
+             "<span data-k='learn'>Esc  back to Learn</span><span data-k='learn'>browser Back  previous page</span>"
+             "<span>/  search</span><span>1-4  tabs</span><span id='czst' title='colours on or off: press c anywhere outside a text box'>c  colours</span><span>?  all keys</span><span class='ver'>sosview %s · %s · no network</span></div>" % ("<span data-k='report'>o  original / sosview</span>" if "orig" in ctx else "", VERSION, "read-only, except what you type in $ run" if serve else "read-only"))
+    if LITE:
+        h[-1] = h[-1].replace("<span data-k='learn'>Esc  back to Learn</span><span data-k='learn'>browser Back  previous page</span>", "").replace("1-4  tabs", "1-3  tabs").replace("sosview %s" % VERSION, "sosview %s bare" % VERSION)
+    tdata = tasks or {"source": "none", "rows": [], "name": "", "note": ("no task data: tasks are kept on a Satellite, and this host is a %s" % ("client" if ctx.get("role") == "rhel" else "Capsule"))
+                      if ctx.get("role") in ("rhel", "capsule") else
+                      "no task data: foreman_tasks_tasks has no header line (sos kept only its end) and its columns could not be recognised"
+                      if t is not None and any(v.get("headless") and table_name(k) == "foreman_tasks_tasks" for k, v in t.table_info.items()) else
+                      "no task data: sos_commands/foreman/foreman_tasks_tasks is not in this sosreport"}
+    cw = parse_when(ctx.get("collected", ""))
+    tdata = dict(tdata, collected=cw.strftime("%Y-%m-%d %H:%M:%S") if cw else "")
+    tfull = {}
+    if not serve and t is not None and tasks and tasks.get("source") == "sosreport":
+        try:
+            tfull = tasks_full_static(t, ctx, tasks)
+        except Exception:
+            tfull = {}
+    h.append("<script>var PKI=%s;</script>" % json.dumps(ctx.get("pkinfo") or {}).replace("</", "<\\/"))
+    h.append("<script>var SERVE=%s;var TASKS=%s;var EXPORTS=%s;var TASKFULL=%s;</script>" % ("true" if serve else "false", json.dumps(tdata).replace("</", "<\\/"),
+             json.dumps(exports or []).replace("</", "<\\/"), json.dumps(tfull, default=str).replace("</", "<\\/")))
+    sj = [{"s": x["s"], "f": x["f"], "u": 1 if sig_applies(x, ctx["role"]) else 0, "pb": x["pb"], "c": x["c"] + (" (also appears in normal operation; decoded, not counted)" if x.get("common") else ""),
+           "k": x["k"], "w": x["w"], "l": x.get("l", ""), "v": x.get("v", ""), "r": x.get("rx") or "", "g": x.get("g", ""), "x": x.get("x") or []} for x in kb["sigs"]]
+    pbt = dict((p["id"], p["title"]) for p in kb["playbooks"])
+    h.append("<script>var SIGS=%s;var PBT=%s;var PBS=%s;var TASKPB=%s;</script>" % tuple(json.dumps(v, ensure_ascii=False).replace("</", "<\\/") for v in (((sj, pbt, {}, {})))))
+    h.append("<aside class='notes' id='notes' aria-label='your notes'></aside>")
+    if serve:
+        h.append("<section class='run' id='run' aria-label='run a command'><div class='rnh'><b>$ run</b><span class='gp' id='rncwd'></span>"
+                 "<button type='button' class='btn2' id='rncopy' title='copy everything shown below'>copy output</button>"
+                 "<button type='button' class='btn2' id='rnpin' title='pin the last command and its output to your notes'>pin last</button>"
+                 "<button type='button' class='btn2' id='rnclear'>clear</button><button type='button' class='tdx' id='rnx' title='close (Esc)'>✕</button></div>"
+                 "<div class='rnout' id='rnout' tabindex='0' aria-live='polite'></div>"
+                 "<form class='rnf' id='rnf' autocomplete='off'><span class='rnp' aria-hidden='true'>$</span>"
+                 "<input id='rnq' aria-label='command line' spellcheck='false' autocapitalize='off' autocomplete='off' placeholder='a command line, run by bash in the report directory'>"
+                 "<button class='btn' type='submit' id='rngo'>run</button></form>"
+                 "<div class='gp rnn'>your own shell commands, pipes and scripts · ↑ ↓ earlier commands · Ctrl-C stops · $SOSREPORT is the report directory · "
+                 "programs that take over the screen (less, vim, top) do not work here · a command is stopped after %d minutes · commands can change files</div></section>" % (RUN_SECONDS // 60))
+    h.append("<datalist id='qhist'></datalist><div class='kbov' id='keys' role='dialog' aria-label='keyboard shortcuts'></div>")
+    h.append(status_bar(ctx, secs))
+    h.append("<script>%s%s</script></body></html>" % (COLOR_JS, JS))
+    return "".join(h)
+
+
+# Syntax colouring: by what a token IS (timestamp, process, path, string, number, the log's own level word),
+# never by what sosview thinks it means. 'c' turns it off.
+COLOR_CSS = r"""
+.cz-ts{color:#7d8b99}.cz-pr{color:#79b8ff}.cz-path{color:#a5d6ff}.cz-str{color:#a5e3a5}.cz-num{color:#d2a8ff}.cz-id{color:#6b7682}
+.cz-key{color:#9ecbff}.cz-url{color:#79c0ff;text-decoration:underline dotted}.cz-exc{color:#ffa198;font-weight:600}.cz-fr{color:#6b7682}
+.cz-le{color:#ff7b72;font-weight:600}.cz-lw{color:#e3b341;font-weight:600}.cz-li{color:#7ee787}.cz-ld{color:#6b7682}
+.cz-s2{color:#7ee787}.cz-s3{color:#79c0ff}.cz-s4{color:#e3b341}.cz-s5{color:#ff7b72}
+body.nocolor [class^='cz-']{color:inherit!important;font-weight:inherit!important;text-decoration:none!important}
+"""
+COLOR_JS = r"""
+var CZ=(function(){
+ var parts=[
+  ['fr','^\\s+File "[^"]*", line \\d+.*$|^\\s+at [\\w$.<>]+\\(.*\\)$'],
+  ['ts','\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}(?::\\d{2}(?:[.,]\\d+)?)?(?:Z|[+-]\\d{2}:?\\d{2})?|^[A-Z][a-z]{2} [ \\d]\\d \\d{2}:\\d{2}:\\d{2}|\\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ \\d]\\d \\d{2}:\\d{2}(?::\\d{2})?\\b|\\[\\d{2}/[A-Z][a-z]{2}/\\d{4}(?::\\d{2}){3} [+-]\\d{4}\\]|\\[[A-Z][a-z]{2} [A-Z][a-z]{2} [ \\d]\\d \\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)? \\d{4}\\]'],
+  ['le','\\b(?:FATAL|CRITICAL|CRIT|ERROR|ERR|SEVERE|PANIC|EMERG|ALERT)\\b|\\[[EF](?=\\|)'],
+  ['lw','\\b(?:WARNING|WARN)\\b|\\[W(?=\\|)'],
+  ['li','\\b(?:INFO|NOTICE)\\b|\\[I(?=\\|)'],
+  ['ld','\\b(?:DEBUG|DDEBUG|SUBDEBUG|TRACE)\\b|\\[D(?=\\|)'],
+  ['exc','\\bTraceback \\(most recent call last\\):|\\b[A-Za-z_][\\w:.]*(?:Error|Exception)\\b'],
+  ['url','\\bhttps?://[^\\s"\'<>]+'],
+  ['st','"(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|CONNECT) [^"\\n]{0,600}" \\d{3}\\b'],
+  ['str','"[^"\\n]{0,300}"|\'[^\'\\n]{0,300}\''],
+  ['pr','\\b[\\w.@-]+\\[\\d+\\](?=:)'],
+  ['id','\\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\b|\\b0x[0-9a-f]{6,}\\b'],
+  ['path','(?:^|(?<=[\\s=(\\[,:]))/(?:[\\w.@+-]+/)*[\\w.@+-]+/?'],
+  ['key','^[ \\t]*[A-Za-z_][\\w.-]*(?=[ \\t]*=)|\\b[\\w.-]+(?==\\S)'],
+  ['num','(?<![\\w@.:/#,-])\\d{1,3}(?:\\.\\d{1,3}){3}:\\d+(?![\\w@-]|\\.\\w)|(?<![\\w@.:/#,-])\\d{1,3}(?:,\\d{3})+(?![\\w@-]|[.,]\\d)|(?<![\\w@.:/#-])\\d+(?:\\.\\d+)*(?![\\w@-]|\\.\\w)']];
+ var rx;try{rx=new RegExp(parts.map(function(p){return '('+p[1]+')'}).join('|'),'gm')}catch(e){rx=null}
+ function e(t){return String(t).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+ function line(t){if(!rx||!t)return e(t||'');var o='',l=0,m;rx.lastIndex=0;
+  while((m=rx.exec(t))){if(!m[0].length){rx.lastIndex++;continue}var k=1;while(m[k]===undefined)k++;var c=parts[k-1][0];
+   if(c==='st'){var sc=m[0].slice(-3);o+=e(t.slice(l,m.index))+'<span class="cz-str">'+e(m[0].slice(0,-4))+'</span> <span class="cz-s'+sc[0]+'">'+sc+'</span>'}
+   else o+=e(t.slice(l,m.index))+'<span class="cz-'+c+'">'+e(m[0])+'</span>';l=m.index+m[0].length}
+  return ids(o+e(t.slice(l)))}
+ /* ids are links wherever a log line is drawn: a UUID opens its task (Foreman task or execution plan id) or searches every
+    log for it; Candlepin's csid= and Pulp's 'pulp [id]' are request ids and open the request; so does Foreman's [I|app|1a2b3c4d] */
+ function srv(){return typeof SERVE!=='undefined'&&SERVE}
+ var UID=/(<[^>]*>)|((?:csid(?:<[^>]*>)*=|pulp \[)(?:<[^>]*>)*)?\b([0-9a-f]{8})(-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi,RQ=/(\|[a-z]{2,8}\|)([0-9a-f]{8})\]/g;
+ function ids(h){if(h.indexOf('-')<0&&h.indexOf('|')<0)return h;
+  if(srv())h=h.replace(RQ,function(m,p,id){return p+'<span class="rid" data-q="'+id+'" title="follow request '+id+' through every log">'+id+'</span>]'});
+  return h.replace(UID,function(m,tag,pre,a,b){if(tag)return tag;var id=(a+b).toLowerCase();
+   if(pre){if(!srv())return m;return pre+'<span class="rid" data-q="'+a.toLowerCase()+'" title="follow request '+a.toLowerCase()+' through every log">'+a+'</span>'+b}
+   var tk=taskOf(id);if(!tk&&!srv())return m;
+   return '<span class="uid" data-id="'+id+'" title="'+(tk?'open this task in the Tasks tab':'search every log for this id')+'">'+a+b+'</span>'})}
+ var TIDS=null;function taskOf(id){if(typeof TASKS==='undefined'||!TASKS||!TASKS.rows)return null;
+  if(!TIDS||TIDS.n!==TASKS.rows.length){TIDS={n:TASKS.rows.length,m:{}};TASKS.rows.forEach(function(r){if(r.id)TIDS.m[String(r.id).toLowerCase()]=r;if(r.ext)TIDS.m[String(r.ext).toLowerCase()]=r})}
+  return TIDS.m[id]||null}
+ if(typeof window!=='undefined')window.taskOf=taskOf;
+ function text(t){return String(t).split('\n').map(line).join('\n')}
+ function nodes(root){var w=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,null,false),list=[],n;while((n=w.nextNode()))if(!n.parentNode.closest('.kn,mark,button'))list.push(n);
+  list.forEach(function(n){var s=document.createElement('span');s.innerHTML=text(n.data);n.parentNode.replaceChild(s,n)})}
+ function on(){try{return localStorage.getItem('sv.nocolor')!=='1'}catch(x){return true}}
+ function apply(){var o=on();document.body.classList.toggle('nocolor',!o);var st=typeof document!=='undefined'&&document.getElementById('czst');if(st){st.textContent=o?'c  colours':'c  colours: off';st.classList.toggle('czoff',!o)}}
+ function toggle(){try{localStorage.setItem('sv.nocolor',on()?'1':'0')}catch(x){document.body.classList.toggle('nocolor');return}apply()}
+ if(typeof document!=='undefined')document.addEventListener('DOMContentLoaded',apply);
+ return {line:line,text:text,nodes:nodes,apply:apply,toggle:toggle,ids:ids}})();
+"""
+
+JS = r"""
+(function(){
+function $(s,r){return (r||document).querySelector(s)}function $$(s,r){return Array.prototype.slice.call((r||document).querySelectorAll(s))}
+CZ.apply();$$('pre.out').forEach(function(p){if(p.textContent.length<400000)CZ.nodes(p)});
+function esc(t){return String(t).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
+/* tabs */
+/* tabs: each switch is a step in the browser history, so Back returns to the tab, and in the Report to the same place */
+function curTab(){var p=$('.pane.on');return p?p.dataset.pane:'report'}
+function tab(id,nopush){var was=curTab();if(was==='report'&&id!=='report')tab.ry=window.pageYOffset;document.body.dataset.tab=id;
+ if(!nopush&&was!==id){try{if(was==='report')history.replaceState({tab:'report',y:window.pageYOffset},'',location.hash||'#report');history.pushState({tab:id},'','#'+id)}catch(e){}}
+ $$('.tabs button').forEach(function(b){b.setAttribute('aria-selected',b.dataset.tab===id?'true':'false')});$$('.pane').forEach(function(p){p.classList.toggle('on',p.dataset.pane===id)});document.body.dataset.tab=id;
+ if(id==='tasks')Tasks.init();if(id==='search'&&window.Search)Search.init();if(id!=='report')window.scrollTo(0,0);
+ else if(was!=='report'&&typeof tab.ry==='number')window.scrollTo(0,tab.ry);   /* back on the Report: where it was left; a caller that goes to a block scrolls there after this */
+ fit()}
+function setHash(h){try{history.replaceState(history.state,'',h)}catch(e){}}
+/* the search and task panes fill the window below the header; their side panes are resizable */
+function fit(){var hud=$('#hud'),bot=hud&&hud.offsetHeight?hud.offsetHeight+2:31;   /* the bar at the bottom: the key hints, or the status bar of the inferno theme */
+ $$('.scols,.tcols').forEach(function(el){if(el.offsetParent)el.style.height=Math.max(300,window.innerHeight-el.getBoundingClientRect().top-window.scrollY+window.pageYOffset-bot)+'px'})}
+window.addEventListener('resize',fit);
+function room(el){var used=0;Array.prototype.forEach.call(el.parentNode.children,function(c){if(c!==el&&c.tagName==='ASIDE')used+=c.getBoundingClientRect().width});return Math.max(160,el.parentNode.clientWidth-used-380)}
+function splitter(sp){var el=document.getElementById(sp.dataset.for),side=sp.dataset.side,key='sv.w.'+sp.dataset.for;if(!el)return;
+ try{var w=localStorage.getItem(key);if(w)el.style.width=w+'px'}catch(e){}
+ sp.addEventListener('mousedown',function(e){e.preventDefault();document.body.classList.add('drag');sp.classList.add('on');
+  function mv(ev){var r=el.getBoundingClientRect(),w=side==='left'?ev.clientX-r.left:r.right-ev.clientX;if(side==='left'&&w<90){up();Side.set(el,true);return}el.style.width=Math.max(160,Math.min(room(el),w))+'px'}
+  function up(){document.removeEventListener('mousemove',mv);document.removeEventListener('mouseup',up);document.body.classList.remove('drag');sp.classList.remove('on');try{localStorage.setItem(key,parseInt(el.style.width,10))}catch(e){}}
+  document.addEventListener('mousemove',mv);document.addEventListener('mouseup',up)});
+ sp.addEventListener('dblclick',function(){el.style.width='';try{localStorage.removeItem(key)}catch(e){}})}
+/* left panels: drag the edge to resize, drag it all the way left (or press b) to hide; a slim rail brings it back */
+var Side={key:function(el){return 'sv.c.'+el.id},
+ set:function(el,hide){el.classList.toggle('pcol',hide);var sp=el.nextElementSibling,r=el.previousElementSibling;if(sp&&sp.classList.contains('split'))sp.classList.toggle('pcol',hide);if(r&&r.classList.contains('rail'))r.classList.toggle('on',hide);
+  try{localStorage.setItem(this.key(el),hide?'1':'0')}catch(e){};fit()},
+ init:function(sp){if(sp.dataset.side!=='left')return;var el=document.getElementById(sp.dataset.for);if(!el)return;
+  var r=document.createElement('button');r.type='button';r.className='rail';r.title='show the panel (b)';r.textContent='›';el.parentNode.insertBefore(r,el);r.onclick=function(){Side.set(el,false)};
+  var c=document.createElement('button');c.type='button';c.className='pcl';c.title='hide this panel (b)';c.textContent='‹';el.insertBefore(c,el.firstChild);c.onclick=function(){Side.set(el,true)};
+  var g=document.createElement('i');sp.appendChild(g);
+  try{if(localStorage.getItem(Side.key(el))==='1')Side.set(el,true)}catch(e){}},
+ toggle:function(){var p=$('.pane.on');var sp=p&&$('.split[data-side=left]',p);if(!sp)return;var el=document.getElementById(sp.dataset.for);if(el)this.set(el,!el.classList.contains('pcol'))}};
+$$('.split').forEach(function(sp){Side.init(sp);splitter(sp)});
+/* panels that float over the right side (task details, notes): drag the left edge to resize, double-click it to reset; widths kept in this browser */
+/* the full record of one task: every step with its error and backtrace, each step's input and output, the plan's
+   history, related tasks and the log lines that carry the task's ids. Read from the server, or from the page for the
+   newest tasks that did not succeed when there is no server. */
+var TaskFull={cur:null,
+ load:function(t){var box=$('#tfull');if(!box)return;var self=this;this.cur=t.id;
+  if(SERVE){/* the record first: it comes from the tables and is quick; the log search follows and fills its own part */
+   fetch('/task?logs=0&id='+encodeURIComponent(t.id)).then(function(r){return r.json()}).then(function(d){if(self.cur!==t.id||!$('#tfull'))return;self.show(d,t);
+    if(!d.logs_pending)return;
+    fetch('/task?logs=only&id='+encodeURIComponent(t.id)).then(function(r){return r.json()}).then(function(l){if(self.cur===t.id&&$('#tflogs'))$('#tflogs').innerHTML=self.logs(l)}).catch(function(e){if($('#tflogs'))$('#tflogs').innerHTML='<div class="gp">the log search did not answer: '+esc(String(e))+'</div>'})
+   }).catch(function(e){box.innerHTML='<div class="gp">could not read the task: '+esc(String(e))+'</div>'});return}
+  var d=(typeof TASKFULL!=='undefined'&&TASKFULL)?TASKFULL[t.id]:null;
+  if(d)this.show(d,t);else box.innerHTML='<div class="gp">The page written to a file carries the full record only for the newest tasks that did not succeed. Open the report with <span class="cmd">sosview-lite serve</span> to read every task in full.</div>'},
+ n3:function(v){return /^\d+$/.test(String(v))?String(v).replace(/\B(?=(\d{3})+(?!\d))/g,','):String(v)},
+ /* the steps Pulp recorded for one of its tasks, as Katello kept them: name, state, how far each got */
+ psteps:function(st){if(!st||!st.length)return '';var self=this,rows=[['STEP','STATE','DONE / TOTAL']].concat(st.map(function(x){return [x.message||x.code||'?',x.state||'',x.done==null?'':self.n3(x.done)+(x.total!=null?' / '+self.n3(x.total):'')]})),
+  w=[0,1].map(function(i){return Math.max.apply(null,rows.map(function(r){return r[i].length}))}),
+  pad=function(v,n){v=String(v);while(v.length<n)v+=' ';return v},
+  dw=Math.max.apply(null,rows.slice(1).map(function(r){return r[2].split(' / ')[0].length}).concat([0]));
+  return '<div class="lbl">STEPS PULP RECORDED FOR THIS TASK</div><pre class="out">'+esc(rows.map(function(r,i){var d=r[2];if(i){var a=d.split(' / ');a[0]=Array(Math.max(0,dw-a[0].length)+1).join(' ')+a[0];d=a.join(' / ')}return pad(r[0],w[0])+'  '+pad(r[1],w[1])+'  '+d}).join('\n'))+'</pre>'},
+ kv:function(rows){return '<div class="kv">'+rows.map(function(r){return '<span>'+esc(r[0])+'</span><span style="overflow-wrap:anywhere">'+esc(r[1])+'</span>'}).join('')+'</div>'},
+ phase:function(k){return /PlanStep/.test(k)?'plan':/RunStep/.test(k)?'run':/FinalizeStep/.test(k)?'finalize':k},
+ link:function(rel,ln,txt){return SERVE&&rel&&ln?'<a href="#" class="vw" data-view="'+esc(rel+':'+ln)+'">'+esc(txt||'row')+'</a>':''},
+ show:function(d,t){var box=$('#tfull');if(!box)return;if(d.error){box.innerHTML='<div class="gp">'+esc(d.error)+'</div>';return}
+  var self=this,h='',acts={};(d.actions||[]).forEach(function(a){acts[a.id]=a});
+  $$('#td .tshort').forEach(function(x){x.remove()});
+  /* what the data says: the failed steps, the Pulp tasks, the steps not reached */
+  var say=[];(d.steps||[]).forEach(function(s){if(s.error||s.state==='error')say.push('step '+s.id+' ('+s.cls+', '+self.phase(s.kind)+' phase) ended in <b>'+esc(s.state)+'</b>'+(s.real?' after '+esc(s.real)+' s':'')+(s.error?': <span class="ex">'+esc(s.error.cls)+'</span> '+esc(s.error.msg.slice(0,400)):''))});
+  (d.pulp||[]).forEach(function(p){if(p.state&&p.state!=='completed'){say.push('Pulp task '+esc(p.id.slice(0,8))+(p.name?' ('+esc(p.name)+')':'')+' ended <b>'+esc(p.state)+'</b>'+(p['error.description']?': '+esc(p['error.description']):'')+(p['error.traceback']?' (Pulp traceback below)':''));
+   var st=p.steps||[],f=st.filter(function(x){return x.state==='failed'});if(f.length){var c={};st.forEach(function(x){if(x!==f[0])c[x.state]=(c[x.state]||0)+1});
+    say.push('it failed in step <b>'+esc(f[0].message||f[0].code||'?')+'</b>'+(f[0].done!=null?' ('+self.n3(f[0].done)+(f[0].total!=null?' of '+self.n3(f[0].total):'')+' done)':'')+
+     (Object.keys(c).length?'; the other steps: '+Object.keys(c).sort().map(function(k){return c[k]+' '+esc(k)}).join(', '):''))}}});
+  var pend=(d.steps||[]).filter(function(s){return s.state==='pending'});if(pend.length&&say.length)say.push(pend.length+' step'+(pend.length>1?'s':'')+' never ran: '+pend.map(function(s){return s.id+' ('+self.phase(s.kind)+')'}).join(', '));
+  if(say.length)h+='<div class="lbl">WHAT THE DATA SAYS</div><ul class="tsay">'+say.map(function(x){return '<li>'+x+'</li>'}).join('')+'</ul>';
+  if(d.plan&&!t.ended){var pe='';d.plan.info.forEach(function(x){if(x[0]==='ended_at')pe=String(x[1]).slice(0,19)});
+   if(pe&&$('#tend')){$('#tend').innerHTML=esc(pe)+' <span class="gp">from the execution plan; the task row has no end time</span>';var tk=Tasks.dur({started:t.started,ended:pe,state:'stopped',result:t.result});if(tk&&$('#ttook'))$('#ttook').textContent=tk}}
+  if(t.act&&$('#td .kv')&&!$('#tact')){var kv=$('#td .kv'),a=document.createElement('span'),b=document.createElement('span');a.textContent='task';b.id='tact';b.textContent=t.act;b.style.overflowWrap='anywhere';kv.insertBefore(b,kv.firstChild);kv.insertBefore(a,b)}
+  var rqf='';(d.facts||[]).forEach(function(f){if(!rqf&&f[0]==='request id'&&/^[0-9a-f]{8}-/.test(f[1]))rqf=f[1]});
+  if(rqf&&!$('#treq')&&$('#tidv'))$('#tidv').insertAdjacentHTML('afterend',reqKV(rqf));
+  if(d.facts&&d.facts.length){h+='<div class="lbl">FROM THE INPUT AND OUTPUT</div>'+this.kv(d.facts);
+   var rq='';d.facts.forEach(function(f){if(f[0]==='request id'&&/^[0-9a-f]{8}/.test(f[1]))rq=f[1].slice(0,8)});
+   if(rq&&SERVE)h+='<div style="padding:2px 0 6px"><a href="#" class="rid" data-q="'+rq+'" title="the web or API call that started this task, as production.log recorded it">follow this request ('+rq+') ›</a></div>'}
+  if(d.pulp&&d.pulp.length)h+='<div class="lbl">PULP TASKS ('+d.pulp.length+')</div>'+d.pulp.map(function(p){var r=[['id',p.id]];['name','state','started_at','finished_at','error.description','error.traceback'].forEach(function(k){if(p[k])r.push([k,p[k]])});return self.kv(r)+self.psteps(p.steps)}).join('<hr class="tsep">');
+  if(d.steps&&d.steps.length){h+='<div class="lbl">STEPS ('+d.steps.length+')<span class="gp" style="margin-left:8px">click a step for its error, input and output</span></div>';
+   h+=d.steps.map(function(s){var a=acts[s.action]||{},er=s.error;
+    var sum='<summary class="tst'+(er||s.state==='error'?' er':'')+'"><span>'+esc(s.id)+'</span><span>'+esc(s.state)+'</span><span>'+esc(self.phase(s.kind))+'</span><span>'+esc(s.cls)+'</span><span class="gp">'+(s.real?esc(s.real)+' s':'')+'</span></summary>';
+    var b='<div class="tstb">'+self.kv([['started',s.started||'—'],['ended',s.ended||'—'],['real / execution time',(s.real||'—')+' / '+(s.exec||'—')+' s'],['queue',s.queue||'—'],['action',(a.cls||'')+(s.action?' (#'+s.action+')':'')]])+' '+self.link(d.steps_src,s.ln,'step row ›');
+    if(er){b+='<div class="lbl">ERROR</div><pre class="out" style="white-space:pre-wrap">'+(er.cls?'<span class="ex">'+esc(er.cls)+'</span>\n':'')+CZ.line(er.msg)+'</pre>';
+     if(er.bt&&er.bt.length)b+='<details><summary class="gp">backtrace ('+er.bt.length+' lines)</summary><pre class="out" style="white-space:pre-wrap">'+esc(er.bt.join('\n'))+'</pre></details>'}
+    if(a.input)b+='<details'+(er?' open':'')+'><summary class="gp">input</summary><pre class="out">'+esc(a.input)+'</pre></details>';
+    if(a.output)b+='<details'+(er?' open':'')+'><summary class="gp">output</summary><pre class="out">'+esc(a.output)+'</pre></details>';
+    if(a.ln)b+=' '+self.link(d.actions_src,a.ln,'action row ›');
+    return '<details class="tstep"'+(er?' open':'')+'>'+sum+b+'</div></details>'}).join('')}
+  if(d.plan){h+='<div class="lbl">EXECUTION PLAN '+self.link(d.plan.src,d.plan.ln,'row ›')+'</div>'+this.kv(d.plan.info);
+   if(d.plan.history&&d.plan.history.length)h+='<div class="lbl">EXECUTION HISTORY</div><div class="kv">'+d.plan.history.map(function(e){return '<span>'+esc(e[1])+'</span><span>'+esc(e[0])+(e[2]?' <span class="gp">executor '+esc(e[2])+'</span>':'')+'</span>'}).join('')+'</div>'}
+  var sib=d.siblings||[];if(sib.length){var C={};sib.forEach(function(r){C[r.result||r.state]=(C[r.result||r.state]||0)+1});
+   h+='<div class="lbl">OTHER TASKS UNDER THE SAME PARENT ('+sib.length+': '+Object.keys(C).map(function(k){return C[k]+' '+esc(k)}).join(', ')+')</div><div class="sub">'+sib.slice(0,40).map(function(r){return '<a href="#" class="tsel" data-id="'+esc(r.id)+'">'+esc(r.result||r.state)+' · '+esc(r.label)+' · '+esc(r.started)+'</a>'}).join('')+(sib.length>40?'<span class="gp">… '+(sib.length-40)+' more</span>':'')+'</div>'}
+  if(SERVE)h+='<div id="tflogs">'+(d.logs_pending?'<div class="lbl">LOG LINES THAT CARRY THIS TASK\'S IDS</div><div class="gp">searching the logs for this task\'s ids …</div>':this.logs(d))+'</div>';
+  h+='<details><summary class="lbl" style="cursor:pointer">EVERY COLUMN OF THE TASK ROW</summary>'+this.kv(d.task||[])+' '+this.link(d.task_src,d.task_ln,'row ›')+'</details>';
+  if(d.encoded&&d.encoded.length)h+='<div class="gp">'+esc(d.encoded.join(', '))+': stored encoded in this sosreport; decoded here</div>';
+  (d.notes||[]).forEach(function(n){h+='<div class="gp">'+esc(n)+'</div>'});
+  box.innerHTML=h},
+ logs:function(d){if(d.error)return '<div class="gp">'+esc(d.error)+'</div>';var L=d.logs||[],h='<div class="lbl">LOG LINES THAT CARRY THIS TASK\'S IDS ('+L.length+')</div><div class="gp">matched by '+esc((d.logs_by||[]).join(', '))+'</div>';
+   if(L.length){var byf={};L.forEach(function(l){(byf[l.rel]=byf[l.rel]||[]).push(l)});
+    h+=Object.keys(byf).map(function(f){return '<div class="tlogf">'+esc(f)+' ('+byf[f].length+')</div><pre class="out tlog">'+byf[f].slice(0,200).map(function(l){return '<a href="#" class="vw ln" data-view="'+esc(l.rel+':'+l.n)+'">'+esc(String(l.n))+'</a>  '+CZ.line(l.text)}).join('\n')+'</pre>'}).join('')}
+   else h+='<div class="gp">none: the logs that cover this time may not be in the sosreport, or this task wrote nothing under its ids</div>';
+   (d.notes||[]).forEach(function(n){h+='<div class="gp">'+esc(n)+'</div>'});return h}};
+var Edge={near:function(el,e){var r=el.getBoundingClientRect();return e.clientX-r.left<8&&e.clientX>=r.left-2},
+ add:function(el){if(!el)return;var k='sv.w.'+el.id,drag=false;
+  try{var w=localStorage.getItem(k);if(w)el.style.width=w}catch(e){}
+  el.addEventListener('mousemove',function(e){if(drag)return;var n=Edge.near(el,e);el.classList.toggle('edgehot',n)});
+  el.addEventListener('mouseleave',function(){if(!drag)el.classList.remove('edgehot')});
+  el.addEventListener('dblclick',function(e){if(!Edge.near(el,e))return;el.style.width='';try{localStorage.removeItem(k)}catch(x){}});
+  el.addEventListener('mousedown',function(e){if(e.button!==0||!Edge.near(el,e))return;e.preventDefault();drag=true;document.body.classList.add('dragging');
+   function mv(ev){var r=el.getBoundingClientRect(),w=r.right-ev.clientX;el.style.width=Math.max(280,Math.min(window.innerWidth*0.92,w))+'px'}
+   function up(){drag=false;document.body.classList.remove('dragging');el.classList.remove('edgehot');document.removeEventListener('mousemove',mv);document.removeEventListener('mouseup',up);try{localStorage.setItem(k,el.style.width)}catch(x){}}
+   document.addEventListener('mousemove',mv);document.addEventListener('mouseup',up)})}};
+Edge.add($('#td'));Edge.add($('#notes'));
+document.body.dataset.tab=curTab();
+document.addEventListener('keydown',function(e){var tg=e.target.tagName;if(tg==='INPUT'||tg==='TEXTAREA'||tg==='SELECT'||e.ctrlKey||e.metaKey||e.altKey)return;if(e.key==='b')Side.toggle();else if(e.key==='o'&&curTab()==='search')SFold.toggle()});
+/* search options fold away while you scroll the results, and come back at the top; the options button keeps them folded or open */
+var SFold={auto:false,set:function(f){var b=$('.sbox');if(!b)return;b.classList.toggle('folded',f);document.body.classList.toggle('sfold',f);var x=$('#sfold');if(x)x.textContent=f?'options ▾':'options ▴';fit()},
+ is:function(){var b=$('.sbox');return !!(b&&b.classList.contains('folded'))},
+ toggle:function(){var f=!this.is();this.auto=false;this.set(f);try{localStorage.setItem('sv.sfold',f?'1':'0')}catch(e){}}};
+if($('#sfold')){$('#sfold').onclick=function(){SFold.toggle()};try{if(localStorage.getItem('sv.sfold')==='1')SFold.set(true)}catch(e){}
+ var sres=$('#sres');if(sres)sres.addEventListener('scroll',function(){if(!SFold.is()&&sres.scrollTop>80){SFold.auto=true;SFold.set(true)}else if(SFold.auto&&sres.scrollTop===0){SFold.auto=false;SFold.set(false)}},{passive:true})}
+if(SERVE)document.body.classList.add('serve');
+window.svTab=tab;$$('.tabs button').forEach(function(b){b.addEventListener('click',function(){tab(b.dataset.tab)})});document.body.dataset.tab='report';
+function store(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v)}catch(e){return null}}
+/* the Report's two views, when the original script ran: its report and sosview's; the choice is remembered */
+var RV={pane:function(){var p=$('#pane-report');return p&&p.dataset.rv?p:null},
+ set:function(v,keep){var p=this.pane();if(!p)return;p.dataset.rv=v;$$('.rvb').forEach(function(b){b.setAttribute('aria-pressed',b.dataset.rv===v?'true':'false')});if(!keep)store('sv.rv',v);if(typeof fit==='function')fit()},
+ toggle:function(){var p=this.pane();if(p){this.set(p.dataset.rv==='orig'?'own':'orig');window.scrollTo(0,0)}},
+ reveal:function(el){var p=this.pane();if(!p||!el||!el.closest)return;var m=el.closest('[data-rvv]');if(m&&m.dataset.rvv!==p.dataset.rv)this.set(m.dataset.rvv,true)},
+ init:function(){var p=this.pane();if(!p)return;var s=store('sv.rv');this.set(p.dataset.rvdef==='orig'&&(s==='orig'||s==='own')?s:p.dataset.rvdef,true);
+  var h=location.hash&&location.hash.length>1?document.getElementById(location.hash.slice(1)):null;if(h&&h.closest('[data-rvv]')){this.reveal(h);setTimeout(function(){h.scrollIntoView({block:'start'})},0)}var self=this;
+  document.addEventListener('click',function(e){var b=e.target.closest&&e.target.closest('.rvb,.rvb2');if(b){e.preventDefault();self.set(b.dataset.rv);window.scrollTo(0,0);return}
+   var o=e.target.closest&&e.target.closest('a.osame');if(o){e.preventDefault();var t=document.getElementById(o.dataset.b);if(t){self.set('own');t.scrollIntoView({block:'start'});window.scrollBy(0,-70);t.classList.add('flash');setTimeout(function(){t.classList.remove('flash')},1600);setHash('#'+t.id)}return}
+   var a=e.target.closest&&e.target.closest('a[href^="#"]');if(a&&a.getAttribute('href').length>1){var x=document.getElementById(a.getAttribute('href').slice(1));if(x)self.reveal(x)}},true);
+  window.addEventListener('hashchange',function(){var x=location.hash.length>1?document.getElementById(location.hash.slice(1)):null;if(x)self.reveal(x)})}};
+/* notes: blocks, lines, tasks and strings pinned while reading, with your own comments. Kept in this browser, per report;
+   the report is not changed. "copy as text" gives them with file:line references. */
+var Notes=(function(){var host=($('.me strong')||{}).textContent||'',facts=(($('.facts')||{}).textContent||'').split(' · '),src=facts[facts.length-1]||'',
+  KEY='sv.notes.'+host+'.'+((window.TASKS&&TASKS.collected)||src),list=[],open=false;
+ try{list=JSON.parse(store(KEY)||'[]')||[]}catch(e){list=[]}
+ function save(){store(KEY,JSON.stringify(list));count();if(open)draw()}
+ function count(){var a=$('#notesl');if(a&&!a.dataset.f)a.textContent='notes'+(list.length?' ('+list.length+')':'')}
+ function say(m){var a=$('#notesl');if(!a)return;a.dataset.f=1;a.textContent=m;a.classList.add('flash');setTimeout(function(){delete a.dataset.f;a.classList.remove('flash');count()},1400)}
+ function add(n){if(list.some(function(x){return x.key===n.key})){say('already in your notes');return}n.at=new Date().toISOString().slice(0,16).replace('T',' ');n.note='';list.push(n);save();say('pinned · '+list.length+' note'+(list.length===1?'':'s'))}
+ function block(b){var sec=b.closest('.sec'),st=sec&&$('.sh .t',sec);add({k:'block',key:'block:'+b.id,id:b.id,where:(st?st.textContent.replace(/\s+/g,' ').trim():'')+' / '+(($('.bh .t',b)||{}).textContent||'').replace(/^\/\/\s*/,''),text:blockText(b)})}
+ function line(p,ln,t){add({k:'line',key:'line:'+p+':'+ln,file:p,ln:ln,where:p+':'+ln,text:t})}
+ function task(r){add({k:'task',key:'task:'+r.id,id:r.id,where:'task '+r.id+' · '+r.label,text:[r.state+' / '+r.result,'started '+(r.started||'—')+(r.ended?' · ended '+r.ended:''),r.error?'error: '+String(r.error).split('\n')[0]:''].filter(Boolean).join('\n')})}
+ function cmd(c,o){add({k:'command',key:'cmd:'+c,where:'$ '+c,text:o})}
+ function sig(i){var x=SIGS[i];add({k:'string',key:'sig:'+i,i:i,where:'known string',text:x.s+'\none known cause: '+x.c+(x.k?'\nfirst check: '+x.k:'')})}
+ function text(){var o=['sosview notes · '+host+' · '+src+(window.TASKS&&TASKS.collected?' · collected '+TASKS.collected:''),''];
+  list.forEach(function(n,k){o.push((k+1)+'. ['+n.k+'] '+n.where);String(n.text||'').split('\n').slice(0,40).forEach(function(l){o.push('   '+l)});if(n.note)o.push('   note: '+n.note.replace(/\n/g,'\n         '));o.push('')});
+  return o.join('\n')}
+ function go(n){if(n.k==='block'){close();tab('report');var b=document.getElementById(n.id);if(b){RV.reveal(b);b.scrollIntoView({block:'center'});b.classList.add('flash');setTimeout(function(){b.classList.remove('flash')},1600)}}
+  else if(n.k==='line'){if(SERVE&&window.Search){close();tab('search');Search.view(n.file+':'+n.ln)}}
+  else if(n.k==='command'){close();if(window.Run)Run.show(n.where.slice(2))}
+  else if(n.k==='task'){close();Tasks.focus('task',String(n.id))}else if(n.k==='string'){close();Learn.sig(n.i)}}
+ function draw(){var h='<div class="nh"><b>Notes</b><span class="gp">'+list.length+' · kept in this browser for this report</span><span style="margin-left:auto"></span>'+
+   (list.length?'<button type="button" class="btn2" id="ncopy">copy all as text</button><button type="button" class="btn2" id="nclear">clear</button>':'')+'<button type="button" class="tdx" id="nx" title="close (Esc)">✕</button></div>';
+  if(!list.length)h+='<div class="gp" style="padding:10px 2px;line-height:1.7">Nothing pinned yet. Pin a Report block with its <b>pin</b> button or the <b>p</b> key, a line from the file viewer, a task from its details'+($('#pane-learn')?', or a known string in Learn':'')+'.</div>';
+  h+=list.map(function(n,k){return '<div class="nn" data-k="'+k+'"><div class="nt"><span class="ntag">'+esc(n.k)+'</span><a href="#" class="ngo">'+esc(n.where)+'</a><button type="button" class="nrm" title="remove">✕</button></div><pre class="out">'+esc(String(n.text||'').split('\n').slice(0,8).join('\n'))+(String(n.text||'').split('\n').length>8?'\n…':'')+'</pre><textarea class="ncm" rows="2" placeholder="your comment (kept with the note)">'+esc(n.note||'')+'</textarea></div>'}).join('');
+  var el=$('#notes');el.innerHTML=h;
+  $('#nx').onclick=close;if($('#ncopy'))$('#ncopy').onclick=function(){copy(text(),this)};
+  if($('#nclear'))$('#nclear').onclick=function(){if(this.dataset.sure){list=[];save()}else{this.dataset.sure=1;this.textContent='clear all '+list.length+'?'}};
+  $$('#notes .nn').forEach(function(d){var n=list[+d.dataset.k];$('.ngo',d).onclick=function(e){e.preventDefault();go(n)};$('.nrm',d).onclick=function(){list.splice(list.indexOf(n),1);save()};
+   var tm=null;$('.ncm',d).oninput=function(){var v=this.value;clearTimeout(tm);tm=setTimeout(function(){n.note=v;store(KEY,JSON.stringify(list))},300)}})}
+ function show(){open=true;$('#notes').classList.add('on');draw()}
+ function close(){open=false;$('#notes').classList.remove('on')}
+ count();
+ return {block:block,line:line,task:task,sig:sig,cmd:cmd,show:show,close:close,toggle:function(){open?close():show()},isOpen:function(){return open},text:text,count:function(){return list.length}}})();
+window.Notes=Notes;
+/* run: a command line typed here is run by bash in the report directory, and its output is shown as it arrives.
+   The key comes with the address sosview printed; without it the server runs nothing. Nothing typed here is kept
+   after the page is closed. */
+var Run=(function(){if(!SERVE||!$('#run'))return null;
+ var key='',open=false,busy=null,cwd='',root='',hist=[],hi=0,last=null,PATHS=/(^|[\s'"=(\[<>|])((?:\.\/)?(?:etc|var|sos_commands|proc|sys|usr|boot|run|root|sos_logs|sos_reports|lib|opt)\/[\w@%+.,\/-]*[\w@%+\/-])(?::(\d+))?/gm;
+ try{var m=/[?&]k=([\w-]+)/.exec(location.search);if(m){key=m[1];store('sv.k',key);history.replaceState(null,'',location.pathname+location.hash)}else key=store('sv.k')||''}catch(e){}
+ var out=$('#rnout'),q=$('#rnq'),go=$('#rngo');
+ function where(){var w=!cwd||cwd===root?'the report directory':cwd.indexOf(root+'/')===0?'report/'+cwd.slice(root.length+1):cwd;$('#rncwd').textContent='in '+w}
+ function el(tag,cls,txt){var e=document.createElement(tag);if(cls)e.className=cls;if(txt!==undefined)e.textContent=txt;return e}
+ function end(){out.scrollTop=out.scrollHeight}
+ function links(span){if(cwd!==root||span.textContent.length>400000)return;
+  span.innerHTML=esc(span.textContent).replace(PATHS,function(a,pre,p,ln){p=p.replace(/^\.\//,'');return pre+'<a href="#" class="vw" data-view="'+p+':'+(ln||1)+'">'+a.slice(pre.length)+'</a>'})}
+ function status(d){var b=[];if(d.timeout)b.push('stopped after '+Math.round(d.limit/60)+' minutes');else if(d.stopped)b.push('stopped');else if(d.code)b.push('exit '+d.code);
+  if(d.cut)b.push('output cut: '+(d.cut/1048576).toFixed(1)+' MB more was not shown; add | head, or write it to a file');
+  if(b.length||d.ms>=2000)b.push((d.ms/1000).toFixed(1)+' s');return b.join(' · ')}
+ function fail(msg){out.appendChild(el('span','rs e',msg));end()}
+ function done(){busy=null;go.textContent='run';q.disabled=false;if(open)q.focus()}
+ function run(c){c=c.trim();if(!c||busy)return;if(!key){fail('Commands run only in the page opened with the address sosview printed in the terminal (it ends in ?k=...). Open that address once and this button works in every tab.');return}
+  if(hist[hist.length-1]!==c)hist.push(c);hi=hist.length;q.value='';
+  var head=el('span','rc','$ '+c),span=el('span','ro',''),id=Date.now().toString(36)+Math.random().toString(36).slice(2,8),ac=window.AbortController?new AbortController():null;
+  out.appendChild(head);out.appendChild(span);end();busy={id:id,ac:ac};go.textContent='stop';last={cmd:c,span:span};
+  var buf='',fin=false;
+  function line(l){if(!l)return;var d;try{d=JSON.parse(l)}catch(e){return}
+   if(d.start){root=d.start.root;if(!cwd)cwd=d.start.cwd}
+   else if(d.o!==undefined){var stick=out.scrollTop+out.clientHeight>=out.scrollHeight-40;span.appendChild(document.createTextNode(d.o));if(stick)end()}
+   else if(d.done){fin=true;if(span.textContent&&!/\n$/.test(span.textContent))span.appendChild(document.createTextNode('\n'));links(span);root=d.done.root;cwd=d.done.cwd;where();var s=status(d.done);out.appendChild(el('span','rs'+(d.done.code||d.done.cut||d.done.timeout?' e':''),s));end()}
+   else if(d.error)fail(d.error)}
+  fetch('/run',{method:'POST',headers:{'Content-Type':'application/json','X-Sosview-Key':key},body:JSON.stringify({cmd:c,cwd:cwd,id:id}),signal:ac?ac.signal:undefined}).then(function(r){
+   if(!r.body||!r.body.getReader||(r.headers.get('Content-Type')||'').indexOf('ndjson')<0)return r.text().then(function(t){t.split('\n').forEach(line)});
+   var rd=r.body.getReader(),td=new TextDecoder();
+   function pump(){return rd.read().then(function(x){if(x.done){line(buf);return}buf+=td.decode(x.value,{stream:true});var i;while((i=buf.indexOf('\n'))>=0){line(buf.slice(0,i));buf=buf.slice(i+1)}return pump()})}
+   return pump()}).catch(function(e){if(!fin)fail(e&&e.name==='AbortError'?'stopped':'the connection to sosview was lost: '+(e&&e.message||e))}).then(function(){if(!fin&&!$('.rs',out))fail('no answer');done()})}
+ function stop(){if(!busy)return;fetch('/run/stop',{method:'POST',headers:{'Content-Type':'application/json','X-Sosview-Key':key},body:JSON.stringify({id:busy.id})}).catch(function(){})}
+ function show(c){open=true;$('#run').classList.add('on');$('#runl').setAttribute('aria-expanded','true');where();if(c!==undefined&&typeof c==='string')q.value=c;setTimeout(function(){q.focus()},0)}
+ function close(){open=false;$('#run').classList.remove('on');$('#runl').setAttribute('aria-expanded','false')}
+ $('#runl').onclick=function(){open?close():show()};$('#rnx').onclick=close;
+ $('#rnf').onsubmit=function(e){e.preventDefault();busy?stop():run(q.value)};
+ $('#rnclear').onclick=function(){out.textContent='';last=null;q.focus()};
+ $('#rncopy').onclick=function(){copy(out.textContent,this)};
+ $('#rnpin').onclick=function(){if(last)Notes.cmd(last.cmd,last.span.textContent.replace(/\n$/,''))};
+ out.addEventListener('click',function(e){if(e.target.closest&&e.target.closest('.vw'))close()},true);
+ q.addEventListener('keydown',function(e){
+  if(e.key==='ArrowUp'&&hist.length){e.preventDefault();hi=Math.max(0,hi-1);q.value=hist[hi]}
+  else if(e.key==='ArrowDown'&&hist.length){e.preventDefault();hi=Math.min(hist.length,hi+1);q.value=hist[hi]||''}
+  else if(e.key==='c'&&e.ctrlKey&&busy&&q.selectionStart===q.selectionEnd){e.preventDefault();stop()}
+  else if(e.key==='Escape'){e.stopPropagation();close();$('#runl').focus()}});
+ document.addEventListener('keydown',function(e){var tg=e.target.tagName;if(e.ctrlKey||e.metaKey||e.altKey)return;
+  if(e.key==='Escape'&&open&&tg!=='INPUT'&&tg!=='TEXTAREA'&&tg!=='SELECT')close();
+  else if(e.key==='`'&&tg!=='INPUT'&&tg!=='TEXTAREA'&&tg!=='SELECT'){e.preventDefault();open?close():show()}});
+ return {show:show,close:close,isOpen:function(){return open}}})();
+window.Run=Run;
+/* theme: neon (as the page is written), dark, light or inferno (t); remembered in this browser */
+var Theme={list:['neon','dark','light','inferno'],cur:function(){return document.documentElement.getAttribute('data-theme')||'dark'},
+ set:function(t){if(t==='dark')document.documentElement.removeAttribute('data-theme');else document.documentElement.setAttribute('data-theme',t);store('sv.theme',t);var a=$('#themel');if(a)a.textContent='theme: '+t;fit()},
+ cycle:function(){var l=this.list;this.set(l[(l.indexOf(this.cur())+1)%l.length])}};
+if($('#themel')){$('#themel').textContent='theme: '+Theme.cur();$('#themel').onclick=function(e){e.preventDefault();Theme.cycle()}}
+document.addEventListener('keydown',function(e){var tg=e.target.tagName;if(tg==='INPUT'||tg==='TEXTAREA'||tg==='SELECT'||e.ctrlKey||e.metaKey||e.altKey)return;if(e.key==='t'&&$('#themel'))Theme.cycle()});
+/* view: standard (as written) or clean (v); remembered in this browser. The clean view is built from the standard
+   one in the page: output that lines up in columns becomes a table, runs of rows that differ in one column fold
+   into one, short blocks sit side by side, and blocks whose file is missing become one line per section. */
+function origText(el){var w=document.createTreeWalker(el,NodeFilter.SHOW_TEXT,null,false),x,o='';while((x=w.nextNode()))o+=(x.__orig!==undefined?x.__orig:x.data);return o}
+var Tab={
+ num:/^[-+]?(\d{1,3}(,\d{3})+|\d+)(\.\d+)?\s?([KMGTP]i?B?|[kmgtp]B|%|ms|s)?$/,
+ cut:function(L,data){
+  /* column cuts: runs of positions that are blank in every line (past the end counts as blank) */
+  var w=0,i,j;L.forEach(function(l){w=Math.max(w,l.length)});var bl=[];for(i=0;i<w;i++){var b=true;for(j=0;j<L.length;j++){var c=L[j].charAt(i);if(c&&c!==' '){b=false;break}}bl.push(b)}
+  var cuts=[];i=0;while(i<w&&bl[i])i++;while(i<w){if(bl[i]){var a=i;while(i<w&&bl[i])i++;if(i<w)cuts.push([a,i])}else i++}
+  return cuts},
+ split:function(l,cuts){var r=[],s=0;cuts.forEach(function(c){r.push(l.slice(s,c[0]).trim());s=c[1]});r.push(l.slice(s).trim());return r},
+ lines:function(p){
+  /* the lines of an output block, each with its link (to the file line or a task) and its ? button, if any */
+  var out=[{t:'',a:null,b:null}],ok=true;
+  var text=function(v){var ps=v.split('\n');out[out.length-1].t+=ps[0];for(var i=1;i<ps.length;i++)out.push({t:ps[i],a:null,b:null})};
+  Array.prototype.forEach.call(p.childNodes,function(n){if(!ok)return;if(n.nodeType===3){text(n.__orig!==undefined?n.__orig:n.data);return}if(n.nodeType!==1){return}
+   var cur=out[out.length-1],v=origText(n);
+   if(n.tagName==='A'&&/\b(ln|vw|tk)\b/.test(n.className)&&v.indexOf('\n')<0&&!cur.a){cur.a=n;cur.t+=v}
+   else if(n.tagName==='BUTTON'&&n.classList.contains('kn')&&!cur.b){cur.b=n}
+   else if(n.tagName==='SPAN'&&!n.querySelector('a,button'))text(v);else ok=false});
+  return ok?out:null},
+ make:function(p){
+  if(p.querySelector('details,summary,input'))return null;
+  var LI=this.lines(p);if(!LI)return null;while(LI.length&&!LI[LI.length-1].t.trim())LI.pop();
+  if(LI.length<2||LI.length>400)return null;for(var i=0;i<LI.length;i++)if(LI[i].t.length>400||LI[i].t.indexOf('\t')>=0)return null;
+  var head=null,rows,dash=/^[\s\-+=|]+$/,self=this,RL;
+  var PL=LI.filter(function(o){return o.t.trim()&&!dash.test(o.t)}),pl=PL.map(function(o){return o.t}),pc=pl.map(function(l){return (l.match(/\|/g)||[]).length});
+  if(pl.length>=2&&pc[0]>=2&&pc.every(function(c){return c===pc[0]})){
+   rows=pl.map(function(l){return l.split('|').map(function(c){return c.trim()})});RL=PL.slice();
+   var keep=rows[0].map(function(_,j){return rows.some(function(r){return r[j]!==''})});rows=rows.map(function(r){return r.filter(function(_,j){return keep[j]})});
+   if(!/\d/.test(pl[0])&&pl.slice(1).some(function(l){return /\d/.test(l)})){head=rows.shift();RL.shift()}}
+  else if(LI.filter(function(o){return o.t.trim()}).every(function(o){return /^\s*[A-Za-z][\w .\/()-]{0,30}:\s+\S/.test(o.t)})&&LI.filter(function(o){return o.t.trim()}).length>=2){
+   RL=LI.filter(function(o){return o.t.trim()});rows=RL.map(function(o){var m=/^\s*([^:]+):\s+(.*)$/.exec(o.t);return [m[1].trim(),m[2].trim()]})}
+  else{
+   LI.forEach(function(o){o.t=o.t.replace(/^● /,'  ')});
+   var DO=LI.filter(function(o){return o.t.trim()}),D=DO.map(function(o){return o.t});if(D.length<2)return null;
+   var h0=D[0];if(D.length>=3&&((!/\d/.test(h0)&&D.slice(1).some(function(l){return /\d/.test(l)}))||/^[\sA-Z%\/()._-]+$/.test(h0)&&/[A-Z]{3}/.test(h0)))head=h0;
+   var data=head?D.slice(1):D;RL=head?DO.slice(1):DO;
+   /* indentation must be the same kind on every row (numbers right-aligned are fine) */
+   var ind=data.map(function(l){return /^\s+\S/.test(l)?(/^\s+[\d,.]+\s/.test(l)?'n':'i'):'f'});
+   if(ind.indexOf('i')>=0&&ind.indexOf('f')>=0)return null;
+   var cuts=this.cut(head?[head].concat(data):data);if(!cuts.length)return null;
+   /* drop weak cuts (one blank wide) unless both neighbours are single words, and cuts whose next column is mostly empty */
+   var changed=true,n=data.length,need=n<=3?1:Math.ceil(n*0.4);
+   while(changed&&cuts.length){changed=false;var cells=data.map(function(l){return self.split(l,cuts)});
+    for(var k=0;k<cuts.length;k++){var right=cells.filter(function(r){return r[k+1]!==''}).length;
+     var weak=(cuts[k][1]-cuts[k][0])<2&&cells.some(function(r){return / /.test(r[k])||/ /.test(r[k+1])});
+     if(cells.every(function(r){return /^\d{4}-\d\d-\d\d$/.test(r[k])&&/^\d\d:\d\d(:\d\d)?$/.test(r[k+1])}))weak=true;
+     if(right<need||weak){cuts.splice(k,1);changed=true;break}}}
+   if(!cuts.length)return null;
+   rows=data.map(function(l){return self.split(l,cuts)});if(head){head=this.split(head,cuts);if(head.every(function(c){return !c}))head=null}}
+  var nc=rows[0].length;if(nc<2||rows.some(function(r){return r.length!==nc})||(head&&head.length!==nc))return null;
+  /* a first line is a header only if it is in capitals or names a column whose values are all numbers */
+  if(head&&/[a-z]/.test(head.join(''))){var hn=false;for(var q=0;q<nc;q++)if(head[q]&&!self.num.test(head[q])&&rows.every(function(r){return r[q]===''||self.num.test(r[q])})&&rows.some(function(r){return r[q]!==''}))hn=true;
+   if(!hn){rows.unshift(head);RL.unshift(LI.filter(function(o){return o.t.trim()})[0]);head=null}}
+  if(rows.length<2)return null;
+  /* numeric columns align right; a leading count column gets a bar */
+  var isn=[];for(var j=0;j<nc;j++)isn.push(rows.every(function(r){return r[j]===''||self.num.test(r[j])})&&rows.some(function(r){return r[j]!==''}));
+  var cnt=isn[0]&&rows.every(function(r){return /^[\d,]+$/.test(r[0])})&&rows.length>=2,mx=0;
+  if(cnt)rows.forEach(function(r){mx=Math.max(mx,+r[0].replace(/,/g,''))});
+  /* fold runs of 4+ rows that differ in one column only */
+  var fold=null;if(rows.length>=6){var best=0;for(j=0;j<nc;j++){var tot=0,runs=[],s=0;for(i=1;i<=rows.length;i++){var same=i<rows.length&&rows[i].every(function(c,q){return q===j||c===rows[s][q]});if(!same){if(i-s>=4){runs.push([s,i]);tot+=i-s}s=i}}if(tot>best){best=tot;fold={col:j,runs:runs}}}}
+  var e=function(v){return String(v).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})};
+  /* a column drawn with block characters becomes a bar */
+  var blk=/^[█▉▊▋▌▍▎▏]+$/,bcol=-1,bmx=0;for(j=0;j<nc;j++)if(rows.every(function(r){return r[j]===''||blk.test(r[j])})&&rows.some(function(r){return r[j]!==''})){bcol=j;rows.forEach(function(r){bmx=Math.max(bmx,r[j].length)})}
+  var lc=function(r){for(var q=0;q<r.length;q++)if(r[q]!==''&&!isn[q])return q;return 0};
+  var nw=[];for(j=0;j<nc;j++)nw.push(rows.every(function(r){return r[j].length<=40}));
+  var td=function(v,j,ri){var c=isn[j]?' class="r'+(cnt&&j===0?' cz-num':'')+'"':(nw[j]?' class="nw"':'');var pm=/^(\d{1,3})%$/.exec(v),o=RL[ri]||{},r=rows[ri],inner;
+   if(j===bcol)return '<td class="bc">'+(v?'<span class="vbar" style="width:'+Math.max(2,Math.round(100*v.length/(bmx||1)))+'%"></span>':'')+'</td>';
+   if(o.a&&j===lc(r)){var a=o.a.cloneNode(false);a.textContent=v;inner=a.outerHTML}else inner=e(v);
+   if(o.b&&j===r.length-1)inner+=' '+o.b.cloneNode(true).outerHTML;
+   return '<td'+c+'>'+inner+(pm&&+pm[1]<=100?'<span class="pb"><i style="width:'+pm[1]+'%"></i></span>':'')+'</td>'};
+  var bar=function(r){return cnt?'<td class="bc"><span class="vbar" style="width:'+Math.max(2,Math.round(100*(+r[0].replace(/,/g,''))/(mx||1)))+'%"></span></td>':''};
+  var h='<table class="vt">';if(head)h+='<thead><tr>'+head.map(function(c,j){return '<th'+(isn[j]?' class="r"':'')+'>'+e(c)+'</th>'}).join('')+(cnt?'<th></th>':'')+'</tr></thead>';
+  h+='<tbody>';var g=0,inrun={};if(fold)fold.runs.forEach(function(r){for(var q=r[0];q<r[1];q++)inrun[q]=r});
+  for(i=0;i<rows.length;i++){var r=rows[i],ru=inrun[i];
+   if(ru&&ru[0]===i){g++;var cnum=ru[1]-ru[0],first=rows[ru[0]][fold.col],last=rows[ru[1]-1][fold.col];
+    h+='<tr class="fs">'+r.map(function(c,j){return j===fold.col?'<td>'+e(first)+' … '+e(last)+' <button type="button" class="fold" data-g="'+g+'" title="show or hide these rows">'+cnum+' rows ▸</button></td>':td(c,j,i)}).join('')+bar(r)+'</tr>'}
+   h+='<tr'+(ru?' class="fr" data-g="'+g+'"':'')+'>'+r.map(function(c,j){return td(c,j,i)}).join('')+bar(r)+'</tr>'}
+  h+='</tbody></table>';var d=document.createElement('div');d.className='vtw';d.innerHTML=h;return d}};
+var View={cur:function(){return document.documentElement.getAttribute('data-layout')==='clean'?'clean':'standard'},built:false,
+ titles:function(on){/* the // before block titles: off in the clean view, back as it was in the standard view */
+  $$('#pane-report .blk:not(.oblk) .bh .t').forEach(function(t){var f=t.firstChild;if(!f||f.nodeType!==3)return;
+   if(on&&f.data.indexOf('// ')===0){f.data=f.data.slice(3);if(f.__orig!==undefined)f.__orig=f.__orig.replace(/^\/\/ /,'');t.dataset.sl='1'}
+   else if(!on&&t.dataset.sl){f.data='// '+f.data;if(f.__orig!==undefined)f.__orig='// '+f.__orig;delete t.dataset.sl}})},
+ set:function(v){var b=this.cur()==='clean'?$$('.blk.cur')[0]:null;if(v==='clean'){this.build();this.titles(true);document.documentElement.setAttribute('data-layout','clean')}else{this.titles(false);document.documentElement.removeAttribute('data-layout')}
+  store('sv.view',v);var a=$('#viewl');if(a)a.textContent='view: '+v;if(b)b.scrollIntoView({block:'start'})},
+ toggle:function(){this.set(this.cur()==='clean'?'standard':'clean')},
+ shortb:function(b){if(b.classList.contains('quiet')||b.querySelector('details,.tlg,.tl'))return false;var p=b.querySelector('pre.out');if(!p)return !!b.querySelector('div.nc');var ls=origText(p).replace(/\s+$/,'').split('\n'),w=0;if(ls.length>9)return false;ls.forEach(function(l){w=Math.max(w,l.length)});return w<=78},
+ build:function(){if(this.built)return;this.built=true;var self=this;
+  $$('#pane-report section.sec:not(.osec)').forEach(function(sec){
+   $$('.blk:not(.nc) pre.out',sec).forEach(function(p){try{var t=Tab.make(p);if(t){p.classList.add('tabd');p.parentNode.insertBefore(t,p.nextSibling)}}catch(err){}});
+   var nc=$$('.blk.nc',sec),all=$$('.blk',sec).length;
+   if(nc.length){var d=document.createElement('div');d.className='ncsum';d.appendChild(document.createTextNode(nc.length===all?'nothing from this section is in this sosreport: ':'not in this sosreport: '));
+    nc.forEach(function(b){var c=document.createElement('code'),t=b.querySelector('.bh .t'),m=b.querySelector('div.nc');c.textContent=t?origText(t).replace(/^\/\/ /,''):'';c.title=m?origText(m).replace(/^\(not collected\)\s*/,''):'';d.appendChild(c)});sec.appendChild(d)}
+   var prev=null;$$('.blk:not(.nc)',sec).forEach(function(b){var s=self.shortb(b);if(s&&prev){prev.classList.add('half');b.classList.add('half');prev=null}else prev=s?b:null})})}};
+document.addEventListener('click',function(e){var f=e.target.closest&&e.target.closest('button.fold');if(!f)return;var t=f.closest('table');var open=!f.classList.contains('on');f.classList.toggle('on',open);
+ $$('tr.fr[data-g="'+f.dataset.g+'"]',t).forEach(function(r){r.classList.toggle('open',open)});f.textContent=f.textContent.replace(/[▸▾]/,open?'▾':'▸')});
+if(View.cur()==='clean'){View.build();View.titles(true)}
+if($('#viewl')){$('#viewl').textContent='view: '+View.cur();$('#viewl').onclick=function(e){e.preventDefault();View.toggle()}}
+document.addEventListener('keydown',function(e){var tg=e.target.tagName;if(tg==='INPUT'||tg==='TEXTAREA'||tg==='SELECT'||e.ctrlKey||e.metaKey||e.altKey)return;if(e.key==='v')View.toggle()});
+/* ? : every keyboard shortcut, by tab */
+var Keys={html:function(){var g=[['Everywhere',[['/','search the logs'],['1 – 4','Report, Tasks, Search, Learn'],['N','your notes'],['`','run a command line in the report directory'],['c','colours on or off'],['t','theme: neon, dark, light, inferno'],['v','view: standard or clean'],['?','this list'],['Esc','close a panel, or back']]],
+  ['Report',[['b','hide or show the sections panel'],['j / k','next / previous block'],['[ / ]','previous / next section'],['y / Y','copy the command / the whole block'],['p','pin the block to your notes'],['w','wrap long lines'],['o','original script / sosview, when the original ran']]],
+  ['Search',[['Enter','search'],['o','fold or open the search options'],['b','hide or show the files panel'],['n / p','next / previous match in the viewer']]],
+  ['Tasks',[['click a row','its details'],['Esc','close the details']]],['Learn',[['type','search all of Learn'],['↑ ↓ Enter','choose a result'],['Esc','back to Start here']]]];
+  if(!$('#pane-learn')){g.pop();g[0][1]=g[0][1].filter(function(k){return k[0]!=='t'});g[0][1][1]=['1 – 3','Report, Tasks, Search']}
+  return '<div class="kh"><b>Keyboard shortcuts</b><button type="button" class="tdx" id="kx" title="close (Esc)">✕</button></div><div class="kg">'+g.map(function(x){return '<div><div class="lbl">'+esc(x[0].toUpperCase())+'</div>'+x[1].map(function(k){return '<div class="kr"><kbd>'+esc(k[0])+'</kbd><span>'+esc(k[1])+'</span></div>'}).join('')+'</div>'}).join('')+'</div>'},
+ open:false,toggle:function(){var el=$('#keys');if(!el)return;this.open=!this.open;if(this.open){el.innerHTML=this.html();$('#kx').onclick=function(){Keys.toggle()}}el.classList.toggle('on',this.open)}};
+document.addEventListener('keydown',function(e){var tg=e.target.tagName;if(tg==='INPUT'||tg==='TEXTAREA'||tg==='SELECT')return;
+ if(e.key==='?'){e.preventDefault();Keys.toggle()}else if(e.key==='Escape'&&Keys.open){Keys.toggle()}});
+if($('#notesl'))$('#notesl').onclick=function(e){e.preventDefault();Notes.toggle()};
+document.addEventListener('click',function(e){var b=e.target.closest?e.target.closest('.pin'):null;if(!b)return;e.preventDefault();e.stopPropagation();
+ if(b.dataset.pinSig!==undefined){Notes.sig(+b.dataset.pinSig);return}var blk=b.closest('.blk');if(blk)Notes.block(blk)},true);
+/* report tools: hide not collected, expand all, wrap */
+if($('#hidenc')){$('#hidenc').checked=store('sv.hidenc')==='1';document.body.classList.toggle('hidenc',$('#hidenc').checked);
+ $('#hidenc').onchange=function(){document.body.classList.toggle('hidenc',this.checked);store('sv.hidenc',this.checked?'1':'0')}}
+document.body.classList.toggle('wrap',store('sv.wrap')==='1');
+function wrapToggle(){var on=!document.body.classList.contains('wrap');document.body.classList.toggle('wrap',on);store('sv.wrap',on?'1':'0')}
+if($('#wrapt'))$('#wrapt').onclick=function(e){e.preventDefault();wrapToggle()};
+if($('#xall'))$('#xall').onclick=function(e){e.preventDefault();var open=this.textContent==='expand all';$$('.pane[data-pane=report] details:not(.dsp)').forEach(function(d){d.open=open});$$('.blk.quiet').forEach(function(b){b.classList.toggle('open',open)});$$('.cmd.long').forEach(function(c){c.classList.toggle('open',open)});this.textContent=open?'collapse all':'expand all'};
+document.addEventListener('click',function(e){var t=e.target;if(!t.closest)return;
+ var bh=t.closest('.blk.quiet .bh');if(bh&&!t.closest('button,a')){bh.parentNode.classList.toggle('open');return}
+ var c=t.closest('.cmd.long');if(c&&!String(window.getSelection())){c.classList.toggle('open');return}
+ var d=$('#dsp');if(d&&d.open&&!t.closest('#dsp'))d.open=false});
+function openQuiet(){var h=location.hash,b=/^#b\d\d-\d+$/.test(h)?document.getElementById(h.slice(1)):null;if(b&&b.classList.contains('quiet'))b.classList.add('open');var d=b&&b.closest('details');if(d&&!d.open){d.open=true;b.scrollIntoView({block:'start'})}}
+RV.init();window.addEventListener('hashchange',openQuiet);openQuiet();
+function blockText(b){var t=($('.bh .t',b)||{}).textContent||'',c=$$('.cmd',b).map(function(x){return x.textContent}).join('\n'),o=$$('pre.out',b).map(function(p){var x=p.cloneNode(true);$$('.pkd',x).forEach(function(d){d.remove()});return x.textContent}).join('\n'),n=$('.nc',b),af=$$('.oafter',b).map(function(x){return x.textContent}).join('\n');
+ return t+'\n'+(c?c+'\n':'')+(o||(n?n.textContent:''))+'\n'+(af?af+'\n':'')}
+/* report: index highlight, copy, learn links */
+var secs=$$('.sec'),links={};$$('.idx a').forEach(function(a){links[a.dataset.sec]=a});
+if('IntersectionObserver' in window){var io=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){$$('.idx a.cur').forEach(function(a){a.classList.remove('cur')});var l=links[e.target.id];if(l)l.classList.add('cur')}})},{rootMargin:'-60px 0px -70% 0px'});secs.forEach(function(s){io.observe(s)})}
+function copy(t,btn){function ok(){if(btn){var o=btn.textContent;btn.textContent='copied';setTimeout(function(){btn.textContent=o},1200)}}
+ if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(ok,fb)}else fb();
+ function fb(){var ta=document.createElement('textarea');ta.value=t;document.body.appendChild(ta);ta.select();try{document.execCommand('copy');ok()}catch(e){}document.body.removeChild(ta)}}
+/* a message counted in the report, or in Search's distinct messages: search the logs for it, with ids and numbers as wildcards */
+function msgRegex(m){var r=m.replace(/\s+$/,'').slice(0,120).replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+ return r.replace(/\bUUID\b/g,'[0-9a-fA-F-]{36}').replace(/\bIP\b/g,'[0-9a-fA-F.:]+').replace(/\bHEX\b/g,'[0-9a-fA-F]+').replace(/\bTIME\b/g,'(?:\\d{4}-\\d{2}-\\d{2}[T ])?\\d{1,2}:\\d{2}:\\d{2}(?:[.,]\\d+)?(?:\\s?(?:Z|UTC|[+-]\\d{2}:?\\d{2}))?').replace(/\bDATE\b/g,'\\d{4}-\\d{2}-\\d{2}').replace(/\bN\b/g,'\\d+').replace(/\bHOST\b/g,'[\\w.-]+').replace(/\bID\b/g,'[^\\]]*').replace(/…/g,'.*?').replace(/\\\[([IWEDF])\\\|(\w+)\\\]/g,'\\[$1\\|$2\\|[^\\]]*\\]')}
+function searchFor(q,opts){if(!SERVE||!window.Search)return;opts=opts||{};tab('search');Search.init();$('#q').value=q;$('#o_ww').checked=false;Search.setMode('re');$('#o_cs').checked=!!opts.cs;
+ $('#o_from').value=opts.from||'';$('#o_to').value=opts.to||'';Search.onlyFile=opts.only||null;Search.linkQ=opts.only?q:null;Search.linkFrom=opts.only?(opts.from||''):null;Search.linkTo=opts.only?(opts.to||''):null;Search.pendingView=opts.view||null;Search.pendingFrom=opts.back||null;
+ if(opts.preset&&$('#preset').value!==opts.preset){$('#preset').value=opts.preset;Search.ready=Search.loadFiles()}Search.run()}
+/* timeline: an hour of a row searches that row's log for that hour */
+(function(){var tl=$('#tlr');if(!tl)return;try{if(localStorage.getItem('sv.tl')==='0')tl.open=false}catch(e){}tl.addEventListener('toggle',function(){if(tl._auto){tl._auto=false;return}store('sv.tl',tl.open?'1':'0')})})();
+/* timeline: a day of the week table opens underneath, hour by hour */
+var TL={sel:function(d){var t=$('#tlr');if(!t||!d)return;var p=$('.tlday[data-d="'+d+'"]',t);if(!p)return;$$('.tlday',t).forEach(function(x){x.hidden=x!==p});$$('.tday',t).forEach(function(x){x.classList.toggle('on',x.dataset.d===d)});$$('.tdc',t).forEach(function(x){x.classList.toggle('sel',x.dataset.d===d)})}};
+function dayFocus(d){if(d)TL.sel(d)}
+$$('#tlr .tday,#tlr .tdc').forEach(function(x){x.addEventListener('click',function(){TL.sel(x.dataset.d)})});
+$$('#tlr .tday2').forEach(function(x){x.addEventListener('click',function(e){e.preventDefault();var d=x.dataset.d,b=$('.quick .chip[data-q]');
+ var q=b?b.dataset.q:'error';if($('#o_x'))$('#o_x').value=b&&b.dataset.x?b.dataset.x:'';searchFor(q,{cs:b?b.dataset.cs==='1':false,from:d+' 00:00',to:d+' 23:59:59'})})});
+$$('.tlc.tq').forEach(function(row){row.addEventListener('click',function(e){var c=e.target.closest('i');if(!c||!/v[1-5]/.test(c.className))return;
+ var g=row.closest('.tlg'),h0=new Date(g.dataset.s.replace(' ','T')+':00Z').getTime()+(+c.dataset.k)*3600000,u0=h0-(+g.dataset.off||0)*60000,f=function(x){return new Date(x).toISOString().slice(0,16).replace('T',' ')};
+ Tasks.focus('taskhour',JSON.stringify({a:f(u0),b:f(u0+3600000),k:row.dataset.t,host:f(h0)}))})});
+/* the status bar of the inferno theme: a number goes to where it comes from in the Report */
+$$('#hud a').forEach(function(a){a.addEventListener('click',function(e){e.preventDefault();var el=document.getElementById(a.getAttribute('href').slice(1));if(!el)return;
+ tab('report');RV.reveal(el);if(el.classList.contains('quiet'))el.classList.add('open');var d=el.closest('details');if(d&&!d.open)d.open=true;
+ el.scrollIntoView({block:'start'});el.classList.add('flash');setTimeout(function(){el.classList.remove('flash')},1600);setHash('#'+el.id)})});
+/* a row with no log to search (configuration files changed): an hour goes to that block in the Report, with the lines of that hour marked */
+$$('.tlc.tb').forEach(function(row){row.addEventListener('click',function(e){var c=e.target.closest('i');if(!c||!/v[1-5]/.test(c.className))return;
+ var s0=row.closest('.tlg').dataset.s,t0=new Date(s0.replace(' ','T')+':00Z').getTime()+(+c.dataset.k)*3600000,hk=new Date(t0).toISOString().slice(0,13).replace('T',' ');
+ var b=document.getElementById(row.dataset.b);if(!b)return;tab('report');RV.reveal(b);if(b.classList.contains('quiet'))b.classList.add('open');
+ var d=b.closest('details');if(d&&!d.open)d.open=true;
+ $$('.hl.tlhit').forEach(function(x){x.classList.remove('tlhit')});var hits=$$('.hl[data-h="'+hk+'"]',b);
+ hits.forEach(function(x){x.classList.add('tlhit');var dd=x.closest('details');if(dd&&!dd.open)dd.open=true});
+ var m=$('.tlmsg',b);if(!m){m=document.createElement('div');m.className='tlmsg';var bh=$('.bh',b);bh.parentNode.insertBefore(m,bh.nextSibling)}
+ m.textContent='from the timeline: '+hk+':00 to '+hk.slice(11)+':59 · '+(hits.length?hits.length+(hits.length===1?' file is':' files are')+' marked below':'no line of its own here: the files of that hour are among those rewritten by programs on their own (the last line), or past the lines shown');
+ (hits[0]||b).scrollIntoView({block:'center'});b.classList.add('flash');setTimeout(function(){b.classList.remove('flash')},1600);setHash('#'+b.id)})});
+$$('.tlc.qable:not(.tq):not(.tb)').forEach(function(row){row.addEventListener('click',function(e){var c=e.target.closest('i');if(!c||!/v[1-5]/.test(c.className))return;
+ var s0=row.closest('.tlg').dataset.s,t0=new Date(s0.replace(' ','T')+':00Z').getTime()+(+c.dataset.k)*3600000,f=function(x){return new Date(x).toISOString().slice(0,16).replace('T',' ')};
+ searchFor(row.dataset.q,{cs:true,from:f(t0),to:f(t0+3599000).slice(11)+':59',only:row.dataset.f,preset:'everything'})})});
+window.searchFor=searchFor;window.msgRegex=msgRegex;
+/* An id opens in its own panel at the side: the search box, its results and the viewer stay as they were.
+   A request id: the request as production.log tells it, then the same id in the other logs and the Pulp tasks.
+   Another UUID: every line that holds it, grouped by text in each log. 'search every line' puts it in the search box. */
+var IdP={stack:[],el:null,
+ box:function(){if(this.el)return this.el;var d=document.createElement('aside');d.className='idp';d.id='idp';d.setAttribute('role','dialog');d.setAttribute('aria-label','id');
+  d.innerHTML='<div class="idh"><button type="button" class="btn2" id="idback" hidden>‹ back</button><b id="idt"></b><span class="gp" id="idk"></span>'+
+   '<button type="button" class="btn2" id="idsrch" title="put this id in the search box, with every line that holds it">search every line</button><button type="button" class="tdx" id="idx" title="close (Esc)">✕</button></div><div class="idb" id="idb" tabindex="0"></div>';
+  document.body.appendChild(d);var self=this;
+  $('#idx').onclick=function(){self.close()};$('#idback').onclick=function(){self.stack.pop();var p=self.stack.pop();if(p)self.open(p)};
+  $('#idsrch').onclick=function(){var id=self.stack[self.stack.length-1];self.close();if(id)searchFor(id,{cs:0})};
+  d.addEventListener('keydown',function(e){if(e.key==='Escape'){e.stopPropagation();self.close()}});
+  return this.el=d},
+ open:function(id){if(!SERVE||!id)return;var d=this.box(),self=this;id=String(id).toLowerCase();if(this.stack[this.stack.length-1]!==id)this.stack.push(id);
+  d.classList.add('on');$('#idt').textContent=id;$('#idk').textContent=/^[0-9a-f]{8}$/.test(id)?'request':'id';$('#idback').hidden=this.stack.length<2;
+  $('#idb').innerHTML='<div class="nc">looking through the logs…</div>';$('#idb').focus();
+  fetch('/request?id='+encodeURIComponent(id)).then(function(r){return r.json()}).then(function(r){if(self.stack[self.stack.length-1]!==id)return;
+   var h=r.error?'<div class="nc">'+esc(r.error)+'</div>':Search.reqCard(r,true);
+   var cut=r.stopped||r.unscanned?'the lookup stopped before every log was read'+(r.stopped?' ('+esc(r.stopped)+')':'')+': <b>search every line</b> reads them all':'';
+   if(!h)h='<div class="nc">'+(cut||'no log in this report holds this id ('+(r.searched||0)+' files read)')+'</div>';
+   else if(cut)h='<div class="nc gp">'+cut+'</div>'+h;
+   else if(r.kind!=='uuid'&&r.rows&&!r.rows.length)h='<div class="nc gp">not in production.log</div>'+h;
+   $('#idb').innerHTML=h;Search.reqWire()}).catch(function(e){$('#idb').innerHTML='<div class="nc">'+esc(String(e))+'</div>'})},
+ close:function(){if(this.el)this.el.classList.remove('on');this.stack=[]},
+ isOpen:function(){return !!(this.el&&this.el.classList.contains('on'))}};
+window.IdP=IdP;
+document.addEventListener('click',function(e){var gs=e.target.closest?e.target.closest('.gosec'):null;
+ if(gs){e.preventDefault();tab('report');var se=document.getElementById(gs.dataset.sec);if(se){RV.reveal(se);se.scrollIntoView({block:'start'});setHash('#'+gs.dataset.sec)}return}
+ var ps=e.target.closest?e.target.closest('.pbsearch'):null;
+ if(ps){e.preventDefault();var fs=[];SIGS.forEach(function(x){if(x.pb===ps.dataset.pb&&x.u&&fs.indexOf(x.f)<0)fs.push(x.f)});if(!fs.length)return;
+  $('#o_x').value='';searchFor(fs.map(function(f){return f.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')}).join('|'),{cs:true,preset:'logs',back:{tab:'learn',id:'',title:'playbook: '+(PBS[ps.dataset.pb]||ps.dataset.pb)}});return}
+ /* a package name: what the report records about it, on a line under it; again to close */
+ var pk=e.target.closest?e.target.closest('.pk'):null;
+ if(pk){e.preventDefault();e.stopPropagation();var ln=pk.closest('.pkl'),nx=ln&&ln.nextElementSibling;if(!ln)return;
+  if(nx&&nx.classList.contains('pkd')){nx.remove();return}
+  var rows=(typeof PKI!=='undefined'&&PKI[pk.dataset.p])||[],d=document.createElement('span');d.className='pkd';
+  d.innerHTML=rows.length?rows.map(function(r){return '<span><i>'+esc(r[0])+'</i> '+esc(r[1])+'</span>'}).join(''):'<span>the report records nothing more about this package</span>';
+  ln.parentNode.insertBefore(d,ln.nextSibling);return}
+ var u=e.target.closest?e.target.closest('.uid'):null;
+ if(u){e.preventDefault();e.stopPropagation();var tr=taskOf(u.dataset.id);if(tr){tab('tasks');Tasks.byId(String(tr.id))}else if(SERVE)IdP.open(u.dataset.id);return}
+ var m=e.target.closest?e.target.closest('.ml,.rid,.qx'):null;if(m&&SERVE){e.preventDefault();var q=m.getAttribute('data-q');
+  if(m.classList.contains('rid')){e.stopPropagation();IdP.open(q)}else if(m.classList.contains('qx'))searchFor(q,{cs:1});else searchFor(msgRegex(q));return}
+ var tk=e.target.closest?e.target.closest('.tk'):null;if(tk){e.preventDefault();Tasks.focus(tk.dataset.k,tk.dataset.v);return}
+ var b=e.target.closest?e.target.closest('.cp,.cpb,.lr,.vw,.kn,.lk'):null;if(!b)return;e.preventDefault();
+ if(b.classList.contains('cp'))copy(b.dataset.cmd,b);if(b.classList.contains('cpb'))copy(blockText(b.closest('.blk')),b);if(b.classList.contains('lr')){tab('learn');Learn.show(b.dataset.learn,'replace')}if(b.classList.contains('vw')&&window.Search){var pane=b.closest('.pane'),from=pane&&pane.dataset.pane!=='search'?pane.dataset.pane:null,at=from&&b.closest('[id]');
+  var fr=from?{tab:from,id:at?at.id:'',title:(b.closest('.blk')&&$('.bh .t',b.closest('.blk'))||{}).textContent||''}:null;
+  if(b.dataset.q){var sp=b.dataset.view;searchFor(b.dataset.q.indexOf('re:')===0?b.dataset.q.slice(3):msgRegex(b.dataset.q),{cs:1,only:sp.slice(0,sp.lastIndexOf(':')),view:sp,back:fr})}
+  else{tab('search');Search.view(b.dataset.view,fr)}}
+ if(b.classList.contains('kn'))Learn.sig(+b.dataset.sig);if(b.classList.contains('lk')){var inl=curTab()==='learn';tab('learn');if(b.dataset.rel!==undefined){Learn.show('decoder',inl?false:'replace');Dec.only(+b.dataset.rel);var dl=$('#declist');if(dl)dl.scrollIntoView({block:'start'})}else{Learn.show(b.dataset.card,inl?false:'replace');if(b.dataset.fold)Learn.open(b.dataset.fold)}}});
+/* keys */
+var blks=$$('.blk'),cur=-1;function vis(){return blks.filter(function(b){return b.offsetParent})}
+function setb(i){var v=vis();if(!v.length)return;i=Math.max(0,Math.min(v.length-1,i));blks.forEach(function(b){b.classList.remove('cur')});var b=v[i];b.classList.add('cur');cur=blks.indexOf(b);b.scrollIntoView({block:'start'});setHash('#'+b.id)}
+function step(d){var v=vis(),i=v.indexOf(blks[cur]),r=i>=0?v[i].getBoundingClientRect():null;
+ if(i<0||r.bottom<0||r.top>window.innerHeight){i=v.findIndex(function(b){return b.getBoundingClientRect().top>=60});if(i<0)i=v.length-1;setb(d>0?i:i-1);return}setb(i+d)}
+document.addEventListener('keydown',function(e){var tg=e.target.tagName;if(tg==='INPUT'||tg==='SELECT'||tg==='TEXTAREA'||e.ctrlKey||e.metaKey||e.altKey){if(e.key==='Escape')e.target.blur();return}
+ if(e.target.closest&&e.target.closest('.sbox')&&e.key.length===1)return;   /* a key pressed on the search form's buttons is not a page shortcut */
+ var on=$('.pane.on').dataset.pane;
+ if(e.key==='/'){e.preventDefault();if(SERVE){tab('search');setTimeout(function(){$('#q').focus()},0)}else $('#qtop').focus()}
+ else if(e.key>='1'&&e.key<=($('#pane-learn')?'4':'3')){tab(['report','tasks','search','learn'][+e.key-1])}
+ else if(e.key==='c')CZ.toggle();else if(e.key==='N')Notes.toggle();else if(e.key==='Escape'&&$('.pkd'))$$('.pkd').forEach(function(d){d.remove()});else if(e.key==='Escape'&&IdP.isOpen())IdP.close();else if(e.key==='Escape'&&Notes.isOpen())Notes.close();
+ else if(on==='report'&&e.key==='p'&&cur>=0)Notes.block(blks[cur]);
+ else if(on==='report'&&e.key==='j')step(1);else if(on==='report'&&e.key==='k')step(-1);else if(on==='report'&&e.key==='w')wrapToggle();
+ else if(on==='report'&&e.key==='Y'&&cur>=0){var cb=$('.cpb',blks[cur]);if(cb)copy(blockText(blks[cur]),cb)}
+ else if(on==='search'&&window.Search&&(e.key==='n'||e.key==='p'))Search.step(e.key==='n'?1:-1);
+ else if(on==='report'&&(e.key===']'||e.key==='[')){var vs=secs.filter(function(s){return s.offsetParent}),i=vs.findIndex(function(s){return s.getBoundingClientRect().top>70});if(i<0)i=vs.length;var n=e.key===']'?i:Math.max(0,i-2);if(vs[n])vs[n].scrollIntoView({block:'start'})}
+ else if(on==='report'&&e.key==='o'&&RV.pane())RV.toggle();
+ else if(on==='report'&&e.key==='y'&&cur>=0){var c=$('.cp',blks[cur]);if(c)copy(c.dataset.cmd,c)}});
+var qt=$('#qtop');if(qt)qt.addEventListener('keydown',function(e){if(e.key==='Enter'&&SERVE&&qt.value.trim()){tab('search');Search.init();$('#q').value=qt.value;qt.value='';Search.run()}});
+function sigHit(x,t){if(t.indexOf(x.f)<0)return false;if(!x.r)return true;try{if(!x.rc)x.rc=new RegExp(x.r);return t.split('\n').some(function(l){return l.indexOf(x.f)>=0&&x.rc.test(l)})}catch(e){return true}}
+function sigOf(text){var best=-1;for(var k=0;k<SIGS.length;k++){var x=SIGS[k];if(x.u&&sigHit(x,text)&&(best<0||x.f.length>SIGS[best].f.length||(x.r&&!SIGS[best].r&&x.f.length===SIGS[best].f.length)))best=k}return best}
+var Learn={cur:'home',show:function(){},sig:function(){},file:function(){},open:function(){}},Dec={only:function(){}},Plain={go:function(){}};
+document.addEventListener('click',function(e){var a=e.target.closest?e.target.closest('.gotab,.pll,.lfj'):null;if(!a)return;e.preventDefault();
+ if(a.classList.contains('gotab')){tab(a.dataset.tab);return}
+ if(a.classList.contains('lfj')){Learn.file(a.dataset.lf);return}
+ if($('#plin')){Learn.show('plain');$('#plin').value=a.dataset.pl;Plain.go();window.scrollTo(0,0)}});
+/* tasks */
+var Tasks={done:false,res:{e:1,w:1,o:1,s:0},label:'',day:'',q:'',win:null,by:'err',task:null,opened:null,shown:{},sort:'started',dir:-1,kids:null,
+ init:function(){if(this.done)return;this.done=true;this.draw()},
+ open:function(r){return r.state&&['stopped','skipped'].indexOf(r.state)<0},
+ cat:function(r){return this.open(r)?'o':(r.result==='error'?'e':(r.result==='warning'?'w':(r.result==='success'?'s':'o')))},
+ noerr:function(){return '(no error text'+(TASKS.source==='sosreport'?' in dynflow_steps':'')+')'},
+ when:function(s){if(!s)return null;s=String(s).trim().replace(/\s*(UTC|GMT|Z)$/i,'').replace(/\s*[+-]\d\d:?\d\d$/,'');var d=new Date(s.replace(' ','T')+'Z');return isNaN(d)?null:d},
+ /* error text with ids, long numbers, addresses and host names masked, so the same message from many tasks is one group */
+ mask:function(s){s=String(s||'').split('\n')[0].trim();if(!s)return '';
+  return s.replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/gi,'<uuid>').replace(/\b\d{1,3}(\.\d{1,3}){3}\b/g,'<ip>')
+   .replace(/(\/\/|@|\bhost\s+|\bto\s+)[a-z0-9-]+(\.[a-z0-9-]+)+/gi,'$1<host>').replace(/\b[a-z0-9-]+(\.[a-z0-9-]+)+(?=:\d)/gi,'<host>')
+   .replace(/\b[0-9a-f]*\d[0-9a-f]*[a-f][0-9a-f]*\b/gi,function(m){return m.length>=10?'<hex>':m}).replace(/\b\d{4,}\b/g,'<n>').replace(/\s+/g,' ').slice(0,240)},
+ gkey:function(r){if(this.by==='label')return r.label||'(no label)';if(this.by==='day')return (r.started||'').slice(0,10)||'(no start time)';if(this.by==='none')return '';
+  if(r._m===undefined)r._m=this.mask(r.subfail&&(!r.error||/A sub task failed|SubtaskFailedException/.test(r.error))?r.subfail[0][0]:r.error);return r._m||this.noerr()},
+ /* sub-tasks right under their parent: a row whose parent is in the same list follows it, one level in */
+ nest:function(rows){var by={},kids={},out=[];rows.forEach(function(r){by[r.id]=r});
+  rows.forEach(function(r){if(r.parent&&by[r.parent]&&r.parent!==r.id)(kids[r.parent]=kids[r.parent]||[]).push(r)});
+  var self=this,put=function(r,d){out.push([r,d]);if(d<6)(kids[r.id]||[]).sort(function(a,b){return (self.cat(a)==='s')-(self.cat(b)==='s')}).forEach(function(c){put(c,d+1)})};
+  rows.forEach(function(r){if(!(r.parent&&by[r.parent]&&r.parent!==r.id))put(r,0)});
+  if(out.length<rows.length){var seen={};out.forEach(function(x){seen[x[0].id]=1});rows.forEach(function(r){if(!seen[r.id])out.push([r,0])})}   /* a loop of parents: nothing is lost */
+  return out},
+ /* everything but the result filter: a time window from the Report, the find box, a label and a day */
+ base:function(){var self=this,q=this.q.toLowerCase(),w=this.win,L=this.label,D=this.day;
+  return TASKS.rows.filter(function(r){
+   if(w){var x=String((w.k==='ended'?r.ended:r.started)||'').slice(0,16);if(!(x>=w.a&&x<w.b&&(w.k!=='ended'||r.result==='error'||r.result==='warning')))return false}
+   if(q&&self.text(r).indexOf(q)<0&&!(self.deep.q===q&&r.ext&&self.deep.set[r.ext]))return false;
+   if(L&&r.label!==L)return false;if(D&&(r.started||'').slice(0,10)!==D)return false;return true})},
+ /* what the find box looks through for one task: ids, label, the task's own name, error text and, when the page holds
+    the task's full record, the names in its input and output. With sosview-lite serve the task data on disk is searched too. */
+ deep:{q:'',set:{},n:0},
+ text:function(r){if(r._t===undefined){var f=(typeof TASKFULL!=='undefined'&&TASKFULL&&TASKFULL[r.id])||null;
+   r._t=(String(r.id)+' '+(r.ext||'')+' '+(r.req||'')+' '+r.label+' '+(r.act||'')+' '+(r.error||'')+(f&&f.facts?' '+f.facts.map(function(x){return x[1]}).join(' '):'')).toLowerCase()}return r._t},
+ dig:function(){var self=this,q=this.q.toLowerCase();if(!SERVE||TASKS.source!=='sosreport'||q.length<3||this.deep.q===q)return;
+  fetch('/taskfind?q='+encodeURIComponent(q)).then(function(r){return r.json()}).then(function(d){if(self.q.toLowerCase()!==q)return;var S={};(d.plans||[]).forEach(function(p){S[p]=1});
+   self.deep={q:q,set:S,n:(d.plans||[]).length,file:d.file||''};var had=document.activeElement&&document.activeElement.id==='tfind';self.reset();self.draw();
+   if(had){var f=$('#tfind');f.focus();f.setSelectionRange(f.value.length,f.value.length)}}).catch(function(){})},
+ rows:function(){var self=this;return this.base().filter(function(r){return self.res[self.cat(r)]})},
+ secs:function(r){var a=this.when(r.started);if(!a)return -1;var b=this.when(r.ended);if(!b&&this.open(r)&&TASKS.collected)b=this.when(TASKS.collected);return b?Math.max(0,(b-a)/1000):-1},
+ dur:function(r){var s=this.secs(r);if(s<0)return '';var age=!this.when(r.ended)&&this.open(r);
+  var t=s<90?Math.round(s)+'s':s<5400?Math.round(s/60)+'m':s<172800?(s/3600).toFixed(1)+'h':(s/86400).toFixed(1)+'d';return (age?'age ':'')+t},
+ children:function(){if(this.kids)return this.kids;var k={};TASKS.rows.forEach(function(r){if(r.parent)(k[r.parent]=k[r.parent]||[]).push(r)});return this.kids=k},
+ cmp:function(){var self=this,k=this.sort,d=this.dir,O={e:0,w:1,o:2,s:3};
+  var f=k==='took'?function(r){return self.secs(r)}:k==='result'?function(r){return O[self.cat(r)]}:k==='id'?function(r){var n=Number(r.id);return isNaN(n)?String(r.id):n}:function(r){return String(r[k]||'')};
+  return function(a,b){var x=f(a),y=f(b);return (x<y?-1:x>y?1:0)*d||String(b.started||'').localeCompare(String(a.started||''))}},
+ reset:function(){this.opened=null;this.shown={}},
+ /* a line in the Report opens the matching tasks: one task, a label, a day, an hour or an error text */
+ focus:function(kind,v){tab('tasks');this.init();this.kids=null;this.reset();this.closeDetail();
+  this.win=null;if(kind==='task'){this.byId(v);return}this.label='';this.day='';this.q='';this.res={e:1,w:1,o:1,s:0};
+  if(kind==='taskhour'){this.win=JSON.parse(v);this.res={e:1,w:1,o:1,s:1}}
+  if(kind==='tasklabel'){var have={};TASKS.rows.forEach(function(r){have[r.label]=1});this.label=have[v]?v:(have[v.replace(/Actions::/g,'')]?v.replace(/Actions::/g,''):'');if(!this.label)this.q=v.replace(/Actions::/g,'')}
+  else if(kind==='taskday')this.day=v;else if(kind==='taskerr')this.q=v.replace(/\b(UUID|IP|HEX|N|TIME|DATE)\b.*$/,'').trim().slice(0,80);this.draw()},
+ byId:function(id){var r=TASKS.rows.filter(function(x){return String(x.id)===id||String(x.id).indexOf(id)===0})[0];this.init();if(r)this.select(r)},
+ /* show one task: widen the filters if they hide it, open its group, page down to it, open its details */
+ select:function(r){if(this.rows().indexOf(r)<0){this.res={e:1,w:1,o:1,s:1};this.label='';this.day='';this.q='';this.win=null}
+  var k=this.gkey(r);this.opened=this.opened||{};this.opened[k]=1;this.task=r;
+  var G=this.groups(this.rows()),g=G.filter(function(x){return x.k===k||x.rows.indexOf(r)>=0})[0];
+  if(g){this.opened[g.k]=1;var i=g.rows.indexOf(r);if(i>=(this.shown[g.k]||50))this.shown[g.k]=i+1}
+  this.draw();var el=$('#tm .tr.cur');if(el)el.scrollIntoView({block:'center'})},
+ groups:function(rows){var self=this,M={},out=[],cmp=this.cmp(),rare=null;
+  rows.forEach(function(r){var k=self.gkey(r),g=M[k];if(!g){g=M[k]={k:k,rows:[],c:{e:0,w:0,o:0,s:0},L:{},a:'',b:''};out.push(g)}
+   g.rows.push(r);g.c[self.cat(r)]++;g.L[r.label]=(g.L[r.label]||0)+1;var s=(r.started||'').slice(0,16);if(s){if(!g.a||s<g.a)g.a=s;if(s>g.b)g.b=s}});
+  if(this.by==='day')out.sort(function(a,b){return b.k.localeCompare(a.k)});else{var ne=this.by==='err'?this.noerr():null;out.sort(function(a,b){return ((a.k===ne)-(b.k===ne))||b.rows.length-a.rows.length||a.k.localeCompare(b.k)})}
+  if(this.by==='err'&&out.length>12){var keep=[];out.forEach(function(g){if(g.rows.length>2){keep.push(g);return}
+    if(!rare)rare={k:'\u0000rare',rare:0,rows:[],c:{e:0,w:0,o:0,s:0},L:{},a:'',b:''};rare.rare++;
+    g.rows.forEach(function(r){rare.rows.push(r)});['e','w','o','s'].forEach(function(c){rare.c[c]+=g.c[c]});Object.keys(g.L).forEach(function(l){rare.L[l]=(rare.L[l]||0)+g.L[l]});
+    if(g.a&&(!rare.a||g.a<rare.a))rare.a=g.a;if(g.b>rare.b)rare.b=g.b});
+   if(rare&&rare.rare>1){out=keep;out.push(rare)}}
+  out.forEach(function(g){g.rows.sort(cmp)});return out},
+ bar:function(c,n,max){var w=Math.max(4,Math.round(90*n/(max||1)));return '<span class="rb" style="width:'+w+'px" title="'+c.e+' error · '+c.w+' warning · '+c.o+' open · '+c.s+' success">'+
+   ['e','w','o','s'].map(function(x){return c[x]?'<i class="tl-'+x+'" style="flex:'+c[x]+'"></i>':''}).join('')+'</span>'},
+ pill:function(r){var c=this.cat(r);return '<span class="pill p'+c+'" title="'+esc(r.state+' / '+r.result)+'">'+esc(c==='o'?(r.state||'open'):(r.result||r.state))+'</span>'},
+ trow:function(r,K,d){var self=this,ks=K[r.id]||[],k=ks.length,bad=ks.filter(function(c){var x=self.cat(c);return x==='e'||x==='w'}).length;d=d||0;
+  var sub=k?(bad?'<b class="sbad">'+bad+' of '+k+' failed</b>':k+' sub-task'+(k===1?'':'s')):(r.parent?'sub-task':'');
+  return '<button class="tr'+(this.task===r?' cur':'')+(d?' kid':'')+(k?' par':'')+'" data-id="'+esc(r.id)+'"'+(d?' title="sub-task of the task above it"':'')+'><span'+(d?' style="padding-left:'+(d*14)+'px"':'')+'>'+(d?'<i class="karr">↳</i>':'')+esc(String(r.id).slice(0,12))+'</span><span>'+esc(r.label)+'</span><span>'+esc(r.started||'')+'</span><span>'+esc(r.ended||'—')+'</span><span>'+this.pill(r)+'</span><span>'+esc(this.dur(r))+'</span><span>'+sub+'</span><span class="te">'+esc((r.error||(r.subfail?'A sub task failed':'')).split('\n')[0])+(r.subfail?'<span class="tsub"> → '+esc(r.subfail[0][0])+(r.subfail.length>1?' (+'+(r.subfail.length-1)+' more)':'')+'</span>':'')+'</span></button>'},
+ more:function(k,shown,n){if(shown>=n)return '';var rest=n-shown;return '<div class="tmore">'+shown.toLocaleString()+' of '+n.toLocaleString()+' shown · <a href="#" data-more="'+esc(k)+'" data-n="50">next '+Math.min(50,rest)+'</a>'+(rest>50&&n<=3000?' · <a href="#" data-more="'+esc(k)+'" data-n="'+rest+'">show all</a>':'')+'</div>'},
+ draw:function(){var self=this,K=this.children(),all=TASKS.rows;
+  /* toolbar */
+  var B=this.base(),C={e:0,w:0,o:0,s:0};B.forEach(function(r){C[self.cat(r)]++});
+  var bar='<input id="tfind" class="tin" style="width:200px" placeholder="find: id, plan, request, name, host, error" title="looks through task, plan and request ids, labels, task names and error text'+(SERVE?', and the names in each task&#39;s input and output (repository, Capsule, host …)':'')+'" value="'+esc(this.q)+'" autocomplete="off">';
+  bar+='<span class="tgl">RESULT</span>'+[['e','error'],['w','warning'],['o','open'],['s','success']].map(function(x){return '<button class="chip" data-r="'+x[0]+'" aria-pressed="'+(!!self.res[x[0]])+'" title="click to show or hide · double-click for only this"><i class="dot tl-'+x[0]+'"></i>'+x[1]+' <i class="cn">'+C[x[0]].toLocaleString()+'</i></button>'}).join('');
+  bar+='<span class="thint">double-click one for only that result</span>';
+  var LL={},DD={};all.forEach(function(r){LL[r.label]=(LL[r.label]||0)+1;var d=(r.started||'').slice(0,10);if(d)DD[d]=(DD[d]||0)+1});
+  bar+='<span class="tgl">LABEL</span><select id="tlab" class="tsel"><option value="">any</option>'+Object.keys(LL).sort(function(a,b){return LL[b]-LL[a]}).map(function(l){return '<option value="'+esc(l)+'"'+(l===self.label?' selected':'')+'>'+esc(l)+' ('+LL[l]+')</option>'}).join('')+'</select>';
+  bar+='<span class="tgl">DAY</span><select id="tday" class="tsel"><option value="">any</option>'+Object.keys(DD).sort().reverse().map(function(d){return '<option value="'+d+'"'+(d===self.day?' selected':'')+'>'+d+' ('+DD[d]+')</option>'}).join('')+'</select>';
+  bar+='<span class="tgl">GROUP</span>'+[['err','error text'],['label','label'],['day','day'],['none','none']].map(function(x){return '<button class="chip" data-by="'+x[0]+'" aria-pressed="'+(self.by===x[0])+'">'+x[1]+'</button>'}).join('');
+  var rows=this.rows();
+  $('#tbar').innerHTML=bar;
+  /* status line */
+  var hid=B.length-rows.length,G=this.by==='none'?null:this.groups(rows);
+  var s='<span>showing '+rows.length.toLocaleString()+' of '+all.length.toLocaleString()+' tasks</span>';
+  if(hid)s+='<span>· '+hid.toLocaleString()+' hidden by the result filter (<a href="#" id="tshowall">show</a>)</span>';
+  if(this.q&&this.deep.q===this.q.toLowerCase()&&this.deep.n){var dn=B.filter(function(r){return r.ext&&self.deep.set[r.ext]&&self.text(r).indexOf(self.deep.q)<0}).length;
+   if(dn)s+='<span title="'+esc(this.deep.file)+'">· '+dn.toLocaleString()+' found by a name in their input or output</span>'}
+  if(G)s+='<span>· '+G.length+' group'+(G.length===1?'':'s')+' · <a href="#" id="texp">expand all</a> · <a href="#" id="tcol">collapse all</a></span>';
+  s+='<span>· <a href="#" id="tcopy" title="copy the ids of the '+rows.length+' tasks shown, one per line">copy '+rows.length.toLocaleString()+' ids</a></span>';
+  if(this.win)s+='<span class="tbn">'+(this.win.k==='ended'?'ended with error or warning':'started')+' '+esc(this.win.a)+'–'+esc(this.win.b.slice(11))+' UTC'+(this.win.host!==this.win.a?' ('+esc(this.win.host.slice(11))+' host time)':'')+' · <a href="#" id="twclr">show all tasks</a></span>';
+  s+='<span class="tsrc">'+esc(TASKS.source==='export'?'task export ':'sosreport ')+esc(TASKS.name||'')+(TASKS.collected?' · collected '+esc(TASKS.collected):'')+'</span>';
+  if(TASKS.fit)s+='<span class="tfit">'+esc(TASKS.fit)+'</span>';
+  if(EXPORTS.length)s+='<span>task exports found, check that one is this case\'s before loading it: '+EXPORTS.map(function(x){return '<a href="#" class="ldx" data-p="'+esc(x.p)+'" title="'+esc(x.p)+'">'+esc(x.p.split('/').pop())+'</a> <span class="gp">('+esc(x.where)+(x.when?', file dated '+esc(x.when):'')+')</span>'}).join(' · ')+'</span>';
+  if($('#pane-learn'))s+='<span><a href="#" class="lk" data-card="tasks" title="Learn: what a task is, and how the task tables fit together">how tasks work ›</a></span>';
+  $('#tsum').innerHTML=s;fit();
+  /* table */
+  var sorth=function(k,t){return '<span class="srt'+(self.sort===k?' on':'')+'" data-s="'+k+'">'+t+(self.sort===k?(self.dir<0?' ▾':' ▴'):'')+'</span>'};
+  var m='<div class="th">'+sorth('id','ID')+sorth('label','LABEL')+sorth('started','STARTED')+sorth('ended','ENDED')+sorth('result','RESULT')+sorth('took','TOOK / AGE')+'<span title="sub-tasks: how many a task started and how many of them failed; a sub-task is shown under its parent">SUB-TASKS</span>'+sorth('error','ERROR TEXT')+'</div>';
+  $('#tbar').style.display=all.length?'':'none';
+  if(!all.length)m='<div class="nc" style="padding:18px 22px">'+esc(TASKS.note||'no tasks')+'</div>';
+  else if(!rows.length)m+='<div class="nc">no tasks match'+(this.q?': no task id, plan id, label, name or error text contains "'+esc(this.q)+'"'+(SERVE&&TASKS.source==='sosreport'&&this.deep.q===this.q.toLowerCase()?', and no task&#39;s input or output does':''):'')+(hid?' · '+hid.toLocaleString()+' are hidden by the result filter':'')+'</div>';
+  else if(!G){var n=this.shown['']||100;m+=this.nest(rows).slice(0,n).map(function(x){return self.trow(x[0],K,x[1])}).join('')+this.more('',n,rows.length).replace('next 50','next 100').replace('data-n="50"','data-n="100"')}
+  else{if(!this.opened){this.opened={};if(G.length)this.opened[G[0].k]=1}
+   var max=0;G.forEach(function(g){max=Math.max(max,g.rows.length)});
+   G.forEach(function(g){var op=!!self.opened[g.k],n=g.rows.length,labs=Object.keys(g.L).sort(function(a,b){return g.L[b]-g.L[a]}),ks=-1;
+    var title=g.rare?'rare: '+g.rare+' error texts with 1–2 tasks each':g.k;
+    if(self.by==='err'&&!g.rare&&g.rows[0].error)ks=sigOf(g.rows[0].eraw||g.rows[0].error);
+    var side=self.by==='label'?(function(){var E={};g.rows.forEach(function(r){var e=self.mask(r.error)||'(no error text)';E[e]=(E[e]||0)+1});var ek=Object.keys(E).sort(function(a,b){return E[b]-E[a]});return esc(ek[0].slice(0,60))+' '+E[ek[0]]+(ek.length>1?' · +'+(ek.length-1):'')})()
+     :esc(labs[0])+' '+g.L[labs[0]]+(labs.length>1?' · +'+(labs.length-1):'');
+    m+='<div class="tgrp'+(op?' op':'')+(g.rare?' rare':'')+'" data-g="'+esc(g.k)+'" role="button" tabindex="0" aria-expanded="'+op+'"><span class="tw">'+(op?'▾':'▸')+'</span><span class="gk" title="'+esc(title)+'">'+esc(title)+(ks>=0?'<span class="kn" data-sig="'+ks+'" title="known error string">?</span>':'')+'</span><span class="gn">'+n.toLocaleString()+' task'+(n===1?'':'s')+'</span>'+self.bar(g.c,n,max)+'<span class="gl" title="'+(self.by==='label'?'most common error text':'most common labels')+'">'+side+'</span><span class="gw">'+esc(g.a+(g.b&&g.b!==g.a?' → '+(g.b.slice(0,10)===g.a.slice(0,10)?g.b.slice(11):g.b):''))+'</span></div>';
+    if(op){var sh=Math.min(self.shown[g.k]||50,n);m+=self.nest(g.rows).slice(0,sh).map(function(x){return self.trow(x[0],K,x[1])}).join('')+self.more(g.k,sh,n)}})}
+  $('#tm').innerHTML=m;
+  /* events */
+  var redraw=function(){self.reset();self.draw()};
+  var tf=$('#tfind');tf.oninput=function(){clearTimeout(self.qt);self.qt=setTimeout(function(){self.q=tf.value.trim();self.win=null;redraw();var f=$('#tfind');f.focus();f.setSelectionRange(f.value.length,f.value.length);self.dig()},250)};
+  $$('#tbar .chip[data-r]').forEach(function(b){var t=null;b.onclick=function(){clearTimeout(t);t=setTimeout(function(){self.res[b.dataset.r]=self.res[b.dataset.r]?0:1;redraw()},220)};
+   b.ondblclick=function(){clearTimeout(t);self.res={e:0,w:0,o:0,s:0};self.res[b.dataset.r]=1;redraw()}});
+  $$('#tbar .chip[data-by]').forEach(function(b){b.onclick=function(){self.by=b.dataset.by;redraw()}});
+  $('#tlab').onchange=function(){self.label=this.value;redraw()};$('#tday').onchange=function(){self.day=this.value;redraw()};
+  $('#tcopy').onclick=function(e){e.preventDefault();copy(rows.map(function(r){return r.id}).join('\n'),this)};
+  if($('#tshowall'))$('#tshowall').onclick=function(e){e.preventDefault();self.res={e:1,w:1,o:1,s:1};redraw()};
+  if($('#texp'))$('#texp').onclick=function(e){e.preventDefault();self.opened={};G.forEach(function(g){self.opened[g.k]=1});self.draw()};
+  if($('#tcol'))$('#tcol').onclick=function(e){e.preventDefault();self.opened={};self.draw()};
+  if($('#twclr'))$('#twclr').onclick=function(e){e.preventDefault();self.win=null;self.res={e:1,w:1,o:1,s:0};redraw()};
+  $$('#tm .srt').forEach(function(h){h.onclick=function(){var k=h.dataset.s;if(self.sort===k)self.dir=-self.dir;else{self.sort=k;self.dir=(k==='label'||k==='error')?1:-1}self.draw()}});
+  $$('#tm .tgrp').forEach(function(g){var tg=function(e){if(e.target.closest('.kn'))return;var k=g.dataset.g;if(self.opened[k])delete self.opened[k];else self.opened[k]=1;self.draw()};
+   g.onclick=tg;g.onkeydown=function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();tg(e)}}});
+  $$('#tm [data-more]').forEach(function(a){a.onclick=function(e){e.preventDefault();var k=a.dataset.more;self.shown[k]=(self.shown[k]||(self.by==='none'?100:50))+(+a.dataset.n);self.draw()}});
+  var byId={};rows.forEach(function(r){byId[r.id]=r});
+  $$('#tm .tr').forEach(function(b){b.onclick=function(){var r=byId[b.dataset.id];if(!r)return;self.task=r;$$('#tm .tr.cur').forEach(function(x){x.classList.remove('cur')});b.classList.add('cur');self.detail(r)}});
+  $$('#tbar .ldx,#tsum .ldx').forEach(function(a){a.onclick=function(e){e.preventDefault();if(!SERVE)return;a.textContent='loading…';fetch('/load-export?path='+encodeURIComponent(a.dataset.p)).then(function(r){return r.json()}).then(function(d){if(d.error){a.textContent=d.error;return}d.collected=TASKS.collected;TASKS=d;EXPORTS=[];self.kids=null;self.task=null;self.label='';self.day='';self.closeDetail();redraw()})}});
+  if(this.task&&rows.indexOf(this.task)>=0)this.detail(this.task);else{this.task=null;this.closeDetail()}},
+ closeDetail:function(){var d=$('#td');if(d){d.classList.remove('on');d.innerHTML=''}if(this.task){this.task=null;$$('#tm .tr.cur').forEach(function(x){x.classList.remove('cur')})}if(curTab()==='tasks'&&/^#tasks\//.test(location.hash))setHash('#tasks')},
+ detail:function(t){var self=this,K=this.children(),byId={};TASKS.rows.forEach(function(r){byId[r.id]=r});if(curTab()==='tasks')setHash('#tasks/'+encodeURIComponent(t.id));
+  var d='<div class="tdh" style="display:flex;gap:10px;align-items:baseline"><b>task '+esc(String(t.id).slice(0,12))+'</b><span style="color:var(--dim)">'+esc(t.label)+'</span><button type="button" class="btn2 tdpin" title="pin this task to your notes">pin</button><button type="button" class="tdx" title="close (Esc)">✕</button>'+(SERVE&&t.src?'<a href="#" class="vw" data-view="'+esc(t.src+':'+t.ln)+'" style="margin-left:auto;font-size:12px">'+(TASKS.source==='export'?'original HTML':'row in '+esc(t.src.split('/').pop()))+' ›</a>':'')+'</div>';
+  d+='<div class="kv"><span>label</span><span>'+esc(t.label)+'</span><span>state</span><span>'+esc(t.state)+' / '+esc(t.result)+'</span><span>started</span><span>'+esc(t.started)+'</span><span>ended</span><span id="tend">'+esc(t.ended||'—')+'</span><span>took / age</span><span id="ttook">'+esc(this.dur(t)||'—')+'</span><span>id</span><span id="tidv" style="overflow-wrap:anywhere">'+esc(t.id)+' <button type="button" class="cp mini" data-cmd="'+esc(t.id)+'">copy</button></span>'+(t.req?reqKV(t.req):'');
+  var tpb=null;Object.keys(TASKPB||{}).forEach(function(k){if(!tpb&&TASKPB[k].some(function(x){return t.label.indexOf(x.replace(/^Actions::/,''))>=0||('Actions::'+t.label).indexOf(x)>=0}))tpb=k});
+  if(tpb&&PBT[tpb]&&$('#pane-learn'))d+='<span>playbook</span><span><a href="#learn/pb-'+tpb+'" class="lk" data-card="pb-'+tpb+'">'+esc(PBS[tpb]||PBT[tpb])+' ›</a></span>';
+  if(t.parent)d+='<span>parent</span><span>'+(byId[t.parent]?'<a href="#" class="tsel" data-id="'+esc(t.parent)+'">'+esc(byId[t.parent].label)+' ('+esc(byId[t.parent].result)+')</a>':esc(t.parent)+' (not in the table)')+'</span>';
+  d+='</div>';
+  if(t.subfail){d+='<div class="lbl" style="padding:6px 0 0;border-top:1px solid var(--line)">WHAT THE FAILED SUB-TASKS SAY</div>'+(t.subhow?'<div class="gp" style="padding-bottom:4px">'+esc(t.subhow)+'</div>':'')+'<div class="sfl">'+t.subfail.map(function(x){var k=sigOf(x[0]);
+   return '<div class="sf"><span class="hn">'+x[1]+'×</span><span class="sft">'+CZ.line(x[0])+(k<0?'':'<button type="button" class="kn" data-sig="'+k+'" title="known error string · one known cause: '+esc(SIGS[k].c.slice(0,140))+'">?</button>')+'</span><span class="sfi">'+x[2].map(function(i){return '<a href="#" class="tsel" data-id="'+esc(i)+'">'+esc(String(i).slice(0,8))+'</a>'}).join(' ')+(x[1]>x[2].length?' …':'')+'</span></div>'}).join('')+'</div>'}
+  if(t.subnote&&!t.subfail){d+='<div class="lbl" style="padding:6px 0 0;border-top:1px solid var(--line)">ITS FAILED SUB-TASKS ARE NOT LINKED</div><div class="gp" style="padding-bottom:4px">'+esc(t.subnote)+'</div>'
+    +((t.subcand||[]).length?'<div class="sub">'+t.subcand.map(function(i){var r=TASKS.rows.filter(function(x){return String(x.id)===String(i)})[0];return '<a href="#" class="tsel" data-id="'+esc(i)+'">'+esc(r?(r.result||r.state)+' · '+r.label+' · '+r.started+(r.error?' · '+r.error.split('\n')[0].slice(0,80):''):String(i).slice(0,8))+'</a>'}).join('')+'</div>':'')}
+  var ks=(K[t.id]||[]).slice().sort(function(a,b){return (self.cat(a)==='s')-(self.cat(b)==='s')});if(ks.length){var C={};ks.forEach(function(r){C[r.result||r.state]=(C[r.result||r.state]||0)+1});
+   d+='<div class="lbl" style="padding:6px 0 0;border-top:1px solid var(--line)">SUB-TASKS ('+ks.length+': '+Object.keys(C).map(function(k){return C[k]+' '+esc(k)}).join(', ')+')</div><div class="sub">'+ks.slice(0,40).map(function(r){return '<a href="#" class="tsel" data-id="'+esc(r.id)+'">'+esc(r.result||r.state)+' · '+esc(r.label)+(r.error?' · '+esc(r.error.slice(0,80)):'')+'</a>'}).join('')+(ks.length>40?'<span class="gp">… '+(ks.length-40)+' more</span>':'')+'</div>'}
+  d+='<div class="lbl" style="padding:6px 0 0;border-top:1px solid var(--line);display:flex">ERROR TEXT'+(t.error?'<button type="button" class="cp mini" style="margin-left:auto" data-cmd="'+esc(t.eraw||t.error)+'">copy</button>':'')+'</div><pre class="out" style="white-space:pre-wrap">'+(t.error?CZ.line(t.eraw||t.error):'(none recorded)')+(function(){var k=t.error?sigOf(t.eraw||t.error):-1;return k<0?'':'<button type="button" class="kn" data-sig="'+k+'" title="known error string · one known cause: '+esc(SIGS[k].c.slice(0,140))+'">?</button>'})()+'</pre>';
+  if(SERVE&&t.error)d+='<div class="lbl" style="padding:6px 0 0">THIS ERROR TEXT IN THE LOGS</div><div id="ewhere" class="gp">counting…</div>';
+  var st=(TASKS.steps||{})[t.ext]||[];
+  if((TASKS.source==='sosreport'&&t.ext)||(TASKS.source==='export'&&SERVE&&t.src))d+='<div id="tfull" class="tfull"><div class="gp">'+(SERVE?'reading everything '+(TASKS.source==='export'?'the export':'the sosreport')+' holds on this task…':'')+'</div></div>';
+  if(st.length){d+='<div class="lbl tshort" style="padding:6px 0 0">DYNFLOW STEPS ('+st.length+')</div><div class="steps tshort">'+st.map(function(x){return '<div class="stp'+(x[4]?' er':'')+'"><span>'+esc(x[0])+'</span><span>'+esc(x[2])+'</span><span>'+esc(x[1])+(x[4]?'<br><em>'+esc(x[4])+'</em>':'')+'</span>'+(SERVE&&TASKS.steps_src?'<a href="#" class="vw" data-view="'+esc(TASKS.steps_src+':'+x[5])+'">row</a>':'')+'</div>'}).join('')+'</div>'}
+  d+='<div class="lbl" style="padding:6px 0 0;border-top:1px solid var(--line)">LOGS AROUND THIS TASK</div>';
+  if(!t.started)d+='<div class="gp">no start time recorded</div>';
+  else if(SERVE)d+='<div id="around"><a href="#" id="afind">find '+esc(t.started)+(TASKS.source==='sosreport'?' UTC':'')+' in production.log, proxy.log, messages …</a></div><div class="gp">the database stores task times in UTC; logs are written in the host&#39;s local time, so the time is shifted by the offset sos recorded</div>';
+  else{var dd=t.started,mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][+dd.slice(5,7)-1],day=+dd.slice(8,10);
+   d+='<pre class="out">grep -n \'^'+esc(dd.slice(0,10))+'T'+esc(dd.slice(11,16))+'\' var/log/foreman/production.log | head -3\ngrep -n \'^'+mo+' '+(day<10?' ':'')+day+' '+esc(dd.slice(11,16))+'\' var/log/messages | head -3</pre><div class="gp">sosview-lite serve jumps there in the viewer</div>'}
+  var live='hammer task info --id '+t.id+(t.state==='paused'||this.open(t)?"\nforeman-rake foreman_tasks:cleanup TASK_SEARCH='id = "+t.id+"' STATES='"+t.state+"' NOOP=true VERBOSE=true":'');
+  d+='<div class="lbl" style="padding:6px 0 0;border-top:1px solid var(--line);display:flex">ON THE LIVE SATELLITE<button type="button" class="cp mini" style="margin-left:auto" data-cmd="'+esc(live)+'">copy</button></div><pre class="out" style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(live)+'</pre>';
+  $('#td').innerHTML=d;$('#td').classList.add('on');TaskFull.load(t);$('#td .tdpin').onclick=function(){Notes.task(t)};
+  $('#td').scrollTop=0;$('#td .tdx').onclick=function(){self.closeDetail()};
+  if(SERVE&&t.error){var tid=t.id;fetch('/errwhere?q='+encodeURIComponent((t.eraw||t.error).slice(0,400))).then(function(r){return r.json()}).then(function(w){if(!self.task||self.task.id!==tid||!$('#ewhere'))return;
+   if(w.error){$('#ewhere').textContent=w.error;return}
+   $('#ewhere').className='ewh';$('#ewhere').innerHTML=w.logs.map(function(x){var span=x.span?'<span class="z">log covers '+esc(x.span)+'</span>':'';
+    if(!x.n)return '<span class="z">'+esc(x.name)+'</span><span class="z">0</span>'+span;
+    return '<a href="#" class="vw" data-view="'+esc(x.file+':'+x.line)+'" data-q="'+esc('re:'+w.pattern)+'" title="open the newest of these lines; the search lists the others">'+esc(x.name)+'</a><span>'+x.n.toLocaleString()+' line'+(x.n===1?'':'s')+'</span><span class="z">'+esc(x.when)+(span?' · '+span.replace(/<[^>]+>/g,''):'')+'</span>'}).join('')+'<span class="z" style="grid-column:1/-1">the error text with numbers as wildcards: '+esc(w.text)+'</span>'})}
+  $$('#td .tsel').forEach(function(a){a.onclick=function(e){e.preventDefault();var r=byId[a.dataset.id];if(r)self.select(r)}});
+  if($('#afind'))$('#afind').onclick=function(e){e.preventDefault();$('#around').textContent='looking…';fetch('/around?when='+encodeURIComponent(t.started)+(TASKS.source==='sosreport'?'&utc=1':'')).then(function(r){return r.json()}).then(function(a){
+   if(a.error){$('#around').textContent=a.error;return}
+   $('#around').innerHTML=(a.shift?'<div class="gp">'+esc(a.shift)+'</div>':'')+(a.files.length?a.files.map(function(f){if(f.error)return '<div class="gp">'+esc(f.file)+': '+esc(f.error)+'</div>';
+    var nm=esc(f.file.split('/').pop()),cov=' <span class="gp">· log covers '+esc(f.first)+' → '+esc(f.last)+'</span>';
+    if(f.pos==='before')return '<div>'+nm+' <span class="gp">starts after this time:</span> <a href="#" class="vw" data-view="'+esc(f.file+':1')+'">first line</a>'+cov+'</div>';
+    if(f.pos==='after')return '<div>'+nm+' <span class="gp">ends before this time:</span> <a href="#" class="vw" data-view="'+esc(f.file+':'+f.total)+'">last line</a>'+cov+'</div>';
+    return '<div><a href="#" class="vw" data-view="'+esc(f.file+':'+f.line)+'">'+nm+' line '+f.line.toLocaleString()+'</a> <span class="gp">first line at or after '+esc(a.when)+' is at '+esc(f.at||'?')+'</span>'+cov+'</div>'}).join(''):'<div class="gp">none of these logs are in this sosreport</div>')})}}};
+window.Tasks=Tasks;
+document.addEventListener('keydown',function(e){if(e.key==='Escape'&&curTab()==='tasks'&&$('#td.on')&&!/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName))Tasks.closeDetail()});
+/* search (serve only) */
+/* a Rails request id ([I|app|1a2b3c4d]) is a link: it searches the logs for that request */
+/* the request that started the task: its id is what the task's own log lines carry ([E|bac|1a2b3c4d]) */
+function reqKV(full){var r8=String(full).slice(0,8).toLowerCase();
+  return '<span>request</span><span id="treq">'+(SERVE?'<a href="#" class="rid" data-q="'+esc(r8)+'" title="'+esc(full)+': the web or API call that started this task; its lines and the task\'s own lines carry '+esc(r8)+'">'+esc(r8)+'</a>':
+   '<span title="'+esc(full)+': the task\'s own log lines carry '+esc(r8)+', as in [E|bac|'+esc(r8)+']">'+esc(r8)+'</span>')+' <button type="button" class="cp mini" data-cmd="'+esc(r8)+'">copy</button></span>'}
+function rids(h){if(!SERVE)return h;var a=function(id,rest){return '<span class="rid" data-q="'+id+'" title="follow request '+id+' through every log">'+id+'</span>'+(rest||'')};
+ /* the smart proxy's '<time> <id> [I]' (the colouriser links the others); a Rails id of other than 8 characters */
+ return h.replace(/\|([0-9a-f]{4,7}|[0-9a-f]{9,16})\]/g,function(m,id){return '|'+a(id)+']'})
+  .replace(/^((?:<span class="cz-ts">[^<]*<\/span>|[^\s<]+)\s+)([0-9a-f]{8})( \[[A-Z]\] )/,function(m,p,id,rest){return p+a(id,rest)})}
+if(SERVE){var S=window.Search={inited:false,fams:[],off:{},fopen:{},counts:{},ctl:null,tick:null,hits:{},order:{},famOf:{},vfile:null,vline:0,
+ init:function(){if(this.inited)return;this.inited=true;this.recent();var self=this;$('#preset').onchange=function(){self.loadFiles()};$('#o_dup').onchange=function(){self.loadFiles()};this.ready=this.loadFiles();
+  $('#sf').onsubmit=function(e){e.preventDefault();self.run()};
+  /* after choosing a mode the next keys are the search text, not page shortcuts (c would turn the colours off) */
+  $$('#smode button').forEach(function(b){b.onclick=function(){self.setMode(b.dataset.m);$('#q').focus();if($('#q').value.trim())self.run()}});if(!this.mode)this.setMode('re');
+  $('#o_near').onchange=function(){if(self.mode==='aw'&&$('#q').value.trim())self.run()};$('#sstop').onclick=function(){if(self.ctl)self.ctl.abort()};$('#vprev').onclick=function(){self.step(-1)};$('#vnext').onclick=function(){self.step(1)};
+  $$('.quick .chip').forEach(function(b){b.onclick=function(){$('#q').value=b.dataset.q;$('#o_cs').checked=b.dataset.cs==='1';$('#o_ww').checked=false;Search.setMode('re');$('#o_x').value=b.dataset.x||'';
+   $$('.quick .chip').forEach(function(c){c.setAttribute('aria-pressed',c===b?'true':'false')});self.run()}});
+  $('#q').addEventListener('input',function(){$$('.quick .chip').forEach(function(c){c.setAttribute('aria-pressed','false')})});
+  ['o_from','o_to','o_x'].forEach(function(id){$('#'+id).addEventListener('input',function(){self.act()})});
+  $('#vwide').onclick=function(){var v=$('#sview');if(v.dataset.w!==undefined){v.style.width=v.dataset.w;delete v.dataset.w}else{v.dataset.w=v.style.width;v.style.width=Math.round(room(v))+'px'}};
+  $('#vpin').onclick=function(){var row=self.vfile&&(document.getElementById('v'+self.vline)||$('#vb .cur'));if(!row)return;var tx=row.textContent.replace(/^\d+/,'').replace(/\?$/,'');Notes.line(self.vfile,+row.id.slice(1),tx)};
+  $('#vat').addEventListener('keydown',function(e){if(e.key!=='Enter'||!self.vfile)return;e.preventDefault();var p=self.vfile,w=this.value.trim();if(!w)return;
+   fetch('/at?path='+encodeURIComponent(p)+'&when='+encodeURIComponent(w)).then(function(r){return r.json()}).then(function(d){if(d.error){$('#vf').textContent=d.error;return}self.atText=d.text;self.view(p+':'+d.line)})})},
+ hashOf:function(){var q=$('#q').value.trim(),a=['q='+encodeURIComponent(q),'in='+$('#preset').value];if($('#o_cs').checked)a.push('cs=1');if($('#o_ww').checked)a.push('ww=1');if(this.mode&&this.mode!=='re')a.push('m='+this.mode);if(this.mode==='aw'&&$('#o_near').checked)a.push('near=req');
+  if($('#o_x').value.trim())a.push('x='+encodeURIComponent($('#o_x').value.trim()));if($('#o_ctx').value!=='1')a.push('ctx='+$('#o_ctx').value);
+  if($('#o_from').value.trim())a.push('from='+encodeURIComponent($('#o_from').value.trim()));if($('#o_to').value.trim())a.push('to='+encodeURIComponent($('#o_to').value.trim()));
+  if(this.vfile)a.push('v='+encodeURIComponent(this.vfile+':'+this.vline));return '#search?'+a.join('&')},
+ fromHash:function(h){var i=h.indexOf('?');if(i<0)return;var P={};h.slice(i+1).split('&').forEach(function(kv){var j=kv.indexOf('=');if(j>0)P[kv.slice(0,j)]=decodeURIComponent(kv.slice(j+1))});
+  this.init();if(P['in']&&$('#preset').value!==P['in']){$('#preset').value=P['in'];this.ready=this.loadFiles()}
+  $('#q').value=P.q||'';$('#o_cs').checked=P.cs==='1';$('#o_ww').checked=P.ww==='1';this.setMode(P.m||'re');$('#o_near').checked=P.near==='req';$('#o_x').value=P.x||'';$('#o_ctx').value=P.ctx||'1';$('#o_from').value=P.from||'';$('#o_to').value=P.to||'';
+  this.pendingView=P.v||null;this.act();if(P.q)this.run();else if(P.v)this.view(P.v)},
+ loadFiles:function(){var self=this;return fetch('/files?preset='+encodeURIComponent($('#preset').value)+'&dup='+($('#o_dup').checked?1:0)).then(function(r){return r.json()}).then(function(d){self.fams=d.families||[];self.off={};self.fopen={};self.counts={};self.drawFiles()})},
+ drawFiles:function(){var self=this,c=this.counts,box=$('#sfiles'),top=box.scrollTop;
+  var h='<div class="lbl" style="display:flex;gap:10px"><span>FILES, LARGEST FIRST</span><a href="#" class="fa" data-a="all" title="tick every file">all</a><a href="#" class="fa" data-a="none" title="untick every file">none</a><span style="margin-left:auto">hits</span></div>';
+  h+=this.fams.map(function(f,i){var mem=f.members,multi=mem.length>1,on=mem.filter(function(m){return !self.off[m.path]}).length,k=multi?f.key:mem[0].path,sl=k.lastIndexOf('/'),dir=k.slice(0,sl+1).replace(/^(var\/log\/|sos_commands\/)/,''),base=k.slice(sl+1);
+    var tip=multi?f.key+'\n'+mem.length+' files, oldest first: '+mem[0].path.split('/').pop()+' … '+mem[mem.length-1].path.split('/').pop():k;
+    var r='<label class="fam'+(on?'':' off')+'" title="'+esc(tip)+'"><input type="checkbox" data-f="'+i+'"'+(on?' checked':'')+'><span class="nm"><span>'+esc(base)+'</span><span>'+esc((dir?dir+' · ':'')+f.size+(multi?' · '+mem.length+' files':'')+(!multi&&mem[0].note?' · '+mem[0].note:''))+'</span></span><button type="button" class="fo" data-o="'+i+'" title="tick this log and untick the rest">only</button><span class="c">'+(c[f.key]===undefined?'':c[f.key].toLocaleString())+'</span></label>';
+    if(multi){r+='<button type="button" class="fx" data-f="'+i+'">'+(self.fopen[i]?'▾ hide':'▸ show')+' the '+mem.length+' files'+(on<mem.length?' · '+on+' ticked':'')+'</button>';
+     if(self.fopen[i])r+='<div class="mem">'+mem.map(function(m){return '<label class="'+(self.off[m.path]?'off':'')+'" title="'+esc(m.path)+'"><input type="checkbox" data-p="'+esc(m.path)+'"'+(self.off[m.path]?'':' checked')+'><span class="nm"><span>'+esc(m.path.split('/').pop())+'</span><span>'+esc(m.size+(m.note?' · '+m.note:''))+'</span></span><span class="c">'+(c[m.path]===undefined?'':c[m.path].toLocaleString())+'</span></label>'}).join('')+'</div>'}
+    return r}).join('')||'<div class="nc">no files in this group</div>';
+  box.innerHTML=h;box.scrollTop=top;
+  $$('#sfiles input[data-f]').forEach(function(x){var f=self.fams[+x.dataset.f],on=f.members.filter(function(m){return !self.off[m.path]}).length;x.indeterminate=on>0&&on<f.members.length;
+   x.onchange=function(){self.offMine=null;f.members.forEach(function(m){self.off[m.path]=!x.checked});self.drawFiles()}});
+  $$('#sfiles input[data-p]').forEach(function(x){x.onchange=function(){self.offMine=null;self.off[x.dataset.p]=!x.checked;self.drawFiles()}});
+  $$('#sfiles .fx').forEach(function(b){b.onclick=function(){self.fopen[b.dataset.f]=!self.fopen[b.dataset.f];self.drawFiles()}});
+  $$('#sfiles .fa').forEach(function(a){a.onclick=function(e){e.preventDefault();self.offMine=null;self.off={};if(a.dataset.a==='none')self.fams.forEach(function(f){f.members.forEach(function(m){self.off[m.path]=true})});self.drawFiles()}});
+  $$('#sfiles .fo').forEach(function(b){b.onclick=function(e){e.preventDefault();e.stopPropagation();self.offMine=null;var keep=self.fams[+b.dataset.o];self.off={};self.fams.forEach(function(f){if(f!==keep)f.members.forEach(function(m){self.off[m.path]=true})});self.drawFiles()}});
+  this.act()},
+ /* what narrows the search right now, shown under the search box (also when the options are folded): click one to remove it */
+ act:function(){var el=$('#sact');if(!el)return;var self=this,a=[],f=$('#o_from').value.trim(),t=$('#o_to').value.trim(),x=$('#o_x').value.trim(),tot=0,on=0;
+  this.fams.forEach(function(fm){fm.members.forEach(function(m){tot++;if(!self.off[m.path])on++})});
+  if(f||t)a.push(['time',f&&t?'between '+f+' and '+t:f?'from '+f:'until '+t]);
+  if(x)a.push(['x','hiding lines matching '+x]);
+  if(tot&&on<tot)a.push(['files',on+' of '+tot+' files ticked']);
+  var one=f&&t&&/^\d{4}-\d\d-\d\d/.test(f)&&(!/^\d{4}-/.test(t)||t.slice(0,10)===f.slice(0,10))&&$('#tlr .tday[data-d="'+f.slice(0,10)+'"]')?f.slice(0,10):'';
+  el.innerHTML=a.length?'<span>narrowed to</span>'+a.map(function(c){return '<button type="button" class="fchip" data-k="'+c[0]+'" title="remove this'+($('#q').value.trim()?' and search again':'')+'">'+esc(c[1])+' ×</button>'}).join('')+(a.length>1?'<button type="button" class="fchip" data-k="all" title="remove all of these">clear all ×</button>':'')+(one?'<a href="#" class="tlgo" data-d="'+one+'" title="the Report timeline, with this day marked">this day in the timeline ›</a>':''):'';
+  $$('.tlgo',el).forEach(function(x){x.onclick=function(e){e.preventDefault();dayFocus(x.dataset.d);tab('report');var tl=$('.tlr');if(tl){RV.reveal(tl);if(!tl.open){tl._auto=true;tl.open=true}tl.scrollIntoView({block:'start'})}}});
+  $$('.fchip',el).forEach(function(b){b.onclick=function(){self.unfilter(b.dataset.k)}})},
+ /* one request, from the lines that carry its id: what the log says, in the log's order */
+ reqCard:function(d,panel){var more=(d&&d.more)||[],pt=(d&&d.pulp&&d.pulp.rows)||[];if(!d||d.error||((!d.rows||!d.rows.length)&&!more.length&&!pt.length))return '';
+  var below=panel?'':', every line in the results below',uu=d.kind==='uuid';
+  var secs=d.ms!==null&&d.ms!==undefined?(d.ms/1000).toFixed(1)+' s':'',h='<div class="reqc">'+(panel?'':'<div class="lbl">REQUEST · the lines that carry this id, in each log&#39;s order</div>');
+  if(d.rows.length)h+='<div class="rh"><b>'+esc(panel?d.file.split('/').pop():d.id)+'</b><span>'+(panel?'':esc(d.file.split('/').pop())+' · ')+esc(d.first)+(d.last!==d.first?' → '+esc(d.last.slice(11)):'')+(secs?' · answered in '+secs:'')+' · '+d.lines.toLocaleString()+' line'+(d.lines===1?'':'s')+(d.bt?', '+d.bt.toLocaleString()+' of them backtrace':'')+'</span></div>';
+  else if(!panel)h+='<div class="rh"><b>'+esc(d.id)+'</b><span>not in production.log</span></div>';
+  d.rows.forEach(function(r){h+='<div class="rr'+(r.k==='error'?' e':r.k==='warning'?' w':r.k==='note'?' n':'')+'"><span class="rt">'+esc(r.t)+'</span><span class="rk">'+esc(r.k==='note'?'':r.k)+'</span><span class="rv">'+CZ.line(r.v)+' <a href="#" class="vw gp" data-view="'+esc(r.rel+':'+r.n)+'" title="open the log at this line">line '+r.n.toLocaleString()+' ›</a></span></div>';
+   if(r.bt)h+='<div class="rbt">backtrace, '+r.bt+' line'+(r.bt===1?'':'s')+(r.frame?' · first line from Foreman or Katello code: <b>'+esc(r.frame)+'</b>':'')+'</div>'});
+  if(d.tasks&&d.tasks.length){var nn=function(n){return Number(n).toLocaleString()};
+   h+='<div class="rsub">tasks this request changed <span>'+nn(d.task_n)+', by label and how they stand at the last line</span></div>';
+   d.tasks.forEach(function(x){h+='<div class="rr'+(x.result==='error'?' e':x.result==='warning'?' w':'')+'"><span class="rt"></span><span class="rk">×'+nn(x.n)+'</span><span class="rv">'+esc(x.label||'(no label on the line)')+' <span class="gp">· '+esc(x.state)+(x.result?', '+(x.result==='error'?'<b class="ex">error</b>':esc(x.result)):'')+'</span></span></div>'});
+   (d.task_odd||[]).forEach(function(p){h+='<div class="rr '+(p.result==='error'?'e':'w')+'"><span class="rt">'+esc(p.t)+'</span><span class="rk">'+esc(p.result||p.state)+'</span><span class="rv">'+esc(p.label)+' <span class="uid" data-id="'+esc(p.id||p.plan)+'">'+esc(p.id||p.plan)+'</span> <a href="#" class="vw gp" data-view="'+esc(p.rel+':'+p.n)+'">line '+nn(p.n)+' ›</a></span></div>'})}
+  var fmt=function(n){return Number(n).toLocaleString()},sec=function(ms){return ms>=1000?(ms/1000).toFixed(ms>=10000?0:1)+' s':ms+' ms'};
+  var row=function(r){return '<div class="rr'+(r.k==='error'?' e':r.k==='warning'?' w':'')+'"><span class="rt">'+esc(r.t)+'</span><span class="rk">'+(r.count>1?'×'+fmt(r.count)+' ':'')+esc(r.k)+'</span><span class="rv">'+CZ.line(r.v)+(r.count>1?' <span class="gp">· the same text until '+esc(r.last)+'</span>':'')+' <a href="#" class="vw gp" data-view="'+esc(r.rel+':'+r.n)+'" title="open the log at the first of these lines">line '+fmt(r.n)+' ›</a></span></div>'};
+  var sub=function(t,x){return '<div class="rsub">'+t+(x?' <span>'+x+'</span>':'')+'</div>'},core=!!(d.pulp&&d.pulp.by&&d.pulp.by.length);
+  /* each log: its errors and warnings in full, then what the rest of its lines did (Pulp tasks by type, API calls by endpoint), then the other texts, closed */
+  more.forEach(function(m){var errs=m.rows.filter(function(r){return r.cls==='err'}),oth=m.rows.filter(function(r){return r.cls!=='err'});
+   h+='<div class="rh rs"><b>'+esc(m.file.split('/').pop())+'</b><span>'+fmt(m.n)+' line'+(m.n===1?'':'s')+(m.span?' · '+esc(m.span):'')+(function(){var nf=(m.failed||[]).filter(function(f){return f.kind==='failed'}).length,x=[];if(m.errors)x.push(fmt(m.errors)+' with an error level');if(nf)x.push(nf+' Pulp task'+(nf===1?'':'s')+' failed');return ' · '+(x.length?x.join(' · '):'no error level')})()+'</span></div>';
+   errs.forEach(function(r){h+=row(r)});
+   var tk=(m.tasks||[]).filter(function(x){return x.started||x.completed||x.failed||x.canceled});
+   if(tk.length&&!core){h+=sub('Pulp tasks in this log','by type');tk.forEach(function(x){h+='<div class="rr'+(x.failed?' e':x.canceled?' w':'')+'"><span class="rt"></span><span class="rk">×'+fmt(Math.max(x.started,x.completed+x.failed+x.canceled))+'</span><span class="rv">'+esc(x.type||'(type not in the log)')+' <span class="gp">· '+fmt(x.started)+' started · '+fmt(x.completed)+' completed'+(x.failed?' · <b class="ex">'+fmt(x.failed)+' failed</b>':'')+(x.canceled?' · '+fmt(x.canceled)+' canceled':'')+(x.longest?' · longest '+sec(x.longest):'')+'</span></span></div>'});
+    (m.failed||[]).forEach(function(f){h+='<div class="rr '+(f.kind==='failed'?'e':'w')+'"><span class="rt">'+esc(f.t)+'</span><span class="rk">'+esc(f.kind)+'</span><span class="rv">'+esc(f.type)+' <span class="uid" data-id="'+esc(f.id)+'">'+esc(f.id)+'</span>'+(f.why?' · <span class="ex">'+esc(f.why)+'</span>':'')+' <a href="#" class="vw gp" data-view="'+esc(f.rel+':'+f.n)+'">line '+fmt(f.n)+' ›</a></span></div>'})}
+   if(m.api&&m.api.length){h+=sub('API calls',fmt(m.api_lines)+' line'+(m.api_lines===1?'':'s')+', by endpoint; ids set aside');m.api.forEach(function(x){var st=Object.keys(x.status).sort().map(function(k){return '<span class="'+(k[0]==='5'||k[0]==='4'?'ex':'')+'">'+k+(Object.keys(x.status).length>1?' ×'+fmt(x.status[k]):'')+'</span>'}).join(' · ');
+    h+='<div class="rr'+(Object.keys(x.status).some(function(k){return k[0]==='5'})?' e':'')+'"><span class="rt"></span><span class="rk">×'+fmt(x.n)+'</span><span class="rv">'+esc(x.verb)+' '+esc(x.path)+(st?' <span class="gp">· '+st+'</span>':'')+' <a href="#" class="vw gp" data-view="'+esc(x.rel+':'+x.ln)+'" title="open the log at the first of these calls">line '+fmt(x.ln)+' ›</a></span></div>'})}
+   if(oth.length){h+='<details class="rmo"><summary>'+fmt(m.other_texts)+' other text'+(m.other_texts===1?'':'s')+' · '+fmt(m.other_lines)+' line'+(m.other_lines===1?'':'s')+(m.other_texts>oth.length?' · the first '+oth.length+' here'+below:'')+'</summary>';oth.forEach(function(r){h+=row(r)});h+='</details>'}});
+  if(pt.length){h+='<div class="rh rs"><b>Pulp tasks</b><span>'+fmt(d.pulp.n)+' in '+esc(d.pulp.file.split('/').pop())+' with this id'+(uu?'':' as their logging_cid')+' · '+esc(d.pulp.tz)+'</span></div>';
+   if(core){d.pulp.by.forEach(function(x){h+='<div class="rr'+(x.states.failed?' e':x.states.canceled?' w':'')+'"><span class="rt"></span><span class="rk">×'+fmt(x.n)+'</span><span class="rv">'+esc(x.name)+' <span class="gp">· '+Object.keys(x.states).sort().map(function(k){return (k==='failed'?'<b class="ex">':'')+fmt(x.states[k])+' '+esc(k)+(k==='failed'?'</b>':'')}).join(' · ')+'</span></span></div>'});pt=d.pulp.odd||[]}
+   pt.forEach(function(r){h+='<div class="rr'+(r.state==='failed'?' e':r.state==='canceled'?' w':'')+'"><span class="rt">'+esc(r.start.slice(11))+'</span><span class="rk">'+esc(r.state)+'</span><span class="rv">'+esc(r.name)+(r.end?' · ended '+esc(r.end.slice(11)):'')+(r.err?' · <span class="ex">'+esc(r.err)+'</span>':'')+' <a href="#" class="vw gp" data-view="'+esc(d.pulp.file+':'+r.n)+'" title="open the table at this row">row ›</a></span></div>'})}
+  var ft=[];
+  var ts=(typeof TASKS!=='undefined'&&d.plans&&d.plans.length)?TASKS.rows.filter(function(r){return r.ext&&d.plans.indexOf(r.ext)>=0}).slice(0,6):[];
+  if(ts.length)ft.push('task'+(ts.length>1?'s':'')+' that store this request id: '+ts.map(function(r){return '<a href="#" class="rqt" data-id="'+esc(String(r.id))+'">'+esc(r.label)+' · '+esc(r.state)+', '+esc(r.result)+' ›</a>'}).join(' '));
+  else if(d.plans&&d.plans.length)ft.push(d.plans.length+' execution plan'+(d.plans.length>1?'s':'')+' store this request id');
+  if(d.plain&&!panel)ft.push(d.plain+' other line'+(d.plain===1?'':'s')+' with this id are in the results below');
+  if(d.stopped)ft.push(esc(d.stopped));
+  return h+(ft.length?'<div class="rf">'+ft.map(function(x){return '<span>'+x+'</span>'}).join('')+'</div>':'')+'</div>'},
+ reqWire:function(){$$('#sreq .rqt,#idp .rqt').forEach(function(a){a.onclick=function(e){e.preventDefault();tab('tasks');Tasks.byId(a.dataset.id)}})},
+ setMode:function(m){this.mode=m;$$('#smode button').forEach(function(b){b.setAttribute('aria-pressed',b.dataset.m===m?'true':'false')});
+  var nl=$('#o_nearl');if(nl)nl.hidden=m!=='aw';var qi=$('#q');if(qi)qi.placeholder={re:'text or regex, e.g.  Connection refused|timed out',ex:'exact text, every character as typed, e.g.  ssl:True',aw:'words in any order on one line, e.g.  pulp tasks failed'}[m]||''},
+ unfilter:function(k){var all=k==='all';if(all||k==='time'){$('#o_from').value='';$('#o_to').value=''}if(all||k==='x')$('#o_x').value='';if(all||k==='files'){this.off={};this.offMine=null;this.drawFiles()}this.act();if($('#q').value.trim())this.run()},
+ run:function(){var self=this,q=$('#q').value.trim();if(!q)return;this.init();if(!this.fams.length&&this.ready){var r=this.ready;this.ready=null;$('#sstat').textContent='loading the file list…';r.then(function(){self.run()});return}this.unback();if(this.ctl)this.ctl.abort();this.ctl=window.AbortController?new AbortController():null;var t0=Date.now();
+  /* regex: as typed. exact text: every character means itself. all words: each word somewhere on the line, any order,
+     with anything between them; 'in one request': anywhere in the lines of one request. Results are marked word by word. */
+  var mode=this.mode||'re',ww=$('#o_ww').checked,words=[],pat,hl,er=function(x){return x.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')};
+  if(mode==='ex'){pat=er(q);if(ww)pat='\\b'+pat+'\\b';hl=pat}
+  else if(mode==='aw'){words=q.split(/\s+/).filter(Boolean).map(function(w){return ww?'\\b'+er(w)+'\\b':er(w)});
+   pat=words.length>1?'^'+words.map(function(w){return '(?=.*?'+w+')'}).join(''):words[0];hl=words.join('|')}
+  else{pat=ww?'\\b(?:'+q+')\\b':q;hl=pat}
+  var near=mode==='aw'&&words.length>1&&$('#o_near').checked,on=[],only=this.onlyFile;this.onlyFile=null;
+  if(!only&&this.offMine&&q!==this.linkQ2){this.off=this.offMine;this.offMine=null;   /* a link had narrowed the files: these are other words, so back to the user's own ticks */
+   if(this.linkFrom2!==null&&$('#o_from').value===this.linkFrom2&&$('#o_to').value===this.linkTo2){$('#o_from').value='';$('#o_to').value=''}this.drawFiles()}
+  if(only){if(!this.offMine){var keep={};Object.keys(this.off).forEach(function(k){keep[k]=self.off[k]});this.offMine=keep}this.linkQ2=q;this.linkFrom2=this.linkFrom;this.linkTo2=this.linkTo;
+   var fam=this.fams.filter(function(f){return f.members.some(function(m){return m.path===only})})[0];this.off={};
+   this.fams.forEach(function(f){f.members.forEach(function(m){self.off[m.path]=f!==fam})});if(!fam)on.push(only)}
+  this.fams.forEach(function(f){f.members.forEach(function(m){if(!self.off[m.path])on.push(m.path)})});this.act();
+  if(!on.length){$('#sstat').textContent='no file is ticked: tick a log on the left, or click "all"';return}
+  this.req=null;if(/^[0-9a-f]{8}$/.test(q)){var rq=q;fetch('/request?id='+rq).then(function(r){return r.json()}).then(function(d){if($('#q').value.trim()!==rq)return;
+    self.req={q:rq,html:self.reqCard(d)};var el=$('#sreq');if(el){el.innerHTML=self.req.html;self.reqWire()}}).catch(function(){})}
+  this.sofar='';clearInterval(this.tick);var tk=function(){$('#sstat').textContent='searching '+on.length+' files… '+Math.round((Date.now()-t0)/1000)+' s'+self.sofar};tk();this.tick=setInterval(tk,400);$('#sstop').hidden=false;
+  var u='/search?q='+encodeURIComponent(pat)+'&cs='+($('#o_cs').checked?1:0)+'&ctx='+$('#o_ctx').value+'&x='+encodeURIComponent($('#o_x').value.trim())+
+   '&from='+encodeURIComponent($('#o_from').value.trim())+'&to='+encodeURIComponent($('#o_to').value.trim())+
+   (words.length>1?'&w='+encodeURIComponent(words.join('\n'))+(near?'&near=req':''):'');
+  this.vfile=null;setHash(this.hashOf());
+  fetch(u+'&stream=1',{method:'POST',body:on.join('\n'),signal:this.ctl?this.ctl.signal:undefined}).then(function(r){return self.stream(r,hl,t0)}).then(function(d){clearInterval(self.tick);$('#sstop').hidden=true;
+   if(d.error){$('#sstat').textContent='error: '+d.error;return}self.lastU=u;self.lastPat=hl;self.remember(q);self.show(d,hl)}).catch(function(e){clearInterval(self.tick);$('#sstop').hidden=true;$('#sstat').textContent=e.name==='AbortError'?'stopped':'search failed: '+e+' (is sosview-lite serve still running?)'})},
+ cont:function(){var self=this,a=this.last;if(!a||!a.unscanned||!a.unscanned.length)return;var t0=Date.now(),n=a.unscanned.length;
+  clearInterval(this.tick);this.tick=setInterval(function(){$('#sstat').textContent='searching the remaining '+n+' files… '+Math.round((Date.now()-t0)/1000)+' s'},400);
+  fetch(this.lastU,{method:'POST',body:a.unscanned.join('\n')}).then(function(r){return r.json()}).then(function(b){clearInterval(self.tick);if(b.error){$('#sstat').textContent='error: '+b.error;return}
+   var byf={};a.groups.forEach(function(g){byf[g.file]=g});
+   b.groups.forEach(function(g){var o=byf[g.file];if(!o){a.groups.push(g);return}var off=o.members.length;o.members=o.members.concat(g.members);
+    o.lines=o.lines.concat(g.lines.map(function(l){return [l[0],l[1],l[2],l[3]+off]}));o.n+=g.n;o.shown+=g.shown});
+   a.groups.sort(function(x,y){return y.n-x.n});a.hits+=b.hits;a.files_hit+=b.files_hit;a.files_scanned+=b.files_scanned;a.ms+=b.ms;
+   Object.keys(b.counts||{}).forEach(function(k){a.counts[k]=(a.counts[k]||0)+b.counts[k]});
+   var P={},H={},F={},L={};a.patterns.concat(b.patterns).forEach(function(p){P[p.key]=(P[p.key]||0)+p.n;if(p.hosts)H[p.key]=Math.max(H[p.key]||0,p.hosts);if(p.first&&(!F[p.key]||p.first<F[p.key]))F[p.key]=p.first;if(p.last&&(!L[p.key]||p.last>L[p.key]))L[p.key]=p.last});
+   if(a.when&&b.when&&a.when.unit===b.when.unit){var W={};a.when.rows.concat(b.when.rows).forEach(function(r){W[r[0]]=(W[r[0]]||0)+r[1]});a.when.rows=Object.keys(W).sort().map(function(k){return [k,W[k]]})}else if(b.when&&b.when.rows.length&&!(a.when&&a.when.rows.length))a.when=b.when;
+   a.patterns=Object.keys(P).map(function(k){return {key:k,n:P[k],hosts:H[k]||0,first:F[k]||'',last:L[k]||''}}).sort(function(x,y){return y.n-x.n}).slice(0,20);
+   a.skipped=a.skipped.concat(b.skipped);a.unscanned=b.unscanned;a.unscanned_bytes=b.unscanned_bytes;a.stopped=b.stopped;self.show(a,self.lastPat)})},
+ show:function(d,q,partial){var self=this,re=null,keepTop=$('#sres').scrollTop;try{re=new RegExp(q,d.cs?'g':'gi')}catch(e){}
+  var un=d.unscanned||[],mb=function(b){return b>=1048576?(b/1048576).toFixed(0)+' MB':Math.max(1,Math.round(b/1024))+' KB'};if(!partial)self.last=d;
+  var st=(d.hits===0?'0 matches in the '+d.files_scanned.toLocaleString()+' file'+(d.files_scanned===1?'':'s')+' searched':d.hits.toLocaleString()+' match'+(d.hits===1?'':'es')+' · '+d.groups.length+' log'+(d.groups.length===1?'':'s')+' ('+d.files_hit+' of '+d.files_scanned+' files)')+' · '+(d.ms/1000).toFixed(1)+' s';
+  if(un.length)st+=' · <b>'+un.length+' file'+(un.length===1?'':'s')+' ('+mb(d.unscanned_bytes)+') not searched yet</b> (time budget) <a href="#" id="scont">continue with those</a>';
+  else if(d.stopped)st+=' · stopped: '+esc(d.stopped);
+  if(d.skipped&&d.skipped.length)st+=' · '+d.skipped.length+' file(s) left out for their size';
+  if(d.near)st+=' · '+d.near.requests.toLocaleString()+' request'+(d.near.requests===1?' holds':'s hold')+' every word between '+(d.near.requests===1?'its':'their')+' lines'+(d.near.cut?' (the first '+(d.near.requests>400?'400':'ones read')+' are shown)':'');
+  if(d.words)st+=' · each word on its own: '+d.words.map(function(w){return '<b>'+esc(w[0].replace(/\\b/g,'').replace(/\\(.)/g,'$1'))+'</b> '+w[1].toLocaleString()+(w[2]?'+':'')+' line'+(w[1]===1?'':'s')}).join(', ');
+  if(!partial){$('#sstat').innerHTML=st;if($('#scont'))$('#scont').onclick=function(e){e.preventDefault();self.cont()}}
+  this.counts=d.counts||{};this.drawFiles();this.hits={};this.order={};this.famOf={};
+  function mark(t){if(!re)return CZ.line(t);var o='',l=0,m;re.lastIndex=0;while((m=re.exec(t))&&m[0].length){o+=CZ.line(t.slice(l,m.index))+'<mark>'+CZ.ids(esc(m[0]))+'</mark>';l=m.index+m[0].length}return o+CZ.line(t.slice(l))}   /* the text searched for stays a link: a task id opens its task */
+  var h='';
+  /* when the hits happened, by the time on each line: a bar per day (per hour within three days); a click searches that day or hour */
+  var wn=d.when&&d.when.rows&&d.when.rows.length>1?d.when:null;
+  if(wn){var rows=wn.rows.slice(-120),mx=0;rows.forEach(function(r){mx=Math.max(mx,r[1])});
+   h+='<div class="when"><div class="lbl" style="padding:0 0 4px">HITS PER '+(wn.unit==='hour'?'HOUR':'DAY')+' (the time on each line)'+(wn.rows.length>rows.length?' · newest '+rows.length+' of '+wn.rows.length+' days':'')+' · click a bar to search only that '+wn.unit+'</div><div class="wbars">'+
+    rows.map(function(r){return '<a href="#" class="wb" data-k="'+esc(r[0])+'" title="'+esc(r[0]+(wn.unit==='hour'?':00':''))+' · '+r[1].toLocaleString()+' hit'+(r[1]===1?'':'s')+'"><i style="height:'+Math.max(6,Math.round(100*r[1]/mx))+'%"></i></a>'}).join('')+
+    '</div><div class="waxis"><span>'+esc(rows[0][0]+(wn.unit==='hour'?':00':''))+'</span><span>most in one '+wn.unit+': '+mx.toLocaleString()+'</span><span>'+esc(rows[rows.length-1][0]+(wn.unit==='hour'?':00':''))+'</span></div></div>'}
+  if(d.patterns.length>1){var byf=self.distBy==='first',ps=d.patterns.slice();if(byf)ps.sort(function(a,b){return (a.first||'9').localeCompare(b.first||'9')||b.n-a.n});
+   var timed=d.patterns.some(function(p){return p.first});
+   h+='<div class="dist"><div class="lbl" style="padding:0 0 4px">DISTINCT MESSAGES (times and ids left out'+(timed?'; the time is when each was first seen':'')+')'+(timed?' · order: <a href="#" class="dord'+(byf?'':' on')+'" data-o="n">most frequent</a> <a href="#" class="dord'+(byf?' on':'')+'" data-o="first">first seen</a>':'')+'</div>'+ps.slice(0,8).map(function(p){var ks=sigOf(p.key);return '<div title="'+esc(p.key)+(p.first?'\nfirst '+p.first+' · last '+p.last:'')+'">'+String(p.n).padStart(7)+'  '+(timed?'<span class="fs">'+(p.first?esc(p.first):'                ')+'</span>  ':'')+'<span class="ml" data-q="'+esc(p.key)+'">'+esc(p.key)+'</span>'+(p.hosts?'<span class="hn" title="the same message for '+p.hosts+' host names; HOST stands for the name">'+p.hosts+' hosts</span>':'')+(ks>=0?'<span class="kn" data-sig="'+ks+'" title="known error string · one known cause: '+esc(SIGS[ks].c)+'">?</span>':'')+'</div>'}).join('')+'</div>'}
+  if(d.groups.length)h+='<div class="rbar"><span>'+d.groups.length+' log'+(d.groups.length===1?'':'s')+(d.groups.length>1?' · click a name to open or close it':'')+'</span>'+(d.groups.length>1?'<a href="#" id="gopen">expand all</a><a href="#" id="gshut">collapse all</a>':'')+'<a href="#" id="scopy" title="file:line and text of every match shown">copy as text</a></div>';
+  d.groups.forEach(function(g,gi){var open=gi===0||d.groups.length<=3,multi=g.members.length>1,body='',mi=-1;self.order[g.file]=[];
+   g.members.forEach(function(p){self.famOf[p]=g.file;self.hits[p]=[]});
+   g.lines.forEach(function(l){var p=g.members[l[3]];
+    if(multi&&l[3]!==mi){mi=l[3];body+='<div class="mh">'+esc(p.split('/').pop())+' · '+(d.counts[p]||0).toLocaleString()+' match'+(d.counts[p]===1?'':'es')+'</div>'}
+    if(l[0]===null){body+='<a class="gap"><i></i>…</a>';return}
+    if(l[2]){self.hits[p].push(l[0]);self.order[g.file].push([p,l[0]])}
+    var ks=l[2]?sigOf(l[1]):-1;body+='<a href="#" data-view="'+esc(p+':'+l[0])+'" class="vw'+(l[2]?'':' ctx')+'" title="'+esc(l[1].slice(0,600))+'"><i>'+l[0]+'</i>'+rids(l[2]?mark(l[1]):CZ.line(l[1]))+(ks>=0?'<span class="kn" data-sig="'+ks+'" title="known error string · one known cause: '+esc(SIGS[ks].c)+'">?</span>':'')+'</a>'});
+   h+='<div class="grp'+(open?'':' shut')+'"><div class="gh" tabindex="0" role="button" aria-expanded="'+(open?'true':'false')+'" title="click to open or close"><span class="tw">'+(open?'▾':'▸')+'</span><b title="'+esc(g.file)+'">'+esc(g.file)+'</b><span>'+g.n.toLocaleString()+' match'+(g.n===1?'':'es')+(multi?' in '+g.members.length+' files, oldest file first':'')+(g.n>g.shown?' · newest '+g.shown+' shown':'')+'</span></div><div class="gl">'+body+'</div></div>'});
+  var nm='no matches';
+  if(!partial&&!h){var tot=0,onn=0,one='';self.fams.forEach(function(fm){fm.members.forEach(function(m){tot++;if(!self.off[m.path]){onn++;one=m.path}})});
+   var nar=[];if(tot&&onn<tot)nar.push(onn===1?'only '+esc(one)+' was searched ('+(tot-1).toLocaleString()+' other files are unticked)':'only '+onn+' of '+tot.toLocaleString()+' files were searched');
+   if($('#o_from').value.trim()||$('#o_to').value.trim())nar.push('only lines in the time window');if($('#o_x').value.trim())nar.push('lines matching the "hide" pattern were left out');
+   if(nar.length)nm='no matches · '+nar.join(' · ')+' <button type="button" class="btn2" id="swide">search every file, any time</button>'}
+  $('#sres').innerHTML='<div id="sreq">'+(self.req&&self.req.q===$('#q').value.trim()?self.req.html:'')+'</div>'+(h||'<div class="nc">'+(partial?'searching…':nm)+'</div>');self.reqWire();if($('#swide'))$('#swide').onclick=function(){self.unfilter('all')};$('#sres').scrollTop=partial?keepTop:0;
+  function setg(g,shut){g.classList.toggle('shut',shut);$('.tw',g).textContent=shut?'▸':'▾';$('.gh',g).setAttribute('aria-expanded',shut?'false':'true')}
+  $$('#sres .gh').forEach(function(x){x.onclick=function(){setg(x.parentNode,!x.parentNode.classList.contains('shut'))};x.onkeydown=function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();x.onclick()}}});
+  if($('#scopy'))$('#scopy').onclick=function(e){e.preventDefault();var out=[$('#q').value+'  ('+$('#sstat').textContent.split(' · ').slice(0,2).join(' · ')+')'];
+   d.groups.forEach(function(g){out.push('== '+g.file+' ('+g.n+')');g.lines.forEach(function(l){if(l[0]!==null&&l[2])out.push(g.members[l[3]]+':'+l[0]+'  '+l[1])})});copy(out.join('\n')+'\n',this)};
+  $$('#sres .wb').forEach(function(a){a.onclick=function(e){e.preventDefault();var k=a.dataset.k;if(k.length>10){$('#o_from').value=k+':00';$('#o_to').value=k+':59:59'}else{$('#o_from').value=k+' 00:00';$('#o_to').value=k+' 23:59:59'}dayFocus(k.slice(0,10));self.run()}});
+  $$('#sres .dord').forEach(function(a){a.onclick=function(e){e.preventDefault();self.distBy=a.dataset.o==='first'?'first':'n';self.show(d,q,partial)}});
+  if($('#gopen')){$('#gopen').onclick=function(e){e.preventDefault();$$('#sres .grp').forEach(function(g){setg(g,false)})};$('#gshut').onclick=function(e){e.preventDefault();$$('#sres .grp').forEach(function(g){setg(g,true)})}}
+  if(partial)return;var pv=this.pendingView,pf=this.pendingFrom;this.pendingView=this.pendingFrom=null;var o=d.groups[0]&&self.order[d.groups[0].file][0];if(pv)this.view(pv,pf);else if(o)this.view(o[0]+':'+o[1])},
+ /* a streamed search: one JSON line per finished log, then {done}. Logs are drawn as they arrive, at most every 300 ms. */
+ /* the last 10 searches, offered under the search box (kept in this browser) */
+ remember:function(q){var h=[];try{h=JSON.parse(store('sv.recent')||'[]')||[]}catch(e){}h=[q].concat(h.filter(function(x){return x!==q})).slice(0,10);store('sv.recent',JSON.stringify(h));this.recent()},
+ recent:function(){var h=[];try{h=JSON.parse(store('sv.recent')||'[]')||[]}catch(e){}var dl=$('#qhist');if(dl)dl.innerHTML=h.map(function(x){return '<option value="'+esc(x)+'">'}).join('')},
+ stream:function(r,pat,t0){var self=this,ct=r.headers.get('Content-Type')||'';if(!/ndjson/.test(ct)||!r.body||!r.body.getReader||!window.TextDecoder)return r.json();
+  var rd=r.body.getReader(),dec=new TextDecoder(),buf='',G=[],C={},fin=null,timer=null;
+  function paint(){timer=null;if(fin)return;var gs=G.slice().sort(function(a,b){return b.n-a.n}),n=0,f=0;gs.forEach(function(g){n+=g.n;f+=g.members.length});
+   self.sofar=' · '+n.toLocaleString()+' match'+(n===1?'':'es')+' in '+gs.length+' log'+(gs.length===1?'':'s')+' so far';
+   self.show({hits:n,files_hit:f,files_scanned:0,ms:Date.now()-t0,cs:$('#o_cs').checked,unscanned:[],groups:gs,counts:C,patterns:[],skipped:[],stopped:''},pat,true)}
+  function line(t){if(!t.trim())return;var o=JSON.parse(t);if(o.done){fin=o.done;return}G.push(o.group);Object.keys(o.counts||{}).forEach(function(k){C[k]=o.counts[k]});if(!timer)timer=setTimeout(paint,G.length===1?0:300)}
+  function pump(){return rd.read().then(function(x){if(x.done){line(buf);clearTimeout(timer);return fin||{error:'the search ended without a result (is sosview-lite serve still running?)'}}
+   buf+=dec.decode(x.value,{stream:true});var i;while((i=buf.indexOf('\n'))>=0){line(buf.slice(0,i));buf=buf.slice(i+1)}if(fin){clearTimeout(timer);rd.cancel().catch(function(){});return fin}return pump()})}
+  return pump()},
+ rows:function(ls){var hs=this.hits[this.vfile]||[],ln=this.vline;return ls.map(function(l){return '<div class="'+(l[0]===ln?'cur':(hs.indexOf(l[0])>=0?'hit':''))+'" id="v'+l[0]+'"><i>'+l[0]+'</i>'+rids(CZ.line(l[1]))+(function(){var k=sigOf(l[1]);return k<0?'':'<button type="button" class="kn" data-sig="'+k+'" title="known error string · one known cause: '+esc(SIGS[k].c.slice(0,160))+' · click: open it in Learn">?</button>'})()+'</div>'}).join('')},
+ more:function(){var self=this,vb=$('#vb'),p=this.vfile;$$('.vmore',vb).forEach(function(x){x.remove()});var ds=$$('div[id^="v"]',vb);if(!ds.length)return;
+  var first=+ds[0].id.slice(1),last=+ds[ds.length-1].id.slice(1),tot=this.vtotal||last,N=500;
+  function bar(cls,label,a,b2,end){var x=document.createElement('div');x.className='vmore';x.innerHTML='<a href="#">'+label+'</a>'+(end?' · <a href="#" data-e="1">'+end+'</a>':'');
+   $$('a',x).forEach(function(k){k.onclick=function(e){e.preventDefault();if(k.dataset.e){self.view(p+':'+(cls==='up'?1:tot));return}self.load(a,b2,cls==='up')}});return x}
+  if(first>1)vb.insertBefore(bar('up','▲ '+Math.min(N,first-1).toLocaleString()+' earlier lines',Math.max(1,first-N),first-1,first-1>N?'start of file':''),vb.firstChild);
+  if(last<tot)vb.appendChild(bar('dn','▼ '+Math.min(N,tot-last).toLocaleString()+' later lines ('+(tot-last).toLocaleString()+' to the end)',last+1,Math.min(tot,last+N),tot-last>N?'end of file':''))},
+ load:function(a,b2,up){var self=this,p=this.vfile,vb=$('#vb');fetch('/view?path='+encodeURIComponent(p)+'&line='+a+'&from='+a+'&to='+b2).then(function(r){return r.json()}).then(function(d){if(self.vfile!==p||d.error)return;
+  var tmp=document.createElement('div');tmp.innerHTML=self.rows(d.lines);var fr=document.createDocumentFragment();while(tmp.firstChild)fr.appendChild(tmp.firstChild);
+  $$('.vmore',vb).forEach(function(x){x.remove()});var h0=vb.scrollHeight,t0=vb.scrollTop;if(up)vb.insertBefore(fr,vb.firstChild);else vb.appendChild(fr);self.more();if(up)vb.scrollTop=t0+(vb.scrollHeight-h0)})},
+ goBack:function(){var b=this.back;this.unback();if(!b)return;tab(b.tab);var el=b.id&&document.getElementById(b.id);
+  if(el){RV.reveal(el);el.scrollIntoView({block:'center'});el.classList.add('flash');setTimeout(function(){el.classList.remove('flash')},1600)}},
+ unback:function(){var v=$('#sview');this.back=null;$('#vback').hidden=true;if(v.dataset.w!==undefined){v.style.width=v.dataset.w;delete v.dataset.w}},
+ view:function(spec,from){var self=this,i=spec.lastIndexOf(':'),p=spec.slice(0,i),ln=+spec.slice(i+1)||1;this.vfile=p;this.vline=ln;
+  if(from){this.init();this.back=from;var v=$('#sview');$('#vback').hidden=false;$('#vback').onclick=function(e){e.preventDefault();self.goBack()};
+   if(v.dataset.w===undefined){v.dataset.w=v.style.width;v.style.width=Math.round(room(v))+'px'}
+   if(!this.last)$('#sres').innerHTML='<div class="nc" style="padding:14px 4px;line-height:1.7">opened from the '+esc(from.tab)+' tab'+(from.title?': <b>'+esc(from.title.replace(/^\/\/\s*/,''))+'</b>':'')+'<br><b>'+esc(p)+'</b> is in the viewer on the right, at line '+ln.toLocaleString()+'.<br><a href="#" id="sback">‹ back to the '+esc(from.tab)+'</a> · or search above to search the logs</div>',$('#sback').onclick=function(e){e.preventDefault();self.goBack()}}
+  if(curTab()==='search'&&!from)setHash(this.hashOf());
+  $('#vpath').textContent=p.split('/').pop();$('#vpath').title=p;$('#vpos').textContent='loading…';$('#vraw').href='/file?path='+encodeURIComponent(p)+'&line='+ln;
+  fetch('/view?path='+encodeURIComponent(p)+'&line='+ln).then(function(r){return r.json()}).then(function(d){if(self.vfile!==p||self.vline!==ln)return;if(d.error){$('#vpos').textContent='';$('#vb').textContent=p+': '+d.error;return}
+   self.vtotal=d.total;$('#vpos').textContent='line '+ln.toLocaleString()+' of '+d.total.toLocaleString();
+   $('#vb').innerHTML=self.rows(d.lines);self.more();
+   $('#vf').textContent=[self.atText,d.note].filter(Boolean).join(' · ');self.atText='';var c=$('#v'+ln),vb=$('#vb');if(c)vb.scrollTop=c.offsetTop-vb.offsetTop-vb.clientHeight/2;$$('.grp .gl a.cur').forEach(function(a){a.classList.remove('cur')});var a=$('.grp .gl a[data-view="'+(p+':'+ln).replace(/"/g,'\\"')+'"]');if(a)a.classList.add('cur')})},
+ step:function(dir){var self=this,o=this.order[this.famOf[this.vfile]]||[],i=-1,k;if(!o.length)return;
+  for(k=0;k<o.length;k++){if(o[k][0]===self.vfile&&o[k][1]===self.vline){i=k;break}}
+  if(i<0){for(k=0;k<o.length;k++){if(o[k][0]===self.vfile&&o[k][1]>self.vline){i=dir>0?k-1:k;break}}if(i<0)i=dir>0?-1:o.length}
+  var n=o[i+dir];if(n)this.view(n[0]+':'+n[1])}};}
+function route(h,st){h=h||'';var el;
+ if(h.indexOf('learn')===0&&$('#pane-learn')){tab('learn',true);Learn.show(h.slice(6)||'home',true)}
+ else if(h.indexOf('tasks')===0){tab('tasks',true);if(h.indexOf('tasks/')===0)Tasks.byId(decodeURIComponent(h.slice(6)))}
+ else if(h.indexOf('search')===0){tab('search',true);if(window.Search)Search.fromHash(h)}
+ else{tab('report',true);if(st&&st.y!==undefined)window.scrollTo(0,st.y);else if(h&&(el=document.getElementById(h))){RV.reveal(el);el.scrollIntoView({block:'start'});if(el.classList.contains('blk')){cur=blks.indexOf(el);el.classList.add('cur')}}}}
+try{history.scrollRestoration='manual'}catch(e){}      /* the page restores the Report position itself */
+window.addEventListener('popstate',function(e){route((location.hash||'').slice(1),e.state)});
+route((location.hash||'').slice(1),null);
+})();
+"""
+
+
+# ---- search (serve) -------------------------------------------------------------------
+
+LOG_GLOBS = ["var/log/*", "sos_commands/logs/*", "var/lib/pgsql/data/log/*", "var/lib/pgsql/data/pg_log/*"]   # logs only: the task tables have their own preset
+PRESETS = [
+    ("logs", "all logs", LOG_GLOBS),
+    ("foreman", "Foreman (production.log, installer, maintain)", ["var/log/foreman/*", "var/log/foreman-installer/*", "var/log/foreman-maintain/*"]),
+    ("tasks", "task and Dynflow tables (database dumps)", ["sos_commands/foreman/foreman_tasks_*", "sos_commands/foreman/dynflow_*"]),
+    ("pulp", "Pulp / system logs (journal, messages)", ["sos_commands/logs/journalctl*", "var/log/messages*", "var/log/pulp*"]),
+    ("candlepin", "Candlepin", ["var/log/candlepin/*", "var/log/tomcat/*"]),
+    ("httpd", "httpd", ["var/log/httpd/*"]),
+    ("rhsm", "RHSM / virt-who", ["var/log/rhsm/*", "etc/rhsm/*", "etc/virt-who.d/*", "etc/sysconfig/virt-who"]),
+    ("postgresql", "PostgreSQL logs", ["var/lib/pgsql/data/log/*", "var/lib/pgsql/data/pg_log/*", "var/opt/rh/rh-postgresql12/lib/pgsql/data/log/*"]),
+    ("config", "configuration (etc/)", ["etc/*"]),
+    ("everything", "every file, including sos metadata", ["*"]),
+]
+
+
+ARCHIVE = re.compile(r"\.(zst|zip)$")                  # not read; .gz / .xz / .bz2 rotated logs are read through the stdlib
+COMPRESSED = re.compile(r"\.(gz|xz|bz2)$")
+
+
+def open_log(full):
+    """A binary file object for a log, decompressing rotated .gz / .xz / .bz2 copies on the fly."""
+    m = COMPRESSED.search(full)
+    if not m:
+        return open(full, "rb")
+    if m.group(1) == "gz":
+        import gzip
+        return gzip.open(full, "rb")
+    if m.group(1) == "xz":
+        import lzma
+        return lzma.open(full, "rb")
+    import bz2
+    return bz2.open(full, "rb")
+_DATE_TOKEN = r"(?:\d{4}-\d{2}-\d{2}(?:[T_-]?\d{2}[:\-]?\d{2}(?:[:\-]?\d{2})?)?|\d{8}(?:[-_T]?\d{4,6})?|\d{10})"
+_FAM_DATE = re.compile(r"[.\-_]" + _DATE_TOKEN + r"(?=[.\-_]|$)")
+_FAM_NUM = re.compile(r"\.(\d{1,3})$")
+_FAM_DAY = re.compile(r"-(Mon|Tue|Wed|Thu|Fri|Sat|Sun)(?=\.log$)")
+
+
+def log_family(rel):
+    """Rotated and dated copies of one log share a name once the date or number is taken out:
+    tomcat/catalina.2026-07-22.log -> tomcat/catalina.log, messages-20261020 -> messages,
+    production.log.1 -> production.log, postgresql-Mon.log -> postgresql.log."""
+    d, b = os.path.split(rel)
+    b = COMPRESSED.sub("", b)
+    k = _FAM_DAY.sub("", _FAM_NUM.sub("", _FAM_DATE.sub("", b))) or b
+    return d + "/" + k if d else k
+
+
+def member_key(t, rel):
+    """Oldest first, the live file last."""
+    b = COMPRESSED.sub("", os.path.basename(rel))
+    m = _FAM_DATE.search(b)
+    if m:
+        return (1, re.sub(r"\D", "", m.group()).ljust(14, "0"))
+    m = _FAM_NUM.search(b)
+    if m:
+        return (0, "%04d" % (9999 - int(m.group(1))))
+    if _FAM_DAY.search(b):
+        try:
+            return (1, "m%015d" % int(os.path.getmtime(os.path.join(t.root, rel))))
+        except OSError:
+            return (1, "m")
+    return (2, "")
+
+
+def families(t, rels_sizes):
+    """[(family, [(rel, size), ...] oldest first)], largest family first."""
+    fams = {}
+    for rel, size in rels_sizes:
+        fams.setdefault(log_family(rel), []).append((rel, size))
+    out = [(k, sorted(v, key=lambda x: member_key(t, x[0]))) for k, v in fams.items()]
+    out.sort(key=lambda kv: -sum(sz for _, sz in kv[1]))
+    return out
+
+
+def preset_files(t, pid, rotated=True, dups=False):
+    import fnmatch
+    globs = next((g for p, _, g in PRESETS if p == pid), LOG_GLOBS)
+    rx = [re.compile(fnmatch.translate(g)) for g in globs]
+    noise = [] if pid == "everything" else [re.compile(fnmatch.translate(g)) for g in NOISE_GLOBS]
+    full_j = t.exists("sos_commands/logs/journalctl_--no-pager")
+    out = []
+    for rel, full, size in t.files():
+        if not any(r.match(rel) for r in rx) or any(r.match(rel) for r in noise):
+            continue
+        if ARCHIVE.search(rel) or (not rotated and ROTATED.search(rel)) or (COMPRESSED.search(rel) and log_family(rel) == rel):
+            continue
+        if not dups and full_j and "journalctl" in rel and not rel.endswith("journalctl_--no-pager"):
+            continue
+        out.append((rel, size))
+    out.sort(key=lambda x: -x[1])
+    return out
+
+
+# Ready-made searches. Each one only fills the search box; the pattern stays visible and editable.
+QUICK = [
+    ("errors", "errors", r"\b(ERROR|FATAL|CRITICAL|SEVERE|PANIC|Traceback)\b|\[[EF]\||\b\w*(Error|Exception)\b|level=(error|fatal)", True,
+     r"#011from |^\s+(from|at) |^\s*File \"|^\s*[0-9a-f]{8} \| |Use -l to set the terminal output log level", "upper-case ERROR/FATAL, Rails [E| lines, *Error / *Exception class names; traceback frame lines and installer help text hidden"),
+    ("connection", "connection", r"Connection refused|Connection reset|No route to host|Name or service not known|Temporary failure in name resolution|"
+     r"Cannot connect to host|getaddrinfo|Network is unreachable|ECONNREFUSED|EHOSTUNREACH|Failed to connect", False, "", "refused, reset, DNS and routing failures"),
+    ("certs", "certificates", r"certificate verify failed|CERTIFICATE_VERIFY_FAILED|SSL[_ ]?error|SSLError|x509|certificate (has )?expired|not yet valid|"
+     r"unable to get local issuer|self[- ]signed|handshake fail|unknown ca|bad certificate", False, "", "SSL/TLS and certificate errors"),
+    ("timeouts", "timeouts", r"timed out|Timeout::Error|ReadTimeout|ConnectTimeout|execution expired|Gateway Time-?out|deadline exceeded", False, "", "anything that gave up waiting"),
+    ("disk", "disk", r"No space left on device|Disk quota exceeded|Read-only file system|ENOSPC|could not extend file|Input/output error|I/O error", False, "", "full or failing storage"),
+    ("memory", "memory", r"Out of memory|oom[-_]kill|invoked oom-killer|Killed process|Cannot allocate memory|OutOfMemoryError|Java heap space|MemoryError", False, "", "OOM killer and allocation failures"),
+    ("database", "database", r"PG::\w+|DatabaseDisconnect|deadlock detected|too many (clients|connections)|remaining connection slots|could not connect to server|"
+     r"terminating connection|unexpected zero page|duplicate key value|ActiveRecord::\w+(Error|Invalid)", False, "", "PostgreSQL errors seen from either side"),
+    ("permissions", "permissions", r"Permission denied|avc:\s+denied|EACCES|Operation not permitted|403 Forbidden|Access denied|SELinux is preventing", False, "", "file permissions, SELinux, HTTP 403"),
+    ("auth", "auth", r"authentication fail|Failed password|invalid (user|credentials|token)|Unauthorized|401 Unauthorized|token (has )?expired|LDAP|Kerberos|kinit", False, "", "logins, tokens, LDAP/Kerberos"),
+    ("services", "service failures", r"Main process exited|Failed with result|Failed to start|core dumped|segfault|start request repeated|entered failed state|Watchdog timeout", False, "", "systemd units that stopped or crashed"),
+    ("clock", "time sync", r"clock skew|time (jump|went backwards)|System clock wrong|chronyd.*(unsynchronised|no selectable|Can't synchronise)|ntpd.*(no servers|unreachable)", False, "", "clock and NTP/chrony trouble"),
+]
+
+
+# Plain words at least one of which is in every line a quick search matches (lower case for the searches that ignore
+# case). Python's re tries a long alternation at every position of a file; finding these words with str.find first and
+# running the pattern only on the lines that hold one is many times faster, with the same lines found.
+QUICK_WORDS = {
+    "errors": ["ERROR", "FATAL", "CRITICAL", "SEVERE", "PANIC", "Traceback", "[E|", "[F|", "Error", "Exception", "level=error", "level=fatal"],
+    "connection": ["connection refused", "connection reset", "no route to host", "name or service not known", "temporary failure in name resolution",
+                   "cannot connect to host", "getaddrinfo", "network is unreachable", "econnrefused", "ehostunreach", "failed to connect"],
+    "certs": ["certificate", "ssl", "x509", "not yet valid", "unable to get local issuer", "signed", "handshake fail", "unknown ca"],
+    "timeouts": ["timed out", "timeout::error", "readtimeout", "connecttimeout", "execution expired", "gateway time", "deadline exceeded"],
+    "disk": ["no space left on device", "disk quota exceeded", "read-only file system", "enospc", "could not extend file", "input/output error", "i/o error"],
+    "memory": ["out of memory", "oom", "killed process", "cannot allocate memory", "outofmemoryerror", "java heap space", "memoryerror"],
+    "database": ["pg::", "databasedisconnect", "deadlock detected", "too many ", "remaining connection slots", "could not connect to server",
+                 "terminating connection", "unexpected zero page", "duplicate key value", "activerecord::"],
+    "permissions": ["permission denied", "avc:", "eacces", "operation not permitted", "403 forbidden", "access denied", "selinux is preventing"],
+    "auth": ["authentication fail", "failed password", "invalid ", "unauthorized", "token", "ldap", "kerberos", "kinit"],
+    "services": ["main process exited", "failed with result", "failed to start", "core dumped", "segfault", "start request repeated",
+                 "entered failed state", "watchdog timeout"],
+    "clock": ["clock skew", "time jump", "time went backwards", "system clock wrong", "chronyd", "ntpd"],
+}
+PREFILTER = dict((q[2], (q[3], QUICK_WORDS[q[0]])) for q in QUICK if q[0] in QUICK_WORDS)   # pattern -> (case, words)
+
+_HEAD = re.compile(r"^(?:\S+\s+){0,5}?\S+?\[\d+\]:|^\d{4}-\d{2}-\d{2}[T ][\d:.,]+\S*|^[A-Z][a-z]{2}\s+\d{1,2}\s+[\d:]{8}\s+\S+|^\[[^\]]{8,40}\]")
+
+
+def around(line, rx, visible=90, width=400):
+    """Cut a long line so the match sits near the start of what the pane shows, keeping the
+    timestamp / host / process prefix so a cut line still says when and where."""
+    m = rx.search(line)
+    if not m or m.end() <= visible:
+        return clean(line, width)
+    h = _HEAD.match(line)
+    head = line[:h.end()] if h and h.end() <= 60 and h.end() < m.start() - 10 else ""
+    lo = max(len(head), m.start() - 30)
+    return (head + " " if head else "") + "…" + line[lo:lo + width] + ("…" if lo + width < len(line) else "")
+
+
+_HOST_TLDS = "com|net|org|edu|gov|mil|int|io|lab|local|localdomain|internal|lan|corp|intra|home|test|example|cloud"
+
+
+def host_rx(t):
+    """Matches host names in a message: names under this host's own domain, and dotted names that end in a common
+    top-level domain. File names, module paths and versions (foreman.service, pulpcore.app, el9.x86_64) do not match."""
+    dom = ""
+    try:
+        text, _ = t.read(["hostname", "sos_commands/host/hostname_-f", "sos_commands/host/hostname"])
+        name = ((text or "").strip().splitlines() or [""])[0].strip().lower()
+        if name.count(".") >= 2 and re.match(r"^[\w.-]+$", name):
+            dom = name.split(".", 1)[1]
+    except Exception:
+        dom = ""
+    alt = r"(?:[\w-]+\.)+(?:%s)" % _HOST_TLDS
+    if dom:
+        alt = r"(?:[\w-]+\.)+%s|%s" % (re.escape(dom), alt)
+    return re.compile(r"(?<![\w.@/-])(?:%s)(?![\w-]|\.\w)" % alt, re.I)
+
+
+def when_counts(hours):
+    """Hits by the time on the line itself: per hour when they fall within three days, else per day. {"unit", "rows"}."""
+    if not hours:
+        return {"unit": "", "rows": []}
+    ks = sorted(hours)
+    if len(set(k[:10] for k in ks)) <= 3:
+        return {"unit": "hour", "rows": [[k, hours[k]] for k in ks]}
+    days = {}
+    for k, v in hours.items():
+        days[k[:10]] = days.get(k[:10], 0) + v
+    return {"unit": "day", "rows": [[k, days[k]] for k in sorted(days)]}
+
+
+def merge_hosts(pats, hrx, least=4, seen=None):
+    """Distinct messages that differ only in a host name: with `least` or more names they become one row, with HOST
+    in place of the name and the number of names. Fewer than that stay as they are, so a message about two
+    destinations still names both. Returns [{"key", "n", "hosts"}], most frequent first."""
+    by, seen = {}, seen or {}
+    for k, v in pats.items():
+        by.setdefault(hrx.sub("HOST", k), []).append((k, v))
+
+    def span(keys):
+        got = [seen[k] for k in keys if k in seen]
+        return (min(g[0] for g in got), max(g[1] for g in got)) if got else ("", "")
+    out = []
+    for m, items in by.items():
+        if len(items) >= least and any(k != m for k, _ in items):
+            a, b = span([k for k, _ in items])
+            out.append({"key": m, "n": sum(v for _, v in items), "hosts": len(items), "first": a, "last": b})
+        else:
+            for k, v in items:
+                a, b = span([k])
+                out.append({"key": k, "n": v, "hosts": 0, "first": a, "last": b})
+    out.sort(key=lambda p: -p["n"])
+    return out
+
+
+def msgkey(s):
+    """Group key for 'distinct messages': timestamps and request ids off, ids and long numbers hidden, file names generalized."""
+    for rx, rep in NORMALIZE[:4]:
+        s = rx.sub(rep, s)
+    return generalize_paths(squash(s))[:160]
+
+
+_LINE_INDEX = {}
+_DECOMP = {}
+
+
+def _decompressed(full):
+    """The whole decompressed text of a rotated .gz/.xz/.bz2 log, kept for the last three files viewed."""
+    st = os.stat(full)
+    hit = _DECOMP.get(full)
+    if hit and hit[0] == (st.st_size, st.st_mtime):
+        return hit[1]
+    parts, got = [], 0
+    try:
+        with open_log(full) as fh:
+            while got < 512 * 1024 * 1024:
+                chunk = fh.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                parts.append(chunk)
+                got += len(chunk)
+    except Exception:          # a cut or corrupt archive: keep what was decompressed before the damage
+        pass
+    data = b"".join(parts)
+    if len(_DECOMP) >= 3:
+        _DECOMP.pop(next(iter(_DECOMP)))
+    _DECOMP[full] = ((st.st_size, st.st_mtime), data)
+    return data
+
+
+def line_index(full):
+    """Byte offset of the start of every line ('\n'-separated), built once per file and kept while it is unchanged."""
+    import array
+    import io
+    st = os.stat(full)
+    key = (st.st_size, st.st_mtime)
+    hit = _LINE_INDEX.get(full)
+    if hit and hit[0] == key:
+        return hit[1]
+    offs = array.array("Q", [0])
+    pos = 0
+    size = st.st_size
+    if COMPRESSED.search(full):
+        data = _decompressed(full)
+        size = len(data)
+        src = io.BytesIO(data)
+    else:
+        src = open(full, "rb")
+    with src as fh:
+        while True:
+            chunk = fh.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            i = chunk.find(b"\n")
+            while i != -1:
+                offs.append(pos + i + 1)
+                i = chunk.find(b"\n", i + 1)
+            pos += len(chunk)
+    if len(offs) > 1 and offs[-1] >= size:
+        offs.pop()
+    if len(_LINE_INDEX) > 24:
+        _LINE_INDEX.pop(next(iter(_LINE_INDEX)))
+    _LINE_INDEX[full] = (key, offs)
+    return offs
+
+
+def read_lines(full, lo, hi):
+    """(total lines, lines lo..hi-1) without reading the rest of the file."""
+    offs = line_index(full)
+    n = len(offs)
+    lo, hi = max(0, lo), min(n, hi)
+    if lo >= hi:
+        return n, []
+    if COMPRESSED.search(full):
+        whole = _decompressed(full)
+        data = whole[offs[lo]:(offs[hi] if hi < n else offs[lo] + 64 * 1024 * 1024)]
+    else:
+        with open(full, "rb") as fh:
+            fh.seek(offs[lo])
+            data = fh.read((offs[hi] - offs[lo]) if hi < n else 64 * 1024 * 1024)
+    rows = data.decode("utf-8", "replace").split("\n")[:hi - lo]
+    return n, [r[:-1] if r.endswith("\r") else r for r in rows]
+
+
+ERR_LOGS = [("production.log", ["var/log/foreman/production.log"]), ("proxy.log", ["var/log/foreman-proxy/proxy.log"]),
+            ("candlepin.log", ["var/log/candlepin/candlepin.log"]), ("system log", ["var/log/messages", "sos_commands/logs/journalctl_--no-pager*"]),
+            ("rhsm.log", ["var/log/rhsm/rhsm.log"])]
+
+
+def error_pattern(err):
+    """A task's error text as a pattern for the logs: the exception class in front is left out (logs often print the
+    message alone), the first 80 characters are kept, and every run of digits matches any number."""
+    first = next((l for l in (err or "").splitlines() if l.strip()), "").strip()
+    msg = re.sub(r"^[\w:]+(?:Error|Exception|Fault|Failure)\w*:\s*", "", first)
+    cut = re.search(r" [\[(]", msg[25:])          # stop before a trailing [details] or (details): addresses and pids vary
+    msg = msg[:25 + cut.start()] if cut else msg
+    msg = msg[:80].rstrip()
+    if len(re.sub(r"\d+", "", msg)) < 10:
+        return None, None, None
+    parts = re.split(r"(\d+)", msg)
+    pat = "".join(r"\d+" if i % 2 else re.escape(x) for i, x in enumerate(parts))
+    lit = max((x for i, x in enumerate(parts) if i % 2 == 0), key=len)
+    return pat, lit, msg
+
+
+def error_where(t, ctx, err):
+    """How often a task's error text appears in the main logs: count, first and last time, the newest line, and the
+    span each log covers (a 0 from a log that starts after the task means something else than a 0 that covers it)."""
+    pat, lit, msg = error_pattern(err)
+    if not pat:
+        return {"error": "the error text is too short to look for"}
+    rx = re.compile(pat)
+    ref = ref_time(ctx)
+    out = []
+    for name, cands in ERR_LOGS:
+        text, rel = t.read(cands, tail=True, limit=LOG_READ, largest=True)
+        if text is None:
+            continue
+        n, first, last, newest = 0, None, None, None
+        pos = text.find(lit)
+        while pos >= 0:
+            ls = text.rfind("\n", 0, pos) + 1
+            le = text.find("\n", pos)
+            le = len(text) if le < 0 else le
+            l = text[ls:le]
+            if rx.search(l):
+                n += 1
+                newest = ls
+                w = parse_when(l[:100], ref)
+                if w:
+                    first = w if first is None or w < first else first
+                    last = w if last is None or w > last else last
+            pos = text.find(lit, le)
+        head = [parse_when(l[:100], ref) for l in text[:20000].splitlines()[:50]]
+        tail_ = [parse_when(l[:100], ref) for l in text[-20000:].splitlines()[-50:]]
+        seen_ = [x for x in head + tail_ if x]            # earliest and latest: lines are not always in time order
+        a, b = (min(seen_), max(seen_)) if seen_ else (None, None)
+        when = ""
+        if first:
+            when = when_span(first, last)
+        out.append({"name": name, "file": rel, "n": n, "when": when,
+                    "line": (t.line_base(rel, text) + text.count("\n", 0, newest) + 1) if newest is not None else 0,
+                    "span": when_span(a, b, "%b %d") if a and b else ""})
+    return {"pattern": pat, "text": msg, "logs": out}
+
+
+AROUND_LOGS = ["var/log/foreman/production.log", "var/log/foreman-proxy/proxy.log", "var/log/messages", "sos_commands/logs/journalctl_--no-pager",
+               "var/log/foreman-installer/satellite.log", "var/log/foreman-installer/capsule.log", "var/log/candlepin/candlepin.log"]
+
+
+_YEAR_CUT = {}
+
+
+def _may_span_years(fh, size, ref):
+    """A quick look at a year-less log: the month at the first line of every 256 KB. False when those months, read back
+    from the collection time, stay inside the last 12 months; then the whole file need not be read to find a cut.
+    Small files are always read whole."""
+    if size <= 4 * 1024 * 1024:
+        return True
+    months, first = [], None
+    for off in range(0, size, 256 * 1024):
+        fh.seek(off)
+        buf = fh.read(1024).decode("utf-8", "replace")
+        if off:
+            buf = buf[buf.find("\n") + 1:]
+        m = _SYSLOG_LINE.match(buf)
+        if m:
+            first = first or m
+            months.append(MONTHS[m.group(1)])
+    fh.seek(max(0, size - 8192))
+    tail = list(_SYSLOG_LINE.finditer(fh.read().decode("utf-8", "replace")))
+    if not first or not tail:
+        return True
+    months.append(MONTHS[tail[-1].group(1)])
+    wraps = sum(1 for a, b in zip(months, months[1:]) if b < a)
+    try:
+        last = datetime.datetime(ref.year, MONTHS[tail[-1].group(1)], int(tail[-1].group(2)))
+        if last > ref + datetime.timedelta(days=1):
+            last = last.replace(year=ref.year - 1)
+        begin = datetime.datetime(last.year - wraps, MONTHS[first.group(1)], int(first.group(2)))
+    except ValueError:
+        return True
+    return begin < ref - datetime.timedelta(days=363)
+
+
+def file_year_cut(full, ref):
+    """Byte offset where the last 12 months of a year-less log begin (see syslog_years); 0 when the whole file is
+    inside them, is not such a log, is compressed or is too big to read in one piece."""
+    try:
+        st = os.stat(full)
+    except OSError:
+        return 0
+    key = (full, st.st_size, st.st_mtime, ref)
+    if key in _YEAR_CUT:
+        return _YEAR_CUT[key]
+    cut = 0
+    if ref and not COMPRESSED.search(full) and st.st_size <= 512 * 1024 * 1024:
+        try:
+            with open(full, "rb") as fh:
+                if _SYSLOG_LINE.search(fh.read(4096).decode("utf-8", "replace")) and _may_span_years(fh, st.st_size, ref):
+                    fh.seek(0)
+                    text = fh.read().decode("utf-8", "replace")
+                    ys = syslog_years(text, ref)
+                    if ys and ys[2]:
+                        cut = len(text[:ys[2]].encode("utf-8"))
+        except (OSError, MemoryError):
+            cut = 0
+    if len(_YEAR_CUT) > 64:
+        _YEAR_CUT.clear()
+    _YEAR_CUT[key] = cut
+    return cut
+
+
+def line_at_time(full, when, ref):
+    """First line whose timestamp is at or after `when` (binary search over the line index; logs are close to time order).
+    In a year-less log that goes back more than 12 months, the search stays in the last 12."""
+    offs = line_index(full)
+    n = len(offs)
+    ycut = file_year_cut(full, ref)
+    lo0 = 0
+    if ycut:
+        import bisect
+        lo0 = min(max(0, n - 1), bisect.bisect_left(offs, ycut))
+
+    def ts(i):
+        for k in range(i, min(n, i + 40)):
+            _, r = read_lines(full, k, k + 1)
+            w = parse_when(r[0][:60], ref) if r else None
+            if w:
+                return w, k
+        return None, i
+    first, _ = ts(lo0)
+    last = None
+    for k in range(max(0, n - 40), n):
+        w = parse_when(read_lines(full, k, k + 1)[1][0][:60], ref) if n else None
+        if w:
+            last = w
+    lo, hi = lo0, n
+    while lo < hi:
+        mid = (lo + hi) // 2
+        w, k = ts(mid)
+        if w is None or w < when:
+            lo = (k if w is not None else mid) + 1
+        else:
+            hi = mid
+    w, k = ts(min(lo, max(0, n - 1)))
+    return {"line": k + 1, "at": w.strftime("%Y-%m-%d %H:%M:%S") if w else "", "first": first.strftime("%Y-%m-%d %H:%M") if first else "",
+            "last": last.strftime("%Y-%m-%d %H:%M") if last else "", "total": n}
+
+
+def user_time(s, ref, day=None):
+    """A time typed into the page: '2026-11-02 08:00', 'Nov 2 14:05', or '10:30' (on `day`, else the collection day)."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    w = parse_when(s, ref)
+    if w:
+        return w
+    m = re.match(r"^(\w{3})\s+(\d{1,2})\s+(\d{1,2}):(\d\d)$", s)
+    if m:
+        return parse_when("%s %2d %02d:%s:00" % (m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)), ref)
+    m = re.match(r"^(\d{1,2}):(\d\d)(?::(\d\d))?$", s)
+    if m:
+        base = day or ref
+        return base.replace(hour=int(m.group(1)), minute=int(m.group(2)), second=int(m.group(3) or 0), microsecond=0)
+    return None
+
+
+SPLIT = 24 * 1024 * 1024            # an uncompressed file bigger than this is searched in parts, in parallel
+
+
+def _part_bounds(full, size, context):
+    """Byte ranges of about SPLIT bytes, each starting at a line start; with each start, where its `context`
+    lines before begin (so a hit on a part's first line still shows the line above it)."""
+    out, pos = [], 0
+    with open(full, "rb") as fh:
+        while pos < size:
+            end = min(size, pos + SPLIT)
+            if end < size:
+                fh.seek(end)
+                rest = fh.read(1 << 20)
+                k = rest.find(b"\n")
+                end = size if k < 0 else end + k + 1
+            pre = pos
+            if pos and context:
+                back = min(pos, 64 * 1024)
+                fh.seek(pos - back)
+                buf = fh.read(back)
+                q = len(buf) - 1                      # buf ends with the '\n' before pos
+                for _ in range(context):
+                    q = buf.rfind(b"\n", 0, q)
+                    if q < 0:
+                        break
+                pre = pos - back + (q + 1 if q >= 0 else 0)
+            out.append((pos, end, pre))
+            pos = end
+    return out
+
+
+def _newest(blocks, per_file, context):
+    """The blocks that hold the newest per_file hits; the oldest kept block starts up to `context` lines before
+    its first kept hit."""
+    import collections
+    keep, hits = collections.deque(), 0
+    for blk in reversed(blocks):
+        nh = sum(1 for e in blk if e[2])
+        if hits + nh <= per_file:
+            keep.appendleft(blk)
+            hits += nh
+            if hits == per_file:
+                break
+            continue
+        room = per_file - hits
+        if room > 0:
+            k0 = [ix for ix, e in enumerate(blk) if e[2]][-room]
+            lo = k0
+            while lo > 0 and not blk[lo - 1][2] and k0 - lo < context:
+                lo -= 1
+            keep.appendleft(list(blk[lo:]))
+        break
+    return keep
+
+
+def scan_part(job):
+    """Search one file, or one byte range of it. Returns its hit count, the newest per_file hits as raw blocks
+    [(line index from the start of the range, text, is hit)], the message patterns, its line count, and whether
+    the time ran out. Runs in a worker process; everything it needs is in `job`."""
+    import collections
+    import time
+    root, rel, start, end, pre, pattern, case, context, exclude, since, until, ref, per_file, deadline, group_limit, max_hits = job[:16]
+    ycut = job[16] if len(job) > 16 else 0
+    consumed = start
+    rx = re.compile(pattern, 0 if case else re.I)
+    rxm = re.compile(pattern, (0 if case else re.I) | re.M)        # over a whole piece: ^ and $ at every line
+    pf = PREFILTER.get(pattern)
+    if pf and bool(pf[0]) != bool(case):          # the words fit the quick search as it is defined: same case handling
+        pf = None
+    # Case-insensitive search is several times slower in Python's re. When the pattern means the same in lower case
+    # (no \B, \S, \W, \D, \A, \Z), candidate lines are found in a lower-cased copy with a case-sensitive pattern;
+    # every candidate line is then checked with the real pattern.
+    rxl = None
+    if not case and not re.search(r"\\[A-Z]", pattern):
+        try:
+            rxl = re.compile(pattern.lower(), re.M)
+        except re.error:
+            rxl = None
+    xr = re.compile(exclude, 0 if case else re.I) if exclude else None
+    res = {"rel": rel, "start": start, "n": 0, "blocks": [], "pats": {}, "lines": 0, "cut": False, "full": False, "binary": False, "error": False,
+           "hours": {}, "seen": {}}   # hits per hour of the line's own time; first/last time per distinct message
+    if time.time() > deadline:     # queued behind the budget: not started, so the search ends when the budget does
+        res["cut"] = True
+        return res
+    try:
+        fh = open_log(os.path.join(root, rel))
+        if start:
+            fh.seek(start)
+        head = fh.read(min(8192, end - start) if end is not None else 8192)
+    except Exception:          # OSError, EOFError, zlib/lzma errors on a damaged archive
+        res["error"] = True
+        return res
+    if start == 0 and b"\0" in head and head.count(b"\0") > 64:
+        fh.close()
+        res["binary"] = True
+        return res
+    prev_tail = []
+    if pre < start and context:
+        with open(os.path.join(root, rel), "rb") as ph:
+            ph.seek(pre)
+            pl = ph.read(start - pre).decode("utf-8", "replace").split("\n")
+        if pl and pl[-1] == "":
+            pl.pop()
+        prev_tail = [(-len(pl) + k, x) for k, x in enumerate(pl)]
+    left = None if end is None else end - start - len(head)
+    blocks = collections.deque()
+    pats, hours, seen = res["pats"], res["hours"], res["seen"]
+    nblk_hits, after, n, cut, i, rest, hits_seen = 0, 0, 0, False, 0, head, 0
+    last_idx = -1
+    while True:
+        if left is None:
+            try:
+                chunk = fh.read(8 * 1024 * 1024)
+            except Exception:
+                chunk = b""
+        else:
+            chunk = fh.read(min(8 * 1024 * 1024, left)) if left > 0 else b""
+            left -= len(chunk)
+        data = rest + chunk
+        if chunk:
+            k = data.rfind(b"\n")
+            if k < 0:
+                rest = data
+                continue
+            rest, data = data[k + 1:], data[:k + 1]
+        else:
+            rest = b""
+        if not data:
+            break
+        data_start, consumed = consumed, consumed + len(data)
+        old_idx = 0                                 # lines of this piece before this index are over 12 months old
+        if ycut and data_start < ycut:
+            old_idx = len(data[:ycut - data_start].decode("utf-8", "replace")) if consumed > ycut else len(data) + 1
+        text = data.decode("utf-8", "replace")
+        # The pattern runs over the whole piece in C; only lines with a match are handled in Python.
+        nl_pos, nl_idx = 0, i
+        last_end = None
+        tail_prev = prev_tail
+
+        def lines_between(p0, p1, first_idx, limit):
+            out, q, j = [], p0, first_idx
+            while q < p1 and len(out) < limit:
+                e = text.find("\n", q, p1)
+                e = p1 if e < 0 else e
+                out.append((j, text[q:e]))
+                q, j = e + 1, j + 1
+            return out
+        pos = 0
+        scan, srx = text, rxm
+        if rxl is not None:
+            low = text.lower()
+            if len(low) == len(text):
+                scan, srx = low, rxl
+        words = pf[1] if pf and (pf[0] or scan is not text) else None
+        nxt = dict((w, -2) for w in words) if words else None
+        while True:
+            if nxt is not None:                     # the next line that holds one of the quick search's words
+                st = -1
+                for w, at in list(nxt.items()):
+                    if at == -1:
+                        continue
+                    if at < pos:
+                        at = scan.find(w, pos)
+                        nxt[w] = at
+                        if at == -1:
+                            continue
+                    if st < 0 or at < st:
+                        st = at
+                if st < 0:
+                    break
+            else:
+                m = srx.search(scan, pos)           # one search per candidate line: the rest of a hit line is skipped
+                if m is None:
+                    break
+                st = m.start()
+            if st >= len(text):
+                break
+            ls = text.rfind("\n", 0, st) + 1
+            le = text.find("\n", st)
+            le = len(text) if le < 0 else le
+            pos = le + 1
+            nl_idx += text.count("\n", nl_pos, ls)
+            nl_pos = ls
+            L = nl_idx
+            l = text[ls:le]
+            mm = rx.search(l)                       # the line on its own: a match across a newline does not count
+            if mm is None:
+                continue
+            if hits_seen & 0xff == 0 and time.time() > deadline:
+                cut = True
+                break
+            hits_seen += 1
+            w = None
+            if since or until:
+                if ls < old_idx:
+                    continue
+                w = parse_when(l[:80], ref)
+                if w is None or (since and w < since) or (until and w > until):
+                    continue
+            if xr and xr.search(l):
+                continue
+            if after > 0 and blocks:                # the lines after the previous hit, up to this one
+                got = lines_between(last_end + 1, ls, last_idx + 1, after) if last_end is not None else lines_between(0, ls, i, after)
+                blocks[-1].extend((j, x, False) for j, x in got)
+                after = 0
+            ring = []
+            if context:
+                q, j = ls, L
+                while q > 0 and len(ring) < context:
+                    q0 = text.rfind("\n", 0, q - 1) + 1
+                    j -= 1
+                    ring.insert(0, (j, text[q0:q - 1]))
+                    q = q0
+                need = context - len(ring)
+                if need and q == 0:
+                    ring = [x for x in tail_prev if x[0] < L][-need:] + ring
+            n += 1
+            if n & 0xff == 0:                       # tell the other parts, and stop once the whole search has enough
+                with _HITS.get_lock() if hasattr(_HITS, "get_lock") else _nolock():
+                    _HITS.value += 256
+                    over_all = _HITS.value > max_hits
+                if over_all:
+                    res["over"] = True
+                    break
+            if n > max_hits:
+                break
+            if n <= group_limit:
+                if len(l) <= 200:
+                    kk = msgkey(l)
+                else:                               # a long line: the part around the match, never starting inside the timestamp
+                    m0 = NORMALIZE[0][0].match(l) or NORMALIZE[1][0].match(l) or NORMALIZE[2][0].match(l)
+                    kk = msgkey(l[max(m0.end() if m0 else 0, mm.start() - 40):mm.end() + 120])
+                pats[kk] = pats.get(kk, 0) + 1
+                if w is None and ls >= old_idx:
+                    w = parse_when(l[:80], ref)
+                    q = ls
+                    for _ in range(30):                 # a traceback line or a wrapped line: the time of the entry above it
+                        if w is not None or q <= 0:
+                            break
+                        q = text.rfind("\n", 0, q - 1) + 1
+                        if q < old_idx:
+                            break
+                        w = parse_when(text[q:q + 80], ref)
+                if w is not None:
+                    ws = "%04d-%02d-%02d %02d:%02d" % (w.year, w.month, w.day, w.hour, w.minute)
+                    hours[ws[:13]] = hours.get(ws[:13], 0) + 1
+                    sn = seen.get(kk)
+                    if sn is None:
+                        seen[kk] = [ws, ws]
+                    elif ws < sn[0]:
+                        sn[0] = ws
+                    elif ws > sn[1]:
+                        sn[1] = ws
+            last_blk = blocks[-1] if blocks else None
+            if last_blk is not None and last_blk[-1][0] >= L - context - 1:      # touches the previous block
+                last_blk.extend((j, x, False) for j, x in ring if j > last_blk[-1][0])
+                last_blk.append((L, l, True))
+            else:
+                blocks.append([(j, x, False) for j, x in ring] + [(L, l, True)])
+            nblk_hits += 1
+            if nblk_hits > 2 * per_file:            # keep the newest per_file hits (trimmed in one pass now and then)
+                blocks, nblk_hits = _newest(blocks, per_file, context), per_file
+            after = context
+            last_end, last_idx = le, L
+        if cut or n > max_hits or res.get("over"):
+            break
+        nlines = text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+        if after > 0 and blocks:                    # context after the last hit of this piece
+            got = lines_between(last_end + 1, len(text), last_idx + 1, after) if last_end is not None else lines_between(0, len(text), i, after)
+            blocks[-1].extend((j, x, False) for j, x in got)
+            after -= len(got)
+        if context:
+            tl = []
+            q, j = len(text) - (1 if text.endswith("\n") else 0), i + nlines
+            while q > 0 and len(tl) < context:
+                q0 = text.rfind("\n", 0, q) + 1
+                j -= 1
+                tl.insert(0, (j, text[q0:q]))
+                q = q0 - 1
+            prev_tail = tl
+        i += nlines
+        if time.time() > deadline and chunk:
+            cut = True
+            break
+        if not chunk:
+            break
+    # the lines after the last hit of a range come from the next range
+    if after > 0 and blocks and end is not None and not cut:
+        try:
+            more = fh.read(64 * 1024).decode("utf-8", "replace").split("\n")[:after]
+            blocks[-1].extend((i + k, x, False) for k, x in enumerate(more) if k < len(more) - 1 or x)
+        except Exception:
+            pass
+    fh.close()
+    if nblk_hits > per_file:
+        blocks = _newest(blocks, per_file, context)
+    res.update(n=n, blocks=[list(b) for b in blocks], lines=i, cut=cut, over=res.get("over") or n > max_hits)
+    return res
+
+
+class _nolock(object):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+_POOL = {"pool": None, "n": 0}
+
+
+class _Count(object):
+    """The hits counted so far by all parts of one search (a shared value in worker processes)."""
+    def __init__(self):
+        self.value = 0
+
+
+_HITS = _Count()
+
+
+def _init_worker(v):
+    global _HITS
+    import signal
+    signal.signal(signal.SIGINT, signal.SIG_IGN)          # Ctrl-C is for the server; it ends the workers itself
+    _HITS = v
+
+
+def _pool():
+    """Worker processes for searching, made once. Fork keeps the start cheap; where fork is missing the search
+    runs in this process."""
+    if _POOL["pool"] is None:
+        try:
+            import multiprocessing
+            import warnings
+            n = max(1, min(8, (os.cpu_count() or 2)))
+            if n < 2:
+                return None
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                ctx = multiprocessing.get_context("fork")
+                v = ctx.Value("q", 0)
+                _POOL["pool"] = ctx.Pool(n, initializer=_init_worker, initargs=(v,))
+                _POOL["hits"] = v
+            _POOL["n"] = n
+        except Exception:
+            _POOL["pool"] = False
+    return _POOL["pool"] or None
+
+
+def stop_search_workers():
+    """End the search workers now, for an exit that skips Python's own clean-up. A signal sent to the server and its
+    workers together (pkill, a closed terminal) ends the workers first; the pool then starts new ones while the server
+    is still removing its extracted copy, and those would stay behind when it exits."""
+    import signal
+    p = _POOL.get("pool")
+    if not p:
+        return
+    try:
+        import multiprocessing.pool as mpp
+        p._worker_handler._state = mpp.TERMINATE          # no new worker from here on
+    except Exception:
+        pass
+    for w in list(getattr(p, "_pool", None) or []):
+        try:
+            os.kill(w.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+
+_SEARCH_LOCK = None
+
+
+def search_files(t, pattern, rels, case=False, context=1, budget=25.0, max_hits=200000, per_file=200, big=None,
+                 group_limit=50000, exclude="", since=None, until=None, ref=None, parallel=True):
+    """One search at a time: the parts of a search share one hit counter. Returns the whole result."""
+    for ev in search_stream(t, pattern, rels, case, context, budget, max_hits, per_file, big, group_limit, exclude, since, until, ref, parallel):
+        if ev[0] == "done":
+            return ev[1]
+
+
+def search_stream(t, pattern, rels, case=False, context=1, budget=25.0, max_hits=200000, per_file=200, big=None,
+                  group_limit=50000, exclude="", since=None, until=None, ref=None, parallel=True):
+    """Like search_files, but yields ("group", group, counts) as each log (with its rotated copies) is finished,
+    then ("done", result). The final result is the same as search_files returns."""
+    global _SEARCH_LOCK
+    import threading
+    if _SEARCH_LOCK is None:
+        _SEARCH_LOCK = threading.Lock()
+    with _SEARCH_LOCK:
+        for ev in _search_iter(t, pattern, rels, case, context, budget, max_hits, per_file, big, group_limit, exclude, since, until, ref, parallel):
+            yield ev
+
+
+def _trim_group(g, per_file, context):
+    """Keep the newest per_file matches of a log group (with their context lines)."""
+    keep, seen = len(g["lines"]), 0
+    for idx in range(len(g["lines"]) - 1, -1, -1):
+        if g["lines"][idx][2]:
+            seen += 1
+            if seen == per_file:
+                keep = idx
+                break
+    if seen >= per_file:
+        lo = keep
+        while lo > 0 and g["lines"][lo - 1][0] is not None and g["lines"][lo - 1][3] == g["lines"][keep][3] and not g["lines"][lo - 1][2] and keep - lo < context:
+            lo -= 1
+        g["lines"] = g["lines"][lo:]
+    g["shown"] = sum(1 for l in g["lines"] if l[2])
+
+
+def _search_iter(t, pattern, rels, case=False, context=1, budget=25.0, max_hits=200000, per_file=200, big=None,
+                 group_limit=50000, exclude="", since=None, until=None, ref=None, parallel=True):
+    """Search the given files. Rotated/dated copies of one log come back as one group (oldest file first),
+    showing the newest `per_file` matches of that group. Files, and parts of big files, are searched in parallel
+    worker processes; the result is the same as searching them one after another. Each log group is yielded
+    as soon as all its files are done; smaller logs are searched first, so they arrive first."""
+    import time
+    t0 = time.time()
+    try:
+        rxs = re.compile(pattern, 0 if case else re.I)
+        if exclude:
+            re.compile(exclude, 0 if case else re.I)
+    except re.error as e:
+        yield "done", {"error": "bad pattern: %s" % e}
+        return
+    sizes = {}
+    for rel in rels:
+        full = os.path.realpath(os.path.join(t.root, rel))
+        if full.startswith(t.root + os.sep) and os.path.isfile(full):
+            sizes[rel] = os.path.getsize(full)
+    fams = families(t, list(sizes.items()))
+    fams.sort(key=lambda kv: sum(sz for _, sz in kv[1]))      # smallest first: the time budget reaches the most logs
+    skipped, jobs, order = [], [], []
+    # No file is left out for its size. A file the budget cuts off is reported as not searched yet, and "continue"
+    # asks for it again; the budget then stretches with the size of the first file, so every round finishes at least one.
+    first_size = min([sz for _, m in fams[:1] for _, sz in m] or [0])
+    deadline = t0 + max(budget, first_size / float(4 * 1024 * 1024))
+    for fam, members in fams:
+        for rel, size in members:
+            if big and size > big and len(fams) > 1:
+                skipped.append([rel, size])
+                continue
+            order.append((fam, rel))
+            full = os.path.join(t.root, rel)
+            ycut = file_year_cut(full, ref)        # a date in a year-less log names one day only in its last 12 months
+            parts = [(0, None, 0)] if COMPRESSED.search(rel) or size <= SPLIT else _part_bounds(full, size, context)
+            for st, en, pre in parts:
+                jobs.append((t.root, rel, st, en, pre, pattern, case, context, exclude, since, until, ref, per_file, deadline, group_limit, max_hits, ycut))
+    nparts = {}
+    for jb in jobs:
+        nparts[jb[1]] = nparts.get(jb[1], 0) + 1
+    last_of = {}
+    for fam, rel in order:
+        last_of[fam] = rel
+    pool = _pool() if parallel and len(jobs) > 1 else None
+    global _HITS
+    if pool:
+        _POOL["hits"].value = 0
+    else:
+        _HITS = _Count()
+
+    def results():
+        got = 0
+        if pool:
+            try:
+                for r in pool.imap(scan_part, jobs, chunksize=1):    # in job order, as they finish
+                    got += 1
+                    yield r
+                return
+            except Exception:
+                pass
+        for jb in jobs[got:]:
+            yield scan_part(jb)
+
+    by_rel = {}
+    seen_all, hours_all = {}, {}
+    groups, pats, counts, total, scanned, stopped, done = [], {}, {}, 0, 0, "", set()
+    gmap = {}
+    unscanned = []
+    fam_of = dict((rel, fam) for fam, rel in order)
+    state = {"total": 0, "scanned": 0, "stopped": ""}
+
+    def take(fam, rel):
+        parts = sorted(by_rel.pop(rel, []), key=lambda r: r["start"])
+        if not parts or any(r["error"] for r in parts) or parts[0]["binary"]:
+            return
+        if state["stopped"]:
+            unscanned.append(rel)
+            return
+        if any(r["cut"] for r in parts):              # half-read file: leave it to "continue", so nothing is counted twice
+            state["stopped"] = "time budget of %d s reached" % budget
+            unscanned.append(rel)
+            return
+        state["scanned"] += 1
+        done.add(rel)
+        n, base, ent = 0, 0, {}
+        for r in parts:
+            n += r["n"]
+            for blk in r["blocks"]:
+                for j, x, h in blk:
+                    jj = j + base
+                    if jj not in ent or h:
+                        ent[jj] = (x, h or ent.get(jj, ("", False))[1])
+            for k, v in r["pats"].items():
+                if state["total"] + n <= group_limit or k in pats:
+                    pats[k] = pats.get(k, 0) + v
+                    sn, so = r.get("seen", {}).get(k), seen_all.get(k)
+                    if sn:
+                        seen_all[k] = [min(sn[0], so[0]), max(sn[1], so[1])] if so else list(sn)
+            for k, v in r.get("hours", {}).items():
+                hours_all[k] = hours_all.get(k, 0) + v
+            base += r["lines"]
+        if state["total"] + n > max_hits:
+            state["stopped"] = "more than %s matches: narrow the pattern or untick files" % fmt_n(max_hits)
+        g = gmap.get(fam)
+        if g is None:
+            g = gmap[fam] = {"file": fam, "members": [], "n": 0, "shown": 0, "lines": []}
+            groups.append(g)
+        if n:
+            # the blocks again, in line order: consecutive line numbers are one block; newest per_file hits kept
+            idx = sorted(ent)
+            blks, cur = [], []
+            for jj in idx:
+                if cur and jj != cur[-1][0] + 1:
+                    blks.append(cur)
+                    cur = []
+                cur.append((jj, ent[jj][0], ent[jj][1]))
+            if cur:
+                blks.append(cur)
+            keep = list(_newest(blks, per_file, context))
+            mi = len(g["members"])
+            g["members"].append(rel)
+            counts[rel] = n
+            shown = []
+            for bi, blk in enumerate(keep):
+                if bi:
+                    shown.append([None, "", False, mi])
+                shown.extend([j + 1, around(x, rxs) if h else clean(x, 300), h, mi] for j, x, h in blk)
+            g["lines"].extend(shown)
+            g["n"] += n
+            state["total"] += n
+
+    for r in results():
+        rel = r["rel"]
+        by_rel.setdefault(rel, []).append(r)
+        if len(by_rel[rel]) < nparts[rel]:
+            continue
+        fam = fam_of[rel]
+        take(fam, rel)
+        if last_of[fam] == rel:
+            g = gmap.get(fam)
+            if g and g["n"]:
+                _trim_group(g, per_file, context)
+                counts[g["file"]] = g["n"]
+                yield "group", g, dict((m, counts[m]) for m in g["members"] if m in counts)
+    total, scanned, stopped = state["total"], state["scanned"], state["stopped"]
+    groups = [g for g in groups if g["n"]]
+    groups.sort(key=lambda g: -g["n"])
+    if not stopped and time.time() > deadline and unscanned:
+        stopped = "time budget of %d s reached" % budget
+    skipped_set = set(r for r, _ in skipped)
+    unscanned = [r for r in sizes if r not in done and r not in skipped_set and r in set(unscanned)] if stopped else []
+    yield "done", {"hits": total, "files_hit": sum(len(g["members"]) for g in groups), "files_scanned": scanned, "ms": int((time.time() - t0) * 1000), "cs": case,
+                   "unscanned": unscanned, "unscanned_bytes": sum(sizes[r] for r in unscanned),
+                   "groups": groups, "counts": counts, "patterns": merge_hosts(pats, host_rx(t), seen=seen_all)[:20], "when": when_counts(hours_all), "skipped": skipped, "stopped": stopped}
+
+
+# ---- all words: in any order on one line, or anywhere in one request ----
+REQ_ID_RX = re.compile(r"\|([0-9a-f]{8})\]|^\s*([0-9a-f]{8}) \| |^\S+\s+([0-9a-f]{8}) \[[A-Z]\] |csid=([0-9a-f]{8})|pulp \[([0-9a-f]{8})")
+NEAR_MAX = 400          # requests named in one search pattern
+
+
+def words_pattern(words):
+    """Every word (each already a regex: escaped, perhaps with word bounds) somewhere on the line, in any order."""
+    return "^" + "".join("(?=.*?%s)" % w for w in words)
+
+
+def near_request(t, rels, words, case=False, budget=20.0, exclude="", since=None, until=None, ref=None):
+    """All words within one request: the lines with any of the words are read once, each line's request id
+    (Foreman's [I|app|1a2b3c4d] and backtrace lines, the smart proxy's id, Candlepin's csid=, Pulp's
+    'pulp [id]') is taken, and the requests whose lines hold every word between them are kept.
+    Returns (pattern, info): the pattern finds those requests' lines that hold one of the words, and any
+    line that holds every word on its own."""
+    import time as _t
+    flags = 0 if case else re.I
+    rxs = [re.compile(w, flags) for w in words]
+    anyrx = re.compile("|".join("(?:%s)" % w for w in words), flags | re.M)
+    xrx = re.compile(exclude, flags) if exclude else None
+    t0, seen, stopped = _t.time(), {}, ""
+    for rel in rels:
+        if _t.time() - t0 > budget:
+            stopped = "time budget: not every log was read for requests"
+            break
+        text, _ = t.read([rel], tail=True, limit=512 * 1024 * 1024)
+        if not text:
+            continue
+        pos = 0
+        while True:
+            m = anyrx.search(text, pos)
+            if m is None:
+                break
+            ls = text.rfind("\n", 0, m.start()) + 1
+            le = text.find("\n", m.start())
+            le = len(text) if le < 0 else le
+            pos = le + 1
+            l = text[ls:le]
+            r = REQ_ID_RX.search(l)
+            if not r or (xrx and xrx.search(l)):
+                continue
+            if since or until:
+                w = parse_when(l[:80], ref)
+                if w is None or (since and w < since) or (until and w > until):
+                    continue
+            have = seen.setdefault(next(x for x in r.groups() if x), set())
+            for k, rx in enumerate(rxs):
+                if k not in have and rx.search(l):
+                    have.add(k)
+    full = sorted(r for r, h in seen.items() if len(h) == len(words))
+    info = {"requests": len(full), "cut": len(full) > NEAR_MAX or bool(stopped), "stopped": stopped}
+    same = words_pattern(words)
+    if not full:
+        return same, info
+    return "^(?:%s|(?=.*?(?:%s)).*?(?:%s))" % (same[1:], "|".join(full[:NEAR_MAX]), "|".join(words)), info
+
+
+def word_counts(t, rels, words, case=False, budget=10.0, **kw):
+    """How many lines each word matches on its own, to show which word is too common or matches nothing."""
+    out = []
+    for w in words:
+        d = search_files(t, w, rels, case=case, context=0, budget=budget / max(1, len(words)), per_file=1, max_hits=10 ** 9, parallel=False, **kw)
+        out.append([w, d.get("hits", 0), bool(d.get("stopped"))])
+    return out
+def _int(v, default=0):
+    try:
+        return max(0, min(50, int(v or default)))
+    except (TypeError, ValueError):
+        return default
+
+
+RUN_SECONDS = 300               # a command typed in the page is stopped after this long
+RUN_OUTPUT = 2 * 1024 * 1024    # and this much of its output is sent to the page
+
+
+def _stop_run(p):
+    """End a command and everything it started."""
+    import signal
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+    except (AttributeError, OSError):
+        try:
+            p.terminate()
+        except OSError:
+            pass
+
+    def hard():
+        if p.poll() is None:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except (AttributeError, OSError):
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+    import threading
+    tm = threading.Timer(2.0, hard)
+    tm.daemon = True
+    tm.start()
+
+
+def serve(src, export=None, port=0, open_browser=True, pair=None, diff=None, original=True):
+    import codecs
+    import hmac
+    import http.server
+    import secrets
+    import subprocess
+    import threading
+    import time
+    import signal
+    import socketserver
+    import urllib.parse
+    import webbrowser
+    prog = Progress()
+    t, ctx, secs, tmp = load(src, pair=pair, diff=diff, progress=prog, original=original)
+    ctx["orig_log_url"] = "/original.log"
+    prog.done()
+    after_load = time.time()
+    tmps = [tmp, (ctx.get("diff") or {}).get("tmp")]
+    roots = {"export": None, "pair": None}
+    if ctx.get("pair"):
+        tmps.append(ctx["pair"]["tmp"])
+        roots["pair"] = ctx["pair"]["t"].root
+    tasks = sos_tasks = tasks_from_sos(t)
+    t.forget()
+    if export:
+        tasks, et, etmp = load_task_export(export)
+        tasks["fit"] = export_fit(tasks, sos_tasks, ctx)
+        tmps.append(etmp)
+        roots["export"] = os.path.realpath(et) if et else None
+    exports = [] if export else find_task_exports(src)
+    page = [render_html(ctx, secs, os.path.basename(src), serve=True, tasks=tasks, exports=export_offers(exports, src), t=t).encode("utf-8")]
+    text = render_text(ctx, secs, full=True).encode("utf-8")
+    slow = startup_summary([("tasks and page", time.time() - after_load)])
+    if tmp:
+        print("extracted to %s (%s)" % (tmp, human(_dir_size(tmp))), file=sys.stderr)
+
+    def cleanup(*_):
+        for d in tmps:
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
+
+    def bye(signum, frame):
+        cleanup()
+        print("\nstopped, extracted copies removed", file=sys.stderr)
+        stop_search_workers()
+        os._exit(0)
+    for s in ("SIGTERM", "SIGHUP"):
+        if hasattr(signal, s):
+            signal.signal(getattr(signal, s), bye)
+
+    def paused(signum, frame):
+        # Ctrl+Z stops the server where it stands: it keeps its port and its extracted copy and answers nothing.
+        held = [d for d in tmps if d]
+        print("\nstopped with Ctrl+Z: the page will not load until this is continued. It still holds its port%s.\n"
+              "  continue:  fg        end it and remove the cop%s:  fg, then Ctrl-C   (or: kill %d)"
+              % ((" and %s of extracted report in %s" % (human(sum(_dir_size(d) for d in held)), os.path.dirname(held[0]))) if held else "",
+                 "y" if len(held) < 2 else "ies", os.getpid()), file=sys.stderr)
+        sys.stderr.flush()
+        signal.signal(signal.SIGTSTP, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTSTP)
+
+    def resumed(signum, frame):
+        signal.signal(signal.SIGTSTP, paused)
+        print("continued: serving again", file=sys.stderr)
+    if hasattr(signal, "SIGTSTP") and hasattr(signal, "SIGCONT"):
+        try:
+            signal.signal(signal.SIGTSTP, paused)
+            signal.signal(signal.SIGCONT, resumed)
+        except (ValueError, OSError):          # not the main thread
+            pass
+
+    bound = {"port": 0}
+    run_key = secrets.token_urlsafe(18)       # only the page opened with the printed address holds it
+    runs = {}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _local(self):
+            """Only answer pages served from this address: another site the browser has open cannot read the report
+            through a DNS name rebound to 127.0.0.1, nor post a search to it."""
+            host = self.headers.get("Host") or ""
+            # the loopback names, on any port: through an SSH tunnel the browser's port is not the one sosview listens on.
+            # A rebound DNS name is still refused, since the browser sends that name here.
+            if not re.match(r"^(?:127\.0\.0\.1|localhost|\[::1\])(?::\d{1,5})?$", host):
+                return False
+            origin = self.headers.get("Origin")
+            return not origin or origin == "http://" + host
+
+        def _refuse(self):
+            return self._send(("sosview-lite serve answers only when the address in the browser is 127.0.0.1, localhost or [::1] (any port).\n"
+                               "This request asked for the host %r%s.\n" % ((self.headers.get("Host") or "")[:80],
+                                                                           (" from the page %r" % self.headers.get("Origin")[:80]) if self.headers.get("Origin") else "")
+                               ).encode("utf-8"), "text/plain; charset=utf-8", 403)
+
+        def _send(self, body, ctype="text/html; charset=utf-8", code=200):
+            if isinstance(body, (dict, list)):
+                body, ctype = json.dumps(body).encode("utf-8"), "application/json"
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _safe(self, rel):
+            base = t.root
+            rel = rel or ""
+            if rel.startswith("@pair/") and roots["pair"]:
+                base, rel = roots["pair"], rel[len("@pair/"):]
+            elif rel.startswith("@export/") and roots["export"]:
+                base, rel = roots["export"], rel[len("@export/"):]
+            full = os.path.realpath(os.path.join(base, rel))
+            return full if full.startswith(base + os.sep) and os.path.isfile(full) else None
+
+        def _run(self, path):
+            """A command line typed in the page, run by bash in the report directory. Answered only with the key that
+            the printed address carries: reaching the port is not enough to run anything."""
+            got = (self.headers.get("X-Sosview-Key") or "").encode("utf-8")
+            if not hmac.compare_digest(got, run_key.encode("utf-8")):
+                return self._send({"error": "commands run only in the page opened with the address sosview printed (it ends in ?k=...)"}, code=403)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                n = -1
+            if n < 0 or n > 1024 * 1024:
+                return self._send({"error": "request too large"}, code=413)
+            try:
+                req = json.loads(self.rfile.read(n).decode("utf-8", "replace") or "{}")
+            except ValueError:
+                req = {}
+            rid = str(req.get("id") or "")[:40]
+            if path == "/run/stop":
+                p = runs.get(rid)
+                if p:
+                    p.sv_stopped = True
+                    _stop_run(p)
+                return self._send({"ok": bool(p)})
+            cmd = str(req.get("cmd") or "").strip()
+            if not cmd:
+                return self._send({"error": "empty command"})
+            bash = shutil.which("bash")
+            if not bash:
+                return self._send({"error": "bash was not found on this computer"})
+            cwd = str(req.get("cwd") or "")
+            if not (cwd and os.path.isdir(cwd)):
+                cwd = t.root
+            fd, pwdf = tempfile.mkstemp(prefix="sosview-pwd-")
+            os.close(fd)
+            env = dict(os.environ, TERM="dumb", PAGER="cat", GIT_PAGER="cat", SYSTEMD_PAGER="", LESS="-FRX", SOSREPORT=t.root, SOSVIEW_PWD=pwdf)
+            t0 = time.time()
+            try:
+                p = subprocess.Popen([bash, "-c", "trap 'pwd -P > \"$SOSVIEW_PWD\" 2>/dev/null' EXIT\n" + cmd], cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+            except OSError as e:
+                os.unlink(pwdf)
+                return self._send({"error": "could not start bash: %s" % e})
+            p.sv_stopped = p.sv_timeout = False
+            if rid:
+                runs[rid] = p
+
+            def late():
+                p.sv_timeout = True
+                _stop_run(p)
+            tm = threading.Timer(RUN_SECONDS, late)
+            tm.daemon = True
+            tm.start()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            dec, sent, cut, gone = codecs.getincrementaldecoder("utf-8")("replace"), 0, 0, False
+
+            def put(obj):
+                self.wfile.write(json.dumps(obj).encode("utf-8") + b"\n")
+                self.wfile.flush()
+            try:
+                put({"start": {"cwd": cwd, "root": t.root}})
+                while True:
+                    chunk = os.read(p.stdout.fileno(), 65536)
+                    if not chunk:
+                        break
+                    if sent >= RUN_OUTPUT:
+                        cut += len(chunk)
+                        continue
+                    if sent + len(chunk) > RUN_OUTPUT:
+                        cut += sent + len(chunk) - RUN_OUTPUT
+                        chunk = chunk[:RUN_OUTPUT - sent]
+                    sent += len(chunk)
+                    text = dec.decode(chunk)
+                    if text:
+                        put({"o": text})
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                gone = p.sv_stopped = True          # the page went away: nobody is left to read the output
+                _stop_run(p)
+            finally:
+                tm.cancel()
+                code = p.wait()
+                p.stdout.close()
+                runs.pop(rid, None)
+                now = cwd
+                try:
+                    with open(pwdf) as fh:
+                        d = fh.read().strip()
+                    if d and os.path.isdir(d):
+                        now = d
+                except OSError:
+                    pass
+                try:
+                    os.unlink(pwdf)
+                except OSError:
+                    pass
+            ms = int((time.time() - t0) * 1000)
+            print("run %r -> exit %s, %d ms%s" % (cmd[:80], code, ms, " · stopped after %d s" % RUN_SECONDS if p.sv_timeout else " · stopped" if p.sv_stopped else ""), file=sys.stderr)
+            if not gone:
+                try:
+                    put({"done": {"code": code, "cwd": now, "root": t.root, "ms": ms, "cut": cut, "timeout": p.sv_timeout, "stopped": p.sv_stopped and not p.sv_timeout,
+                                  "limit": RUN_SECONDS}})
+                except OSError:
+                    pass
+
+        def do_POST(self):
+            if not self._local():
+                return self._refuse()
+            u = urllib.parse.urlsplit(self.path)
+            qs = urllib.parse.parse_qs(u.query)
+            if u.path in ("/run", "/run/stop"):
+                return self._run(u.path)
+            if u.path != "/search":
+                return self._send(b"not found", "text/plain", 404)
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                return self._send(b"bad Content-Length", "text/plain", 400)
+            if n < 0 or n > 8 * 1024 * 1024:
+                return self._send(b"request too large", "text/plain", 413)
+            rels = [r for r in self.rfile.read(n).decode("utf-8", "replace").split("\n") if r]
+            q = (qs.get("q") or [""])[0]
+            if not q:
+                return self._send({"error": "empty pattern"})
+            # a task or execution plan id lives in the task tables, which are not logs: search them as well
+            if UUID_RX.search(q) and not any(r.startswith("sos_commands/foreman/") for r in rels):
+                rels += [r for r, _ in preset_files(t, "tasks")]
+            ref = ref_time(ctx)
+            since = user_time((qs.get("from") or [""])[0], ref)
+            until = user_time((qs.get("to") or [""])[0], ref, day=since)
+            if (qs.get("from") or [""])[0].strip() and not since or (qs.get("to") or [""])[0].strip() and not until:
+                return self._send({"error": "could not read the time window; write it like 2026-11-02 08:00, Nov 2 08:00 or 08:00"})
+            opts = dict(case=(qs.get("cs") or ["0"])[0] == "1", context=_int((qs.get("ctx") or ["1"])[0], 0),
+                        exclude=(qs.get("x") or [""])[0], since=since, until=until, ref=ref)
+            # all words: w holds each word as a regex; near=req looks for them across the lines of one request
+            words = [w for w in (qs.get("w") or [""])[0].split("\n") if w][:8]
+            extra = {}
+            if words:
+                try:
+                    for w in words:
+                        re.compile(w)
+                    wopts = dict((k, opts[k]) for k in ("exclude", "since", "until", "ref"))
+                    if (qs.get("near") or [""])[0] == "req" and len(words) > 1:
+                        q, extra["near"] = near_request(t, rels, words, case=opts["case"], **wopts)
+                        opts["context"] = 0
+                except (re.error, Exception) as e:
+                    return self._send({"error": "%s: %s" % (type(e).__name__, e)})
+
+            def post(d):
+                if extra:
+                    d.update(extra)
+                if words and len(words) > 1 and "hits" in d and (d["hits"] == 0 or d["hits"] > 2000):
+                    d["words"] = word_counts(t, rels, words, case=opts["case"], **dict((k, opts[k]) for k in ("exclude", "since", "until", "ref")))
+                return d
+            if (qs.get("stream") or ["0"])[0] == "1":
+                return self._stream_search(q, rels, opts, post)
+            try:
+                d = post(search_files(t, q, rels, **opts))
+            except Exception as e:
+                d = {"error": "%s: %s" % (type(e).__name__, e)}
+            print("search %r in %d files -> %s" % (q[:60], len(rels), ("%s matches, %d ms%s" % (d.get("hits"), d.get("ms", 0), (" · stopped: " + d["stopped"]) if d.get("stopped") else "")) if "hits" in d else d.get("error")), file=sys.stderr)
+            return self._send(d)
+
+        def _stream_search(self, q, rels, opts, post=None):
+            """One JSON object per line: {"group", "counts"} as each log is finished, then {"done": result}.
+            The connection closes at the end; a closed browser tab stops the stream."""
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ndjson")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            d, gen = {}, search_stream(t, q, rels, **opts)
+            try:
+                for ev in gen:
+                    if ev[0] == "group":
+                        line = {"group": ev[1], "counts": ev[2]}
+                    else:
+                        gen.close()                     # the search is over: let go of it before anything else searches
+                        d = post(ev[1]) if post else ev[1]
+                        line = {"done": d}
+                    self.wfile.write(json.dumps(line).encode("utf-8") + b"\n")
+                    self.wfile.flush()
+                    if "done" in line:
+                        break
+            except (BrokenPipeError, ConnectionResetError):
+                d = {"error": "stopped by the browser"}
+            except Exception as e:
+                d = {"error": "%s: %s" % (type(e).__name__, e)}
+                try:
+                    self.wfile.write(json.dumps({"done": d}).encode("utf-8") + b"\n")
+                except OSError:
+                    pass
+            finally:
+                gen.close()
+            print("search %r in %d files -> %s (streamed)" % (q[:60], len(rels), ("%s matches, %d ms%s" % (d.get("hits"), d.get("ms", 0), (" · stopped: " + d["stopped"]) if d.get("stopped") else "")) if "hits" in d else d.get("error")), file=sys.stderr)
+
+        def do_GET(self):
+            if not self._local():
+                return self._refuse()
+            u = urllib.parse.urlsplit(self.path)
+            qs = urllib.parse.parse_qs(u.query)
+            g = lambda k, d="": (qs.get(k) or [d])[0]
+            if u.path == "/":
+                return self._send(page[0])
+            if u.path == "/report.txt":
+                return self._send(text, "text/plain; charset=utf-8")
+            if u.path == "/original.log":
+                return self._send(((ctx.get("orig") or {}).get("text") or "").encode("utf-8"), "text/plain; charset=utf-8")
+            if u.path == "/health":
+                return self._send({"ok": True, "version": VERSION, "host": ctx["hostname"], "files": ctx.get("files")})
+            if u.path == "/files":
+                fl = preset_files(t, g("preset", "logs"), True, g("dup") == "1")[:25000]
+                fams = families(t, fl)[:6000]
+                return self._send({"families": [{"key": k, "size": human(sum(sz for _, sz in m)),
+                                                 "members": [{"path": r, "size": human(sz), "note": t.tailed(r) and "tailed by sos"} for r, sz in m]}
+                                                for k, m in fams]})
+            if u.path == "/view":
+                full = self._safe(g("path"))
+                if full and full.endswith(".html") and g("path").startswith("@export/"):
+                    with open(full, "rb") as fh:
+                        rows = [l for l in _Text().text(fh.read(8 * 1024 * 1024).decode("utf-8", "replace")).splitlines() if l.strip()]
+                    return self._send({"total": len(rows), "lines": [[i + 1, clean(r, 800)] for i, r in enumerate(rows[:2000])], "note": "task page, shown as text"})
+                if not full:
+                    return self._send({"error": "not in this sosreport or task export"})
+                try:
+                    line = int(g("line", "1"))
+                except ValueError:
+                    line = 1
+                lo, hi = max(0, line - 1 - 60), line + 60
+                if g("from"):  # an explicit range, for the viewer's "earlier / later lines"
+                    try:
+                        lo = max(0, int(g("from")) - 1)
+                        hi = min(lo + 2000, max(lo + 1, int(g("to") or lo + 200)))
+                    except ValueError:
+                        pass
+                total, rows = read_lines(full, lo, hi)
+                return self._send({"total": total, "lines": [[lo + k + 1, clean(r, 800)] for k, r in enumerate(rows)], "note": t.tailed(g("path"))})
+            if u.path == "/at":
+                full = self._safe(g("path"))
+                if not full:
+                    return self._send({"error": "not in this sosreport"})
+                ref = ref_time(ctx)
+                when = user_time(g("when"), ref)
+                if not when:
+                    return self._send({"error": "could not read that time; write it like 2026-11-02 14:05, Nov 2 14:05 or 14:05"})
+                r = line_at_time(full, when, ref)
+                fw, lw = parse_when(r.get("first") or ""), parse_when(r.get("last") or "")
+                r["text"] = ("this file starts after %s (first line %s)" % (when.strftime("%Y-%m-%d %H:%M"), r["first"]) if fw and when < fw else
+                             "this file ends before %s (last line %s)" % (when.strftime("%Y-%m-%d %H:%M"), r["last"]) if lw and when > lw + datetime.timedelta(minutes=1) else
+                             "first line at or after %s" % when.strftime("%Y-%m-%d %H:%M:%S"))
+                return self._send(r)
+            if u.path == "/task":
+                lg = {"0": False, "only": "only"}.get(g("logs"), True)     # logs=0: the record without the log search; logs=only: the log lines alone
+                try:
+                    er = roots.get("export")
+                    if er and re.match(r"^[\w.-]+$", g("id")) and os.path.isfile(os.path.join(er, _export_dir(er), g("id") + ".html")):
+                        return self._send(export_task_full(er, g("id"), t, ctx, logs=lg))
+                    return self._send(task_full(t, ctx, g("id"), logs=lg))
+                except Exception as e:
+                    return self._send({"error": "sosview bug: %s: %s" % (type(e).__name__, e)})
+            if u.path == "/request":
+                try:
+                    return self._send(request_story(t, ctx, g("id")))
+                except Exception as e:
+                    return self._send({"error": "%s: %s" % (type(e).__name__, e)})
+            if u.path == "/taskfind":
+                try:
+                    return self._send(task_find(t, g("q")))
+                except Exception as e:
+                    return self._send({"plans": [], "error": "%s: %s" % (type(e).__name__, e)})
+            if u.path == "/errwhere":
+                return self._send(error_where(t, ctx, g("q")))
+            if u.path == "/around":
+                ref = ref_time(ctx)
+                when = parse_when(g("when"), ref)
+                if not when:
+                    return self._send({"error": "no time given"})
+                shift = ""
+                if g("utc") == "1" and ctx.get("utc_offset") is not None:      # task times are UTC, the logs local
+                    utc = when
+                    when = when + datetime.timedelta(minutes=ctx["utc_offset"])
+                    if ctx["utc_offset"]:
+                        shift = "%s UTC is %s on this host (%s, from the clocks sos recorded)" % (
+                            utc.strftime("%H:%M:%S"), when.strftime("%Y-%m-%d %H:%M:%S"), offset_text(ctx["utc_offset"], ctx.get("tz", "")))
+                found = []
+                for rel in AROUND_LOGS:
+                    full = self._safe(rel)
+                    if not full:
+                        continue
+                    try:
+                        r = line_at_time(full, when, ref)
+                    except Exception as e:
+                        r = {"error": str(e)}
+                    r["file"] = rel
+                    found.append(r)
+                for r in found:
+                    fw, lw = parse_when(r.get("first") or ""), parse_when(r.get("last") or "")
+                    r["pos"] = "before" if (fw and when < fw) else "after" if (lw and when > lw + datetime.timedelta(minutes=1)) else "in"
+                return self._send({"when": when.strftime("%Y-%m-%d %H:%M:%S"), "shift": shift, "files": found})
+            if u.path == "/file":
+                full = self._safe(g("path"))
+                if not full:
+                    return self._send(b"not found", "text/plain", 404)
+                try:
+                    line = int(g("line", "1"))
+                except ValueError:
+                    line = 1
+                win = 3000                                   # a window of lines around the match, not the whole file
+                lo = max(0, line - 1 - win // 2)
+                total, rows = read_lines(full, lo, lo + win)
+                hi = lo + len(rows)
+                q = urllib.parse.quote(g("path"))
+                nav = []
+                if lo > 0:
+                    nav.append("<a href='/file?path=%s&line=1'>⇤ start</a>" % q)
+                    nav.append("<a href='/file?path=%s&line=%d'>‹ earlier %d lines</a>" % (q, max(1, lo + 1 - win // 2), win))
+                if hi < total:
+                    nav.append("<a href='/file?path=%s&line=%d'>later %d lines ›</a>" % (q, hi + win // 2, win))
+                    nav.append("<a href='/file?path=%s&line=%d'>end ⇥</a>" % (q, total))
+                body = [("<!doctype html><html lang='en' data-theme='neon'><head><meta charset='utf-8'><title>%s</title><style>%s%s" + theme_css().replace("%", "%%") + " .cur{background:#2b2410;display:inline-block;min-width:100%%} pre{margin:0;padding:12px 18px;font:12.5px/1.5 ui-monospace,monospace} .fnav{display:flex;gap:18px;padding:8px 22px;border-bottom:1px solid var(--line)}</style>" + THEME_HEAD.replace("%", "%%") + "</head><body><div class='facts'>%s · lines %s–%s of %s</div><div class='fnav'>%s</div><pre>")
+                        % (esc(g("path")), CSS, COLOR_CSS, esc(g("path")), fmt_n(lo + 1), fmt_n(hi), fmt_n(total), " ".join(nav))]
+                for k, r in enumerate(rows):
+                    i = lo + k
+                    body.append("<span id='l%d'%s>%7d  %s</span>\n" % (i + 1, " class='cur'" if i + 1 == line else "", i + 1, esc(clean(r, 800))))
+                body.append("</pre><div class='fnav'>%s</div>" % " ".join(nav))
+                body.append("<script>%s;CZ.apply();(function(){var c=%d;for(var i=Math.max(1,c-2000);i<=c+2000;i++){var e=document.getElementById('l'+i);if(!e)continue;"
+                            "var n=e.lastChild;if(n&&n.nodeType===3){var m=/^(\\s*\\d+  )([\\s\\S]*)$/.exec(n.data);if(m){var s=document.createElement('span');s.innerHTML=CZ.line(m[2]);n.data=m[1];e.appendChild(s)}}}"
+                            "document.addEventListener('keydown',function(ev){if(ev.key==='c')CZ.toggle()});var e=document.getElementById('l'+c);if(e)e.scrollIntoView({block:'center'})})()</script></body></html>" % (COLOR_JS, line))
+                return self._send("".join(body).encode("utf-8"))
+            if u.path == "/load-export":
+                p = g("path")
+                if os.path.realpath(p) not in [os.path.realpath(x) for x in exports]:
+                    return self._send({"error": "only the exports offered on this page can be loaded from here"})
+                try:
+                    d, et, etmp = load_task_export(p)
+                    tmps.append(etmp)
+                    roots["export"] = os.path.realpath(et) if et else None
+                    d["fit"] = export_fit(d, sos_tasks, ctx)
+                    print("loaded task export %s: %d tasks" % (p, len(d["rows"])), file=sys.stderr)
+                    return self._send(d)
+                except Exception as e:
+                    return self._send({"error": "%s: %s" % (type(e).__name__, e)})
+            return self._send(b"not found", "text/plain", 404)
+
+    class Server(getattr(socketserver, "ThreadingTCPServer", socketserver.TCPServer)):
+        allow_reuse_address = True
+        daemon_threads = True
+
+        def handle_error(self, request, client_address):      # a browser that stopped waiting is not an error worth a traceback
+            if not isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+                socketserver.TCPServer.handle_error(self, request, client_address)
+    httpd = Server(("127.0.0.1", port), H)
+    bound["port"] = httpd.server_address[1]
+    url = "http://127.0.0.1:%d/?k=%s" % (httpd.server_address[1], run_key)
+    print("%s · %s%s · %d files\nserving %s   (Ctrl-C to stop)" % (ctx["hostname"], ctx["role"], (" " + ctx["satellite"]) if ctx.get("satellite") else "", ctx.get("files", 0), url), flush=True)
+    if slow:
+        print(slow, file=sys.stderr, flush=True)
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nstopped")
+    finally:
+        httpd.server_close()
+        cleanup()
+    return 0
+
+
+# ---- input / main ---------------------------------------------------------------------
+
+PID_MARK = ".sosview-pid"
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    return True
+
+
+def _pid_stopped(pid):
+    """True when the process is stopped (Ctrl+Z); known on Linux only."""
+    try:
+        with open("/proc/%d/stat" % pid) as fh:
+            return fh.read().rsplit(")", 1)[1].split()[0] == "T"
+    except (OSError, IndexError):
+        return False
+
+
+def tidy_extracted_copies(report=True):
+    import time
+    """Remove extracted copies whose sosview process is gone (marked with PID_MARK). Copies without the mark come
+    from older versions and may belong to a paused run, so they are only listed."""
+    base = _tmp_base() or tempfile.gettempdir()
+    removed, legacy, held = [], [], []
+    try:
+        names = [n for n in os.listdir(base) if n.startswith(("sosview-", ".sosview-partial-"))]
+    except OSError:
+        return
+    for n in names:
+        d = os.path.join(base, n)
+        if not os.path.isdir(d) or os.path.islink(d):
+            continue
+        mark = os.path.join(d, PID_MARK)
+        try:
+            pid = int(open(mark).read().split()[0])
+        except (OSError, ValueError, IndexError):
+            try:
+                st = os.stat(d)
+                # unmarked and recent could still be starting up (or a 2.1 run): never listed
+                if st.st_uid == os.getuid() and time.time() - st.st_mtime > 3600 and n.startswith("sosview-"):
+                    legacy.append(d)
+            except OSError:
+                pass
+            continue
+        if pid != os.getpid() and not _pid_alive(pid):
+            shutil.rmtree(d, ignore_errors=True)
+            removed.append(d)
+        elif pid != os.getpid() and _pid_stopped(pid):
+            held.append((pid, d))
+    if report and removed:
+        print("removed %d extracted cop%s left by sosview runs that ended without cleaning up" % (len(removed), "y" if len(removed) == 1 else "ies"), file=sys.stderr)
+    if report and held:
+        pids = sorted(set(p for p, _ in held))
+        one = len(pids) == 1
+        print("note: %d sosview process%s stopped with Ctrl+Z still hold%s %s of extracted reports in %s and answer%s nothing.\n"
+              "      continue one with fg, or end %s and free the space with:  kill %s"
+              % (len(pids), "" if one else "es", "s" if one else "", human(sum(_dir_size(d) for _, d in held)), base, "s" if one else "", "it" if one else "them",
+                 " ".join(str(p) for p in pids)), file=sys.stderr)
+    if report and legacy:
+        size = sum(_dir_size(d) for d in legacy)
+        print("note: %d extracted cop%s from older sosview versions use %s in %s; if no sosview is running, remove with:  rm -rf %s"
+              % (len(legacy), "y" if len(legacy) == 1 else "ies", human(size), base, " ".join(legacy)), file=sys.stderr)
+
+
+def open_input(src):
+    """(root_dir, tmp_or_None) for a directory or an archive."""
+    if not os.path.exists(src):
+        raise RuntimeError("not found: %s" % src)
+    if os.path.isdir(src):
+        return src, None
+    # created hidden, marked, then renamed: another sosview never sees an unmarked live copy
+    part = tempfile.mkdtemp(prefix=".sosview-partial-", dir=_tmp_base())
+    with open(os.path.join(part, PID_MARK), "w") as fh:
+        fh.write("%d\n%s\n" % (os.getpid(), os.path.abspath(src)))
+    tmp = os.path.join(os.path.dirname(part), "sosview-" + os.path.basename(part)[len(".sosview-partial-"):])
+    try:
+        os.rename(part, tmp)
+    except OSError:
+        tmp = part
+    try:
+        if os.path.getsize(src) > 20 * 1024 * 1024:
+            print("extracting %s (%s) to %s …" % (os.path.basename(src), human(os.path.getsize(src)), os.path.dirname(tmp)), file=sys.stderr)
+        safe_extract(src, tmp)
+    except (tarfile.TarError, OSError, EOFError, RuntimeError) as e:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError("could not extract %s: %s" % (src, e))
+    if EXTRACT_PARTIAL:
+        print("partial: " + EXTRACT_PARTIAL[0], file=sys.stderr)
+    elif EXTRACT_NOTES:
+        print("%d archive member%s could not be extracted (listed on the page)" % (len(EXTRACT_NOTES), "" if len(EXTRACT_NOTES) == 1 else "s"), file=sys.stderr)
+    return tmp, tmp
+
+
+def load_tree(src):
+    base, tmp = open_input(src)
+    root = find_sos_root(base)
+    if root is None:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+        raise RuntimeError("no sosreport layout under %s (expected sos_commands/ or version.txt)%s" % (src, ("; " + EXTRACT_PARTIAL[0]) if tmp and EXTRACT_PARTIAL else ""))
+    t = Tree(root)
+    ctx = detect(t)
+    if tmp and EXTRACT_NOTES:
+        ctx["extract_notes"] = list(EXTRACT_NOTES)
+    if tmp and EXTRACT_PARTIAL:
+        ctx["partial"] = EXTRACT_PARTIAL[0]
+    return t, ctx, tmp
+
+
+class Progress(object):
+    """One line on the terminal that says what sosview is doing; nothing when stderr is not a terminal."""
+
+    def __init__(self, on=None):
+        import time
+        self.time = time.time
+        self.on = (hasattr(sys.stderr, "isatty") and sys.stderr.isatty()) if on is None else on
+        self.t0, self.w = self.time(), 0
+
+    def __call__(self, msg):
+        if not self.on:
+            return
+        s = ("  %s · %d s" % (msg, self.time() - self.t0))[:110]
+        try:
+            sys.stderr.write("\r" + s.ljust(self.w))
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            self.on = False
+        self.w = len(s)
+
+    def done(self):
+        if self.on and self.w:
+            try:
+                sys.stderr.write("\r" + " " * self.w + "\r")
+                sys.stderr.flush()
+            except (OSError, ValueError):
+                pass
+        self.w = 0
+
+
+def load(src, pair=None, diff=None, progress=None, original=None):
+    """Read a sosreport. With `pair`, a second report (the other end of a Satellite/Capsule pair) is read for
+    the certificate comparison; its extracted copy is in ctx["pair"]["tmp"]."""
+    import time as _time
+    say = progress or (lambda msg: None)
+    del STAGES[:]
+    clock = [_time.time()]
+
+    def stage(label):
+        now = _time.time()
+        STAGES.append((label, now - clock[0]))
+        clock[0] = now
+    say("opening %s" % os.path.basename(src.rstrip("/")))
+    t, ctx, tmp = load_tree(src)
+    stage("extract and read" if tmp else "read")
+    # the original script runs alongside: None leaves it out (the text report, the tests), False says it was turned off
+    ost = orig_start(t.root, run=bool(original)) if original is not None else None
+    _pool()        # the search workers are forked now, before the big reads: a worker made later would keep its own copy of them
+    if pair:
+        try:
+            pt, pctx, ptmp = load_tree(pair)
+        except RuntimeError:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        ctx["pair"] = {"t": pt, "ctx": pctx, "tmp": ptmp, "src": pair}
+    secs = build_report(t, ctx, progress=lambda n, of, title: say("reading sections %d/%d · %s" % (n, of, title)))
+    stage("sections")
+    if diff:
+        say("reading %s for the comparison" % os.path.basename(diff.rstrip("/")))
+        try:
+            dt, dctx, dtmp = load_tree(diff)
+        except RuntimeError:
+            for d in (tmp, (ctx.get("pair") or {}).get("tmp")):
+                if d:
+                    shutil.rmtree(d, ignore_errors=True)
+            raise
+        ctx["diff"] = {"tmp": dtmp, "src": diff, "host": dctx["hostname"]}
+        try:
+            secs.append(diff_section(t, ctx, dt, dctx, os.path.basename(diff.rstrip("/"))))
+        except Exception as e:
+            import traceback
+            secs.append({"num": "21", "id": "diff", "title": "Differences", "na": False,
+                         "blocks": [block("this section failed to build", None, traceback.format_exc().strip().splitlines()[-4:], note="sosview bug: %s" % e)]})
+    say("building the timeline")
+    try:
+        ctx["timeline"] = report_timeline(t, ctx)
+    except Exception as e:      # the timeline must never stop the report
+        ctx["timeline"] = {"lanes": [], "error": "%s: %s" % (type(e).__name__, e)}
+    stage("timeline")
+    say("checking for potential issues")
+    ctx["issues"] = potential_issues(t, ctx)
+    add_sums(secs)
+    try:
+        annotate_packages(t, ctx, secs)
+    except Exception:          # the package facts must never stop the report
+        ctx["pkinfo"] = {}
+    stage("known error strings")
+    if ost is not None:
+        say("waiting for the original script")
+        ctx["orig"] = orig_finish(ost)
+        stage("original script")
+    return t, ctx, secs, tmp
+
+
+STAGES = []       # (what, seconds) of the last load
+SLOW_START = 20   # a start that took longer than this many seconds says where the time went
+
+
+def startup_summary(extra=()):
+    """One line on where a slow start spent its time: the stages, the slowest sections and the slowest blocks in them.
+    Empty when the start took less than SLOW_START seconds."""
+    stages = list(STAGES) + list(extra)
+    total = sum(x for _, x in stages)
+    if total < SLOW_START:
+        return ""
+
+    def dur(x):
+        return ("%d min %d s" % (x // 60, x % 60)) if x >= 60 else ("%.0f s" % x if x >= 10 else "%.1f s" % x)
+    parts = ["%s %s" % (k, dur(x)) for k, x in stages if x >= 1]
+    slow = sorted(SECTION_TIMES, key=lambda x: -x[2])[:3]
+    secs = ["%s %s %s" % (n, title, dur(x)) for n, title, x, _ in slow if x >= 2]
+    blocks = sorted(((b, x, n) for n, _, _, bl in slow for b, x in bl), key=lambda y: -y[1])[:3]
+    bl = ["'%s' (%s) %s" % (b[:60], n, dur(x)) for b, x, n in blocks if x >= 2]
+    return "ready in %s: %s%s%s" % (dur(total), " · ".join(parts), ("\n  slowest sections: " + " · ".join(secs)) if secs else "",
+                                    ("\n  slowest blocks: " + " · ".join(bl)) if bl else "")
+
+
+def install_self():
+    dest_dir = os.path.expanduser("~/.local/bin")
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, PROG)
+    shutil.copyfile(os.path.abspath(__file__), dest)
+    os.chmod(dest, 0o755)
+    print("installed %s" % dest)
+    if dest_dir not in os.environ.get("PATH", "").split(os.pathsep):
+        print("note: %s is not on your PATH; add  export PATH=\"$HOME/.local/bin:$PATH\"  to ~/.bashrc" % dest_dir)
+    return 0
+
+
+def write_private(path, text):
+    """Write a report file that only its owner can read: it holds what the sosreport holds."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    try:
+        os.chmod(path, 0o600)            # a file that was already there keeps its old mode otherwise
+    except OSError:
+        pass
+
+
+def utf8_output():
+    """Python 3.6 (RHEL 8) writes ASCII under a C or POSIX locale and stops with an error on the first '\xb7' or '\u2026';
+    Python 3.7 and later write UTF-8 there. Do the same on 3.6, and under any other encoding replace a character it lacks."""
+    import io
+    for name in ("stdout", "stderr"):
+        st = getattr(sys, name, None)
+        enc = (getattr(st, "encoding", None) or "").lower().replace("-", "").replace("_", "")
+        if st is None or enc == "utf8" or not hasattr(st, "buffer"):
+            continue
+        try:
+            st.flush()
+            setattr(sys, name, io.TextIOWrapper(st.buffer, encoding="utf-8" if enc in ("ascii", "ansix3.41968", "646", "usascii") else st.encoding,
+                                                errors="replace", line_buffering=True))
+        except Exception:
+            pass
+
+
+def main(argv=None):
+    utf8_output()
+    ap = argparse.ArgumentParser(prog=PROG, description="Lay a sosreport out section by section, every block with the command that produced it, after a short list of fixed-limit checks. No network, read-only.",
+                                 epilog="sosview-lite REPORT              write REPORT.txt and REPORT.html next to it and open the page\n"
+                                        "sosview-lite REPORT --text | less\n"
+                                        "sosview-lite SATELLITE-REPORT --pair CAPSULE-REPORT   compare certificate trust between the two\n"
+                                        "sosview-lite serve REPORT [TASK-EXPORT]   page + search + task export on localhost",
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("inputs", nargs="*", help="sosreport (tarball or directory), optionally followed by a task export")
+    ap.add_argument("--text", action="store_true", help="print the text report to stdout")
+    ap.add_argument("--full", action="store_true", help="text: do not cut long blocks")
+    ap.add_argument("-o", "--output", help="directory for the .txt and .html (default: next to the input)")
+    ap.add_argument("--no-open", action="store_true", help="do not open the page in a browser")
+    ap.add_argument("--port", type=int, default=0, help="serve: the localhost port to listen on (default: a free one)")
+    ap.add_argument("--keep", action="store_true", help="keep the extracted copy")
+    ap.add_argument("--no-original", action="store_true", help="do not run the original analysis script (the first view of the Report)")
+    ap.add_argument("--pair", metavar="OTHER_REPORT", help="the other end of a Satellite/Capsule pair: compares certificate trust in both directions")
+    ap.add_argument("--diff", metavar="OTHER_REPORT", help="another report of the same host: adds a section with what differs (packages, repos, answers, settings, certificates, tasks)")
+    ap.add_argument("--install", action="store_true", help="copy this script to ~/.local/bin/" + PROG)
+    ap.add_argument("--version", action="version", version=PROG + " " + VERSION)
+    a = ap.parse_args(argv)
+    if a.install:
+        return install_self()
+    tidy_extracted_copies()
+    inputs = list(a.inputs)
+    mode = "write"
+    if inputs and inputs[0] in ("serve", "text"):
+        mode = inputs.pop(0)
+    if a.text:
+        mode = "text"
+    if not inputs:
+        inputs = find_recent_sosreports([".", "~/Downloads"], limit=1)
+        if not inputs:
+            sys.exit("usage: sosview-lite REPORT [TASK-EXPORT]   (no sosreport found in . or ~/Downloads)")
+        print("using newest sosreport: %s" % inputs[0], file=sys.stderr)
+    src, export = inputs[0], (inputs[1] if len(inputs) > 1 else None)
+    if export and (SOS_NAME.match(os.path.basename(export)) or (os.path.isdir(export) and find_sos_root(export))):
+        sys.exit("%s looks like a second sosreport, not a task export. To compare a Satellite with its Capsule:\n"
+                 "  sosview %s%s --pair %s" % (export, "serve " if mode == "serve" else "", src, export))
+    try:
+        if mode == "serve":
+            return serve(src, export, port=a.port, open_browser=not a.no_open, pair=a.pair, diff=a.diff, original=not a.no_original)
+        prog = Progress(on=False if mode == "text" and not sys.stdout.isatty() and not sys.stderr.isatty() else None)
+        t, ctx, secs, tmp = load(src, pair=a.pair, diff=a.diff, progress=prog, original=None if mode == "text" else not a.no_original)
+        prog.done()
+        if startup_summary():
+            print(startup_summary(), file=sys.stderr)
+    except RuntimeError as e:
+        sys.exit(str(e))
+    import signal
+
+    def _stop(signum, frame):                 # Ctrl-C or kill while writing: remove the extracted copies first
+        for d in (tmp, (ctx.get("pair") or {}).get("tmp"), (ctx.get("diff") or {}).get("tmp")):
+            if d and not a.keep:
+                shutil.rmtree(d, ignore_errors=True)
+        sys.exit(130)
+    for sig in ("SIGINT", "SIGTERM", "SIGHUP"):
+        if hasattr(signal, sig):
+            signal.signal(getattr(signal, sig), _stop)
+    try:
+        if mode == "text":
+            prog.done()
+            try:      # a C-locale terminal (LANG=C over ssh, Python 3.6) cannot print the bar and ≈ glyphs
+                enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                sys.stdout.buffer.write(render_text(ctx, secs, full=a.full).encode(enc, "replace"))
+                sys.stdout.flush()
+            except BrokenPipeError:
+                pass
+            return 0
+        prog("reading the task tables")
+        tasks = sos_tasks = tasks_from_sos(t)
+        t.forget()
+        if export:
+            tasks, et, etmp = load_task_export(export)
+            tasks["fit"] = export_fit(tasks, sos_tasks, ctx)
+            if etmp:
+                shutil.rmtree(etmp, ignore_errors=True)
+        out_dir = a.output or os.path.dirname(os.path.abspath(src.rstrip("/")))
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            if not os.access(out_dir, os.W_OK):
+                raise OSError("not writable")
+        except OSError:
+            if a.output:
+                sys.exit("cannot write to %s" % out_dir)
+            print("note: %s is not writable; writing to the current directory" % out_dir, file=sys.stderr)
+            out_dir = os.getcwd()
+        base = re.sub(r"\.(tar(\.\w+)?|tgz|zip|txt)$", "", os.path.basename(src.rstrip("/")))
+        base = re.sub(r"\.(tar(\.\w+)?|tgz)$", "", base)
+        # named after the report, not the host alone: two reports of one host must not write over each other
+        name = re.sub(r"[^\w.-]", "_", SOS_DIR.sub("", base, 1) if SOS_DIR.match(base) else base).strip("._-") or re.sub(r"[^\w.-]", "_", ctx["hostname"])
+        txt_path = os.path.join(out_dir, "sosview-%s.txt" % name)
+        html_path = os.path.splitext(txt_path)[0] + ".html"
+        prog("writing the text report and the page")
+        write_private(txt_path, render_text(ctx, secs, full=True))
+        if (ctx.get("orig") or {}).get("text"):          # the original script's report, as it wrote it
+            log_path = os.path.splitext(txt_path)[0] + "-original.log"
+            write_private(log_path, ctx["orig"]["text"])
+            ctx["orig_log_url"] = os.path.basename(log_path)
+        write_private(html_path, render_html(ctx, secs, os.path.basename(src.rstrip("/")), serve=False, tasks=tasks, t=t, txt_name=os.path.basename(txt_path)))
+        prog.done()
+        print("%s · %s%s · %d sections · %d s\n  text  %s\n  page  %s" % (ctx["hostname"], ctx["role"], (" " + ctx["satellite"]) if ctx.get("satellite") else "", len(secs), prog.time() - prog.t0, txt_path, html_path))
+        print("  search and task exports: sosview-lite serve %s%s" % (src, (" --pair " + a.pair) if a.pair else ""))
+        if not a.no_open:
+            try:
+                import webbrowser
+                webbrowser.open("file://" + os.path.abspath(html_path))
+            except Exception:
+                pass
+        return 0
+    finally:
+        for d in (tmp, (ctx.get("pair") or {}).get("tmp"), (ctx.get("diff") or {}).get("tmp")):
+            if d and not a.keep:
+                shutil.rmtree(d, ignore_errors=True)
+            elif d:
+                print("extracted copy kept at %s" % d, file=sys.stderr)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+sosview-*.txt
+sosview-*.html
+sosview-*.log
+sosreport-*
