@@ -4,6 +4,10 @@ sosview opens a sosreport from a Red Hat Satellite, a Capsule or a plain RHEL ho
 
 It covers RHEL 7 to 10 and Satellite 6.14 to 6.20.
 
+![The Report tab: the list of potential issues at the top, the sections on the left](screenshots/report-potential-issues.png)
+
+Every screenshot on this page shows a made-up example host.
+
 ## Quick start
 
 ```
@@ -35,6 +39,10 @@ The page has four tabs. Keys `1` to `4` switch between them.
 - **Lines are links.** In serve mode, a line that came from a log opens that log at that line. Task ids open the task.
 - **Two views.** The Report opens on the output of the original analysis script, with corrections so its commands work on current Satellites. The button at the top (or the `o` key) switches to sosview's own view.
 
+![The timeline: errors and activity per day for the week before collection, with one day broken out by hour](screenshots/report-timeline.png)
+
+![The Services section: failed units with their last log lines, and the main services table](screenshots/report-services.png)
+
 ### Tasks
 
 The Foreman tasks that are already inside the sosreport, so most of the time you do not need a separate task export.
@@ -43,6 +51,8 @@ The Foreman tasks that are already inside the sosreport, so most of the time you
 - Tasks are grouped, with sub-tasks under their parent.
 - Open a task to see it from start to end: state, result, how long it took, each step with its time, and the error where it stopped.
 - A sosreport keeps about the last month of tasks. For anything older, load a task export next to the report (see below).
+
+![The Tasks tab: failed tasks grouped by error text, with one task open showing its steps, times and error](screenshots/tasks-task-open.png)
 
 ### Search
 
@@ -53,9 +63,13 @@ Searches every log in the report from one box.
 - Ready-made searches for common errors.
 - A hit opens the log on the right, at that line.
 
+![The Search tab: an error search across all logs, with hits per hour, distinct messages and the log open on the right](screenshots/search.png)
+
 ### Learn
 
 Playbooks for common Satellite problems, a list of known error strings with one known cause each, and a glossary. This tab is still growing.
+
+![The Learn tab: paste a line, pick a question or pick a part of Satellite to read about](screenshots/learn.png)
 
 ## Commands
 
