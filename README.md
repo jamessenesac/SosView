@@ -51,6 +51,7 @@ The Foreman tasks that are already inside the sosreport, so most of the time you
 - Tasks are grouped, with sub-tasks under their parent.
 - Open a task to see it from start to end: state, result, how long it took, each step with its time, and the error where it stopped.
 - A sosreport keeps about the last month of tasks. For anything older, load a task export next to the report (see below).
+- A task export also opens on its own, without a sosreport. You get the Tasks tab alone; what reads the logs (following a request, the log lines around a task) needs the sosreport as well.
 
 ![The Tasks tab: failed tasks grouped by error text, with one task open showing its steps, times and error](screenshots/tasks-task-open.png)
 
@@ -76,6 +77,7 @@ Playbooks for common Satellite problems, a list of known error strings with one 
 ```
 sosview.py serve REPORT                 the page on localhost, with Search, file viewing and full task records
 sosview.py serve REPORT TASK-EXPORT     the same, with a task export loaded on the Tasks tab
+sosview.py serve TASK-EXPORT            a task export on its own: the Tasks tab alone
 sosview.py REPORT                       write REPORT.txt and REPORT.html next to the report and open the page
 sosview.py REPORT --text | less         the text report in the terminal (--full to not cut long blocks)
 sosview.py SATELLITE --pair CAPSULE     compare certificate trust between a Satellite and a Capsule

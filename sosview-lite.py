@@ -23,7 +23,7 @@ import sys
 import tarfile
 import tempfile
 
-VERSION = "2.62.1"
+VERSION = "2.63.0"
 PROG = "sosview-lite"    # the name the tool is installed under and uses for itself in hints; the bare build is sosview-lite
 LITE = True        # the bare build sets this: Report, Search and Tasks only, neon style, no knowledge base
 
@@ -6397,6 +6397,12 @@ def export_task_full(root, task_id, t=None, ctx=None, budget=20.0, io_cap=60000,
     return out
 
 
+def is_task_export(root):
+    if find_sos_root(root):
+        return False
+    return any(r.endswith(".html") for r, _, _ in list_tree(root, limit=5000))
+
+
 def find_task_exports(near):
     """task-export*.tar.gz next to the sosreport or in ~/Downloads. Offered, never loaded silently."""
     found = []
@@ -10008,6 +10014,7 @@ mark{background:var(--hit);color:var(--hitfg)}
 .inrep .lbl{padding:0 0 6px;column-span:all}.inrep .lbl span{letter-spacing:0;color:var(--dim2);margin-left:8px}
 .inrep a{display:block;color:var(--fg2);text-decoration:none;font-size:12.5px;padding:2px 0;break-inside:avoid;overflow-wrap:anywhere}.inrep a:hover{color:var(--fg);text-decoration:underline}
 .dsp{position:relative}.dsp summary{list-style:none;cursor:pointer;color:var(--dim);white-space:nowrap}.dsp summary::-webkit-details-marker{display:none}.dsp summary:hover{color:var(--fg)}
+body.tonly #viewl{display:none}
 .dspm{position:absolute;right:0;top:26px;z-index:9;display:flex;flex-direction:column;gap:6px;padding:10px 14px;background:var(--panel);border:1px solid var(--line2);border-radius:8px;white-space:nowrap}.dspm a{color:var(--fg2);text-decoration:none}.dspm a:hover{color:var(--fg)}
 .tabs button[data-none]{opacity:.5}
 .keys span{flex:0 1 auto;overflow:hidden;text-overflow:ellipsis}.keys span.ver{flex-shrink:0}
@@ -10823,26 +10830,29 @@ def _tiles_html(ctx, src_name):
 
 
 def render_html(ctx, secs, src_name, serve=False, tasks=None, exports=None, t=None, txt_name=None):
+    tonly = bool(ctx.get("tasks_only"))        # a task export opened without a sosreport: the Tasks tab alone
     kb = ({"sigs": [], "playbooks": []})
     match = (None)
     h = ["<!doctype html><html lang='en' data-theme='neon'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>",
-         "<title>sosview · %s</title><style>%s%s%s</style>%s</head><body>" % (esc(ctx["hostname"]), CSS, COLOR_CSS, theme_css(), THEME_HEAD)]
-    h.append("<div class='top'><span class='me'><b>$</b> sosview <strong>%s</strong></span><nav class='tabs' role='tablist'>" % esc(ctx["hostname"]))
-    for tid, label in (("report", "Report"), ("tasks", "Tasks"), ("search", "Search")) + ((())):
+         "<title>sosview · %s</title><style>%s%s%s</style>%s</head><body%s>" % (esc(ctx["hostname"]), CSS, COLOR_CSS, theme_css(), THEME_HEAD, " class='tonly'" if tonly else "")]
+    h.append("<div class='top'><span class='me'><b>$</b> sosview%s <strong>%s</strong></span><nav class='tabs' role='tablist'>" % (" tasks" if tonly else "", esc(ctx["hostname"])))
+    for tid, label in (("tasks", "Tasks"),) if tonly else (("report", "Report"), ("tasks", "Tasks"), ("search", "Search")) + ((())):
         none = " data-none='1' title='no task data in this sosreport'" if tid == "tasks" and not (tasks and tasks.get("rows")) else ""
-        h.append("<button type='button' role='tab' id='tab-%s' aria-controls='pane-%s' data-tab='%s' aria-selected='%s'%s>%s</button>" % (tid, tid, tid, "true" if tid == "report" else "false", none, label))
+        h.append("<button type='button' role='tab' id='tab-%s' aria-controls='pane-%s' data-tab='%s' aria-selected='%s'%s>%s</button>" % (tid, tid, tid, "true" if tid == ("tasks" if tonly else "report") else "false", none, label))
     h.append("</nav>")
-    if serve:
+    if tonly:
+        h.append("<span style='flex:1'></span>" if serve else "<span class='qs qsn'>each task's steps, input and output need <code>sosview-lite serve</code></span>")
+    elif serve:
         h.append("<label class='qs'><span style='color:var(--dim)'>/</span><input id='qtop' type='search' placeholder='search all logs' aria-label='search all logs'></label>")
     else:
         h.append("<span class='qs qsn' title='this page was written to a file: Search, file viewing and logs around a task need sosview-lite serve'>Search and file viewing need <code>sosview-lite serve</code></span>")
-    if serve:
+    if serve and not tonly:
         h.append("<button type='button' class='runb' id='runl' aria-expanded='false' aria-controls='run' title='run a command line in the report directory (`)'>$ run</button>")
     h.append("<details class='dsp' id='dsp'><summary title='layout of the Report and colours of the page; remembered in this browser'>display</summary><div class='dspm'>"
              "<a href='#' id='viewl' title='standard or clean layout of the Report (v)'>view</a>"
              "<a href='#' id='themel' title='neon, dark, light or inferno (t)'>theme</a></div></details>")
     h.append("<a href='#' id='notesl' style='color:var(--dim);white-space:nowrap' title='lines, blocks, tasks and strings you pinned, with your comments; copy them as text (N)'>notes</a>")
-    h.append("<a href='%s' style='color:var(--dim);white-space:nowrap'>report.txt ⇩</a></div>" % ("/report.txt" if serve else esc(txt_name or os.path.splitext(src_name)[0] + ".txt")))
+    h.append("</div>" if tonly else "<a href='%s' style='color:var(--dim);white-space:nowrap'>report.txt ⇩</a></div>" % ("/report.txt" if serve else esc(txt_name or os.path.splitext(src_name)[0] + ".txt")))
     facts = [ctx["os"].replace("Red Hat Enterprise Linux release ", "RHEL ").replace("Red Hat Enterprise Linux Server release ", "RHEL "),
              ctx["role"] + (" " + ctx["satellite"] if ctx.get("satellite") else "") + " (%s)" % ctx.get("role_why", ""), "kernel " + ctx["kernel"],
              re.sub(r"^.*?up\s+", "up ", ctx["uptime"]).split(",  ")[0], "sos " + ctx["sos_version"], "collected " + ctx["collected"],
@@ -10851,8 +10861,14 @@ def render_html(ctx, secs, src_name, serve=False, tasks=None, exports=None, t=No
     if ctx.get("pair"):
         pc = ctx["pair"]["ctx"]
         facts.append("paired with %s (%s%s)" % (pc["hostname"], pc["role"], (" " + pc["satellite"]) if pc.get("satellite") else ""))
-    h.append("<div class='facts'>%s</div>" % " · ".join(esc(f) for f in facts if f))
-    h.append(_tiles_html(ctx, src_name))
+    if tonly:
+        trows = (tasks or {}).get("rows") or []
+        days = sorted(r["started"][:10] for r in trows if r.get("started"))
+        facts = ["task export " + src_name, "%s tasks" % fmt_n(len(trows)), ("started %s to %s" % (days[0], days[-1])) if days else "",
+                 "opened without a sosreport: the logs, and what links into them, are not here"]
+    h.append("<div class='facts'%s>%s</div>" % (" style='display:block'" if tonly else "", " · ".join(esc(f) for f in facts if f)))
+    if not tonly:
+        h.append(_tiles_html(ctx, src_name))
     # report pane
     nnc_all = sum(1 for s in secs for b in s["blocks"] if b["state"] == "nc")
     # two views when the original script was asked for: its report first, then sosview's; a switch at the top of each
@@ -10989,6 +11005,8 @@ def render_html(ctx, secs, src_name, serve=False, tasks=None, exports=None, t=No
              "<span>/  search</span><span>1-4  tabs</span><span id='czst' title='colours on or off: press c anywhere outside a text box'>c  colours</span><span>?  all keys</span><span class='ver'>sosview %s · %s · no network</span></div>" % ("<span data-k='report'>o  original / sosview</span>" if "orig" in ctx else "", VERSION, "read-only, except what you type in $ run" if serve else "read-only"))
     if LITE:
         h[-1] = h[-1].replace("<span data-k='learn'>Esc  back to Learn</span><span data-k='learn'>browser Back  previous page</span>", "").replace("1-4  tabs", "1-3  tabs").replace("sosview %s" % VERSION, "sosview %s bare" % VERSION)
+    if tonly:
+        h[-1] = h[-1].replace("<span>/  search</span><span>1-4  tabs</span>", "<span>/  find a task</span>").replace("read-only, except what you type in $ run", "read-only")
     tdata = tasks or {"source": "none", "rows": [], "name": "", "note": ("no task data: tasks are kept on a Satellite, and this host is a %s" % ("client" if ctx.get("role") == "rhel" else "Capsule"))
                       if ctx.get("role") in ("rhel", "capsule") else
                       "no task data: foreman_tasks_tasks has no header line (sos kept only its end) and its columns could not be recognised"
@@ -11010,7 +11028,7 @@ def render_html(ctx, secs, src_name, serve=False, tasks=None, exports=None, t=No
     pbt = dict((p["id"], p["title"]) for p in kb["playbooks"])
     h.append("<script>var SIGS=%s;var PBT=%s;var PBS=%s;var TASKPB=%s;</script>" % tuple(json.dumps(v, ensure_ascii=False).replace("</", "<\\/") for v in (((sj, pbt, {}, {})))))
     h.append("<aside class='notes' id='notes' aria-label='your notes'></aside>")
-    if serve:
+    if serve and not tonly:
         h.append("<section class='run' id='run' aria-label='run a command'><div class='rnh'><b>$ run</b><span class='gp' id='rncwd'></span>"
                  "<button type='button' class='btn2' id='rncopy' title='copy everything shown below'>copy output</button>"
                  "<button type='button' class='btn2' id='rnpin' title='pin the last command and its output to your notes'>pin last</button>"
@@ -11024,6 +11042,8 @@ def render_html(ctx, secs, src_name, serve=False, tasks=None, exports=None, t=No
     h.append("<datalist id='qhist'></datalist><div class='kbov' id='keys' role='dialog' aria-label='keyboard shortcuts'></div>")
     h.append(status_bar(ctx, secs))
     h.append("<script>%s%s</script></body></html>" % (COLOR_JS, JS))
+    if tonly:                                  # the Tasks pane is the one that is open before the script runs
+        return "".join(h).replace("<div class='pane on' id='pane-report'", "<div class='pane' id='pane-report'", 1).replace("<div class='pane' id='pane-tasks'", "<div class='pane on' id='pane-tasks'", 1)
     return "".join(h)
 
 
@@ -11093,7 +11113,7 @@ function esc(t){return String(t).replace(/[&<>"']/g,function(c){return{'&':'&amp
 /* tabs */
 /* tabs: each switch is a step in the browser history, so Back returns to the tab, and in the Report to the same place */
 function curTab(){var p=$('.pane.on');return p?p.dataset.pane:'report'}
-function tab(id,nopush){var was=curTab();if(was==='report'&&id!=='report')tab.ry=window.pageYOffset;document.body.dataset.tab=id;
+function tab(id,nopush){if(TONLY)id='tasks';var was=curTab();if(was==='report'&&id!=='report')tab.ry=window.pageYOffset;document.body.dataset.tab=id;
  if(!nopush&&was!==id){try{if(was==='report')history.replaceState({tab:'report',y:window.pageYOffset},'',location.hash||'#report');history.pushState({tab:id},'','#'+id)}catch(e){}}
  $$('.tabs button').forEach(function(b){b.setAttribute('aria-selected',b.dataset.tab===id?'true':'false')});$$('.pane').forEach(function(p){p.classList.toggle('on',p.dataset.pane===id)});document.body.dataset.tab=id;
  if(id==='tasks')Tasks.init();if(id==='search'&&window.Search)Search.init();if(id!=='report')window.scrollTo(0,0);
@@ -11164,7 +11184,7 @@ var TaskFull={cur:null,
   if(rqf&&!$('#treq')&&$('#tidv'))$('#tidv').insertAdjacentHTML('afterend',reqKV(rqf));
   if(d.facts&&d.facts.length){h+='<div class="lbl">FROM THE INPUT AND OUTPUT</div>'+this.kv(d.facts);
    var rq='';d.facts.forEach(function(f){if(f[0]==='request id'&&/^[0-9a-f]{8}/.test(f[1]))rq=f[1].slice(0,8)});
-   if(rq&&SERVE)h+='<div style="padding:2px 0 6px"><a href="#" class="rid" data-q="'+rq+'" title="the web or API call that started this task, as production.log recorded it">follow this request ('+rq+') ›</a></div>'}
+   if(rq&&LOGS)h+='<div style="padding:2px 0 6px"><a href="#" class="rid" data-q="'+rq+'" title="the web or API call that started this task, as production.log recorded it">follow this request ('+rq+') ›</a></div>'}
   if(d.pulp&&d.pulp.length)h+='<div class="lbl">PULP TASKS ('+d.pulp.length+')</div>'+d.pulp.map(function(p){var r=[['id',p.id]];['name','state','started_at','finished_at','error.description','error.traceback'].forEach(function(k){if(p[k])r.push([k,p[k]])});return self.kv(r)+self.psteps(p.steps)}).join('<hr class="tsep">');
   if(d.steps&&d.steps.length){h+='<div class="lbl">STEPS ('+d.steps.length+')<span class="gp" style="margin-left:8px">click a step for its error, input and output</span></div>';
    h+=d.steps.map(function(s){var a=acts[s.action]||{},er=s.error;
@@ -11180,7 +11200,7 @@ var TaskFull={cur:null,
    if(d.plan.history&&d.plan.history.length)h+='<div class="lbl">EXECUTION HISTORY</div><div class="kv">'+d.plan.history.map(function(e){return '<span>'+esc(e[1])+'</span><span>'+esc(e[0])+(e[2]?' <span class="gp">executor '+esc(e[2])+'</span>':'')+'</span>'}).join('')+'</div>'}
   var sib=d.siblings||[];if(sib.length){var C={};sib.forEach(function(r){C[r.result||r.state]=(C[r.result||r.state]||0)+1});
    h+='<div class="lbl">OTHER TASKS UNDER THE SAME PARENT ('+sib.length+': '+Object.keys(C).map(function(k){return C[k]+' '+esc(k)}).join(', ')+')</div><div class="sub">'+sib.slice(0,40).map(function(r){return '<a href="#" class="tsel" data-id="'+esc(r.id)+'">'+esc(r.result||r.state)+' · '+esc(r.label)+' · '+esc(r.started)+'</a>'}).join('')+(sib.length>40?'<span class="gp">… '+(sib.length-40)+' more</span>':'')+'</div>'}
-  if(SERVE)h+='<div id="tflogs">'+(d.logs_pending?'<div class="lbl">LOG LINES THAT CARRY THIS TASK\'S IDS</div><div class="gp">searching the logs for this task\'s ids …</div>':this.logs(d))+'</div>';
+  if(LOGS)h+='<div id="tflogs">'+(d.logs_pending?'<div class="lbl">LOG LINES THAT CARRY THIS TASK\'S IDS</div><div class="gp">searching the logs for this task\'s ids …</div>':this.logs(d))+'</div>';
   h+='<details><summary class="lbl" style="cursor:pointer">EVERY COLUMN OF THE TASK ROW</summary>'+this.kv(d.task||[])+' '+this.link(d.task_src,d.task_ln,'row ›')+'</details>';
   if(d.encoded&&d.encoded.length)h+='<div class="gp">'+esc(d.encoded.join(', '))+': stored encoded in this sosreport; decoded here</div>';
   (d.notes||[]).forEach(function(n){h+='<div class="gp">'+esc(n)+'</div>'});
@@ -11210,6 +11230,8 @@ var SFold={auto:false,set:function(f){var b=$('.sbox');if(!b)return;b.classList.
 if($('#sfold')){$('#sfold').onclick=function(){SFold.toggle()};try{if(localStorage.getItem('sv.sfold')==='1')SFold.set(true)}catch(e){}
  var sres=$('#sres');if(sres)sres.addEventListener('scroll',function(){if(!SFold.is()&&sres.scrollTop>80){SFold.auto=true;SFold.set(true)}else if(SFold.auto&&sres.scrollTop===0){SFold.auto=false;SFold.set(false)}},{passive:true})}
 if(SERVE)document.body.classList.add('serve');
+/* a task export opened without a sosreport: the Tasks tab alone, and nothing that reads a log */
+var TONLY=document.body.classList.contains('tonly'),LOGS=SERVE&&!TONLY;
 window.svTab=tab;$$('.tabs button').forEach(function(b){b.addEventListener('click',function(){tab(b.dataset.tab)})});document.body.dataset.tab='report';
 function store(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v)}catch(e){return null}}
 /* the Report's two views, when the original script ran: its report and sosview's; the choice is remembered */
@@ -11542,7 +11564,7 @@ function step(d){var v=vis(),i=v.indexOf(blks[cur]),r=i>=0?v[i].getBoundingClien
 document.addEventListener('keydown',function(e){var tg=e.target.tagName;if(tg==='INPUT'||tg==='SELECT'||tg==='TEXTAREA'||e.ctrlKey||e.metaKey||e.altKey){if(e.key==='Escape')e.target.blur();return}
  if(e.target.closest&&e.target.closest('.sbox')&&e.key.length===1)return;   /* a key pressed on the search form's buttons is not a page shortcut */
  var on=$('.pane.on').dataset.pane;
- if(e.key==='/'){e.preventDefault();if(SERVE){tab('search');setTimeout(function(){$('#q').focus()},0)}else $('#qtop').focus()}
+ if(e.key==='/'){e.preventDefault();if(TONLY){var tf=$('#tfind');if(tf)tf.focus()}else if(SERVE){tab('search');setTimeout(function(){$('#q').focus()},0)}else $('#qtop').focus()}
  else if(e.key>='1'&&e.key<=($('#pane-learn')?'4':'3')){tab(['report','tasks','search','learn'][+e.key-1])}
  else if(e.key==='c')CZ.toggle();else if(e.key==='N')Notes.toggle();else if(e.key==='Escape'&&$('.pkd'))$$('.pkd').forEach(function(d){d.remove()});else if(e.key==='Escape'&&IdP.isOpen())IdP.close();else if(e.key==='Escape'&&Notes.isOpen())Notes.close();
  else if(on==='report'&&e.key==='p'&&cur>=0)Notes.block(blks[cur]);
@@ -11713,12 +11735,13 @@ var Tasks={done:false,res:{e:1,w:1,o:1,s:0},label:'',day:'',q:'',win:null,by:'er
   var ks=(K[t.id]||[]).slice().sort(function(a,b){return (self.cat(a)==='s')-(self.cat(b)==='s')});if(ks.length){var C={};ks.forEach(function(r){C[r.result||r.state]=(C[r.result||r.state]||0)+1});
    d+='<div class="lbl" style="padding:6px 0 0;border-top:1px solid var(--line)">SUB-TASKS ('+ks.length+': '+Object.keys(C).map(function(k){return C[k]+' '+esc(k)}).join(', ')+')</div><div class="sub">'+ks.slice(0,40).map(function(r){return '<a href="#" class="tsel" data-id="'+esc(r.id)+'">'+esc(r.result||r.state)+' · '+esc(r.label)+(r.error?' · '+esc(r.error.slice(0,80)):'')+'</a>'}).join('')+(ks.length>40?'<span class="gp">… '+(ks.length-40)+' more</span>':'')+'</div>'}
   d+='<div class="lbl" style="padding:6px 0 0;border-top:1px solid var(--line);display:flex">ERROR TEXT'+(t.error?'<button type="button" class="cp mini" style="margin-left:auto" data-cmd="'+esc(t.eraw||t.error)+'">copy</button>':'')+'</div><pre class="out" style="white-space:pre-wrap">'+(t.error?CZ.line(t.eraw||t.error):'(none recorded)')+(function(){var k=t.error?sigOf(t.eraw||t.error):-1;return k<0?'':'<button type="button" class="kn" data-sig="'+k+'" title="known error string · one known cause: '+esc(SIGS[k].c.slice(0,140))+'">?</button>'})()+'</pre>';
-  if(SERVE&&t.error)d+='<div class="lbl" style="padding:6px 0 0">THIS ERROR TEXT IN THE LOGS</div><div id="ewhere" class="gp">counting…</div>';
+  if(LOGS&&t.error)d+='<div class="lbl" style="padding:6px 0 0">THIS ERROR TEXT IN THE LOGS</div><div id="ewhere" class="gp">counting…</div>';
   var st=(TASKS.steps||{})[t.ext]||[];
   if((TASKS.source==='sosreport'&&t.ext)||(TASKS.source==='export'&&SERVE&&t.src))d+='<div id="tfull" class="tfull"><div class="gp">'+(SERVE?'reading everything '+(TASKS.source==='export'?'the export':'the sosreport')+' holds on this task…':'')+'</div></div>';
   if(st.length){d+='<div class="lbl tshort" style="padding:6px 0 0">DYNFLOW STEPS ('+st.length+')</div><div class="steps tshort">'+st.map(function(x){return '<div class="stp'+(x[4]?' er':'')+'"><span>'+esc(x[0])+'</span><span>'+esc(x[2])+'</span><span>'+esc(x[1])+(x[4]?'<br><em>'+esc(x[4])+'</em>':'')+'</span>'+(SERVE&&TASKS.steps_src?'<a href="#" class="vw" data-view="'+esc(TASKS.steps_src+':'+x[5])+'">row</a>':'')+'</div>'}).join('')+'</div>'}
   d+='<div class="lbl" style="padding:6px 0 0;border-top:1px solid var(--line)">LOGS AROUND THIS TASK</div>';
   if(!t.started)d+='<div class="gp">no start time recorded</div>';
+  else if(TONLY)d+='<div class="gp">a task export holds no logs: open it together with the sosreport to find '+esc(t.started)+' in them</div>';
   else if(SERVE)d+='<div id="around"><a href="#" id="afind">find '+esc(t.started)+(TASKS.source==='sosreport'?' UTC':'')+' in production.log, proxy.log, messages …</a></div><div class="gp">the database stores task times in UTC; logs are written in the host&#39;s local time, so the time is shifted by the offset sos recorded</div>';
   else{var dd=t.started,mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][+dd.slice(5,7)-1],day=+dd.slice(8,10);
    d+='<pre class="out">grep -n \'^'+esc(dd.slice(0,10))+'T'+esc(dd.slice(11,16))+'\' var/log/foreman/production.log | head -3\ngrep -n \'^'+mo+' '+(day<10?' ':'')+day+' '+esc(dd.slice(11,16))+'\' var/log/messages | head -3</pre><div class="gp">sosview-lite serve jumps there in the viewer</div>'}
@@ -11726,7 +11749,7 @@ var Tasks={done:false,res:{e:1,w:1,o:1,s:0},label:'',day:'',q:'',win:null,by:'er
   d+='<div class="lbl" style="padding:6px 0 0;border-top:1px solid var(--line);display:flex">ON THE LIVE SATELLITE<button type="button" class="cp mini" style="margin-left:auto" data-cmd="'+esc(live)+'">copy</button></div><pre class="out" style="white-space:pre-wrap;overflow-wrap:anywhere">'+esc(live)+'</pre>';
   $('#td').innerHTML=d;$('#td').classList.add('on');TaskFull.load(t);$('#td .tdpin').onclick=function(){Notes.task(t)};
   $('#td').scrollTop=0;$('#td .tdx').onclick=function(){self.closeDetail()};
-  if(SERVE&&t.error){var tid=t.id;fetch('/errwhere?q='+encodeURIComponent((t.eraw||t.error).slice(0,400))).then(function(r){return r.json()}).then(function(w){if(!self.task||self.task.id!==tid||!$('#ewhere'))return;
+  if(LOGS&&t.error){var tid=t.id;fetch('/errwhere?q='+encodeURIComponent((t.eraw||t.error).slice(0,400))).then(function(r){return r.json()}).then(function(w){if(!self.task||self.task.id!==tid||!$('#ewhere'))return;
    if(w.error){$('#ewhere').textContent=w.error;return}
    $('#ewhere').className='ewh';$('#ewhere').innerHTML=w.logs.map(function(x){var span=x.span?'<span class="z">log covers '+esc(x.span)+'</span>':'';
     if(!x.n)return '<span class="z">'+esc(x.name)+'</span><span class="z">0</span>'+span;
@@ -11745,9 +11768,9 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape'&&curTab()===
 /* a Rails request id ([I|app|1a2b3c4d]) is a link: it searches the logs for that request */
 /* the request that started the task: its id is what the task's own log lines carry ([E|bac|1a2b3c4d]) */
 function reqKV(full){var r8=String(full).slice(0,8).toLowerCase();
-  return '<span>request</span><span id="treq">'+(SERVE?'<a href="#" class="rid" data-q="'+esc(r8)+'" title="'+esc(full)+': the web or API call that started this task; its lines and the task\'s own lines carry '+esc(r8)+'">'+esc(r8)+'</a>':
+  return '<span>request</span><span id="treq">'+(LOGS?'<a href="#" class="rid" data-q="'+esc(r8)+'" title="'+esc(full)+': the web or API call that started this task; its lines and the task\'s own lines carry '+esc(r8)+'">'+esc(r8)+'</a>':
    '<span title="'+esc(full)+': the task\'s own log lines carry '+esc(r8)+', as in [E|bac|'+esc(r8)+']">'+esc(r8)+'</span>')+' <button type="button" class="cp mini" data-cmd="'+esc(r8)+'">copy</button></span>'}
-function rids(h){if(!SERVE)return h;var a=function(id,rest){return '<span class="rid" data-q="'+id+'" title="follow request '+id+' through every log">'+id+'</span>'+(rest||'')};
+function rids(h){if(!LOGS)return h;var a=function(id,rest){return '<span class="rid" data-q="'+id+'" title="follow request '+id+' through every log">'+id+'</span>'+(rest||'')};
  /* the smart proxy's '<time> <id> [I]' (the colouriser links the others); a Rails id of other than 8 characters */
  return h.replace(/\|([0-9a-f]{4,7}|[0-9a-f]{9,16})\]/g,function(m,id){return '|'+a(id)+']'})
   .replace(/^((?:<span class="cz-ts">[^<]*<\/span>|[^\s<]+)\s+)([0-9a-f]{8})( \[[A-Z]\] )/,function(m,p,id,rest){return p+a(id,rest)})}
@@ -13136,26 +13159,35 @@ def serve(src, export=None, port=0, open_browser=True, pair=None, diff=None, ori
     import urllib.parse
     import webbrowser
     prog = Progress()
-    t, ctx, secs, tmp = load(src, pair=pair, diff=diff, progress=prog, original=original)
-    ctx["orig_log_url"] = "/original.log"
-    prog.done()
-    after_load = time.time()
-    tmps = [tmp, (ctx.get("diff") or {}).get("tmp")]
     roots = {"export": None, "pair": None}
-    if ctx.get("pair"):
-        tmps.append(ctx["pair"]["tmp"])
-        roots["pair"] = ctx["pair"]["t"].root
-    tasks = sos_tasks = tasks_from_sos(t)
-    t.forget()
-    if export:
-        tasks, et, etmp = load_task_export(export)
-        tasks["fit"] = export_fit(tasks, sos_tasks, ctx)
-        tmps.append(etmp)
+    if src is None:                            # a task export on its own: the Tasks tab alone, on a report with nothing in it
+        prog("reading the task export")
+        t, ctx, secs, tmps, tasks, et = load_tasks_only(export)
+        prog.done()
+        tmp, sos_tasks, exports, slow = None, None, [], ""
         roots["export"] = os.path.realpath(et) if et else None
-    exports = [] if export else find_task_exports(src)
-    page = [render_html(ctx, secs, os.path.basename(src), serve=True, tasks=tasks, exports=export_offers(exports, src), t=t).encode("utf-8")]
-    text = render_text(ctx, secs, full=True).encode("utf-8")
-    slow = startup_summary([("tasks and page", time.time() - after_load)])
+        page = [render_html(ctx, secs, os.path.basename(export.rstrip("/")), serve=True, tasks=tasks, t=t).encode("utf-8")]
+        text = b""
+    else:
+        t, ctx, secs, tmp = load(src, pair=pair, diff=diff, progress=prog, original=original)
+        ctx["orig_log_url"] = "/original.log"
+        prog.done()
+        after_load = time.time()
+        tmps = [tmp, (ctx.get("diff") or {}).get("tmp")]
+        if ctx.get("pair"):
+            tmps.append(ctx["pair"]["tmp"])
+            roots["pair"] = ctx["pair"]["t"].root
+        tasks = sos_tasks = tasks_from_sos(t)
+        t.forget()
+        if export:
+            tasks, et, etmp = load_task_export(export)
+            tasks["fit"] = export_fit(tasks, sos_tasks, ctx)
+            tmps.append(etmp)
+            roots["export"] = os.path.realpath(et) if et else None
+        exports = [] if export else find_task_exports(src)
+        page = [render_html(ctx, secs, os.path.basename(src), serve=True, tasks=tasks, exports=export_offers(exports, src), t=t).encode("utf-8")]
+        text = render_text(ctx, secs, full=True).encode("utf-8")
+        slow = startup_summary([("tasks and page", time.time() - after_load)])
     if tmp:
         print("extracted to %s (%s)" % (tmp, human(_dir_size(tmp))), file=sys.stderr)
 
@@ -13597,7 +13629,10 @@ def serve(src, export=None, port=0, open_browser=True, pair=None, diff=None, ori
     httpd = Server(("127.0.0.1", port), H)
     bound["port"] = httpd.server_address[1]
     url = "http://127.0.0.1:%d/?k=%s" % (httpd.server_address[1], run_key)
-    print("%s · %s%s · %d files\nserving %s   (Ctrl-C to stop)" % (ctx["hostname"], ctx["role"], (" " + ctx["satellite"]) if ctx.get("satellite") else "", ctx.get("files", 0), url), flush=True)
+    if ctx.get("tasks_only"):
+        print("%s · task export · %s tasks\nserving %s   (Ctrl-C to stop)" % (ctx["hostname"], fmt_n(len(tasks["rows"])), url), flush=True)
+    else:
+        print("%s · %s%s · %d files\nserving %s   (Ctrl-C to stop)" % (ctx["hostname"], ctx["role"], (" " + ctx["satellite"]) if ctx.get("satellite") else "", ctx.get("files", 0), url), flush=True)
     if slow:
         print(slow, file=sys.stderr, flush=True)
     if open_browser:
@@ -13712,6 +13747,66 @@ def open_input(src):
     elif EXTRACT_NOTES:
         print("%d archive member%s could not be extracted (listed on the page)" % (len(EXTRACT_NOTES), "" if len(EXTRACT_NOTES) == 1 else "s"), file=sys.stderr)
     return tmp, tmp
+
+
+def looks_like_task_export(path):
+    """True when the input is a task export and not a sosreport: a CSV file, a folder of task pages, or an archive
+    that holds index.html and none of a sosreport's own names. Read from the names alone; nothing is extracted."""
+    if not path or not os.path.exists(path) or SOS_NAME.match(os.path.basename(path.rstrip("/"))):
+        return False
+    if os.path.isdir(path):
+        return not find_sos_root(path) and is_task_export(path)
+    if path.lower().endswith(".csv"):
+        return True
+    marks = ("sos_commands", "version.txt", "sos_reports", "installed-rpms")
+    try:
+        index = False
+        with tarfile.open(path, "r:*") as tf:
+            for n, m in enumerate(tf):
+                parts = m.name.split("/")
+                if any(p in marks for p in parts[:4]):
+                    return False
+                index = index or parts[-1] == "index.html"
+                if n >= 4000:
+                    break
+        return index
+    except (tarfile.TarError, OSError, EOFError):
+        return False
+
+
+def empty_report():
+    """A folder that holds a sosreport's marker and nothing else: what the page stands on when only a task export was given."""
+    part = tempfile.mkdtemp(prefix=".sosview-partial-", dir=_tmp_base())
+    with open(os.path.join(part, PID_MARK), "w") as fh:
+        fh.write("%d\n%s\n" % (os.getpid(), "task export only"))
+    os.mkdir(os.path.join(part, "sos_commands"))
+    tmp = os.path.join(os.path.dirname(part), "sosview-" + os.path.basename(part)[len(".sosview-partial-"):])
+    try:
+        os.rename(part, tmp)
+    except OSError:
+        tmp = part
+    return tmp
+
+
+def load_tasks_only(export):
+    """(t, ctx, secs, [temporary folders], tasks, export root or None) for a task export opened without a sosreport."""
+    tasks, et, etmp = load_task_export(export)
+    if not tasks.get("rows"):
+        if etmp:
+            shutil.rmtree(etmp, ignore_errors=True)
+        raise RuntimeError("no tasks found in %s" % export)
+    stub = empty_report()
+    try:
+        t, ctx, secs, _ = load(stub)
+    except Exception:
+        for d in (stub, etmp):
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
+        raise
+    name = os.path.basename(export.rstrip("/"))
+    ctx["tasks_only"] = True
+    ctx["hostname"] = re.sub(r"\.(tar(\.\w+)?|tgz|zip|csv)$", "", name) or name
+    return t, ctx, secs, [stub, etmp], tasks, et
 
 
 def load_tree(src):
@@ -13888,13 +13983,45 @@ def utf8_output():
             pass
 
 
+def write_tasks_only(export, a):
+    """The page for a task export given without a sosreport: the Tasks tab, written next to the export."""
+    t, ctx, secs, tmps, tasks, et = load_tasks_only(export)
+    try:
+        out_dir = a.output or os.path.dirname(os.path.abspath(export.rstrip("/")))
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            if not os.access(out_dir, os.W_OK):
+                raise OSError("not writable")
+        except OSError:
+            if a.output:
+                sys.exit("cannot write to %s" % out_dir)
+            print("note: %s is not writable; writing to the current directory" % out_dir, file=sys.stderr)
+            out_dir = os.getcwd()
+        html_path = os.path.join(out_dir, "sosview-tasks-%s.html" % (re.sub(r"[^\w.-]", "_", ctx["hostname"]).strip("._-") or "export"))
+        write_private(html_path, render_html(ctx, secs, os.path.basename(export.rstrip("/")), serve=False, tasks=tasks, t=t))
+        print("%s · task export · %s tasks\n  page  %s" % (ctx["hostname"], fmt_n(len(tasks["rows"])), html_path))
+        print("  each task's steps, input and output: %s serve %s" % (PROG, export))
+        if not a.no_open:
+            try:
+                import webbrowser
+                webbrowser.open("file://" + os.path.abspath(html_path))
+            except Exception:
+                pass
+        return 0
+    finally:
+        for d in tmps:
+            if d:
+                shutil.rmtree(d, ignore_errors=True)
+
+
 def main(argv=None):
     utf8_output()
     ap = argparse.ArgumentParser(prog=PROG, description="Lay a sosreport out section by section, every block with the command that produced it, after a short list of fixed-limit checks. No network, read-only.",
                                  epilog="sosview-lite REPORT              write REPORT.txt and REPORT.html next to it and open the page\n"
                                         "sosview-lite REPORT --text | less\n"
                                         "sosview-lite SATELLITE-REPORT --pair CAPSULE-REPORT   compare certificate trust between the two\n"
-                                        "sosview-lite serve REPORT [TASK-EXPORT]   page + search + task export on localhost",
+                                        "sosview-lite serve REPORT [TASK-EXPORT]   page + search + task export on localhost\n"
+                                        "sosview-lite serve TASK-EXPORT            a task export on its own: the Tasks tab alone",
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("inputs", nargs="*", help="sosreport (tarball or directory), optionally followed by a task export")
     ap.add_argument("--text", action="store_true", help="print the text report to stdout")
@@ -13923,6 +14050,17 @@ def main(argv=None):
         if not inputs:
             sys.exit("usage: sosview-lite REPORT [TASK-EXPORT]   (no sosreport found in . or ~/Downloads)")
         print("using newest sosreport: %s" % inputs[0], file=sys.stderr)
+    if len(inputs) == 2 and looks_like_task_export(inputs[0]) and not looks_like_task_export(inputs[1]):
+        inputs.reverse()                      # the export was named first: the report still comes first
+    if len(inputs) == 1 and looks_like_task_export(inputs[0]):
+        if mode == "text" or a.pair or a.diff:
+            sys.exit("%s is a task export: %s needs a sosreport" % (inputs[0], "--pair" if a.pair else "--diff" if a.diff else "the text report"))
+        try:
+            if mode == "serve":
+                return serve(None, inputs[0], port=a.port, open_browser=not a.no_open)
+            return write_tasks_only(inputs[0], a)
+        except RuntimeError as e:
+            sys.exit(str(e))
     src, export = inputs[0], (inputs[1] if len(inputs) > 1 else None)
     if export and (SOS_NAME.match(os.path.basename(export)) or (os.path.isdir(export) and find_sos_root(export))):
         sys.exit("%s looks like a second sosreport, not a task export. To compare a Satellite with its Capsule:\n"
